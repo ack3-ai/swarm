@@ -1,0 +1,4 @@
+packages:
+  - cloudflare/*
+
+autoInstallPeers: false

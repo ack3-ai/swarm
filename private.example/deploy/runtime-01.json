@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "id": "runtime-01",
+  "workerService": "swarm-runtime-01",
+  "workflowName": "audit-workflow-runtime-01",
+  "frameworkCommit": "0000000000000000000000000000000000000000",
+  "containerImageDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+}

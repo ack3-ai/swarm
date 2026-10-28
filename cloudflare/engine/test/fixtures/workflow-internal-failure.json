@@ -1,0 +1,8 @@
+{
+  "message": "Attempt failed due to internal workflows error",
+  "stateChanged": false,
+  "providerCallsAdded": 0,
+  "artifactsAdded": 0,
+  "checkpointChildrenAdded": 0,
+  "sandboxReceiptSurvivedRetry": false
+}

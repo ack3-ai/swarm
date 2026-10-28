@@ -1,0 +1,35 @@
+name: Swarm engine problem
+description: Report an engine problem with a synthetic reproduction or safe operational summary.
+title: "[swarm] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Keep private run IDs, release/checkpoint digests, target identities, source, findings, benchmark answers, credentials and raw logs out of this issue. Retain exact operational receipts privately for authorized investigation. Use a synthetic reproduction where possible.
+  - type: input
+    id: framework_commit
+    attributes:
+      label: Framework commit
+      description: Public Swarm code commit containing the affected behavior, not the target commit or a private release digest.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Minimal synthetic input and steps, or a non-identifying operational summary if reproduction is unavailable.
+    validations:
+      required: true
+  - type: textarea
+    id: observation
+    attributes:
+      label: Expected and observed behavior
+      description: Explain the engine behavior and impact without disclosing target evidence.
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation
+      description: Relevant existing test, proposed regression, or sanitized aggregate supporting the report.

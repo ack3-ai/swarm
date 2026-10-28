@@ -1,0 +1,39 @@
+{
+  "name": "@ack3/cloudflare-experiment-engine",
+  "version": "0.2.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "audit0": "tsc -p tsconfig.release.json && node dist-release/tools/audit0-control.js",
+    "audit0:acceptance": "vitest run test/audit0.acceptance.test.ts test/configurable-stages.test.ts",
+    "build": "WRANGLER_LOG_PATH=dist/wrangler.log wrangler deploy --dry-run --containers-rollout=none --outdir dist",
+    "check": "pnpm typecheck && pnpm test && pnpm build",
+    "deploy": "wrangler deploy --config wrangler.deploy.jsonc",
+    "deploy:code": "node tools/deploy-code.mjs",
+    "deploy:worker": "wrangler deploy --config wrangler.deploy.jsonc --containers-rollout=none",
+    "deploy:runtime": "node tools/deploy-runtime.mjs",
+    "dev": "wrangler dev --remote",
+    "release:export": "tsc -p tsconfig.release.json && node dist-release/tools/export-release.js",
+    "release:publish": "tsc -p tsconfig.release.json && node dist-release/tools/publish-release.js",
+    "source:publish": "node tools/publish-source.mjs",
+    "slots:seed-sql": "tsc -p tsconfig.release.json && node dist-release/tools/runtime-slot-seed.js",
+    "config:deploy": "node tools/render-deploy-config.mjs",
+    "config:runtime": "node tools/render-runtime-config.mjs",
+    "test": "vitest run && node --test test/*.test.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@cloudflare/sandbox": "0.12.9",
+    "jose": "6.2.12",
+    "markdown-it": "15.0.2"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260918.1",
+    "@types/markdown-it": "14.2.0",
+    "@types/node": "22.18.3",
+    "typescript": "7.0.2",
+    "vitest": "4.1.11",
+    "wrangler": "4.135.0"
+  }
+}

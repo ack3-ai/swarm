@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="1060" viewBox="0 0 880 1060" role="img" aria-labelledby="title desc">
+<title id="title">Configurable audit stages</title><desc id="desc">Preflight is automatic. Select discovery and any dependent stages in configuration. Reporting requires synthesis and verification. Coverage and negative review are optional. All selected tasks preserve evidence.</desc>
+<style>text{font-family:system-ui,sans-serif;fill:#203141}.title{font-size:25px;font-weight:650}.body{font-size:20px;fill:#506273}.tag{font-size:14px;font-weight:700}</style>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M1 1L8 5L1 9" fill="none" stroke="#8a9caa" stroke-width="1.6"/></marker></defs>
+<rect width="880" height="1060" rx="20" fill="#f8fafc"/>
+<rect x="80" y="28" width="720" height="104" rx="12" fill="#e9f7f3" stroke="#a8d8ca"/><text x="102" y="55" class="tag">AUTOMATIC</text><text x="102" y="87" class="title">Preflight</text><text x="102" y="116" class="body">Automatic source, tools and baseline checks.</text>
+<path d="M440 132V154" fill="none" stroke="#8a9caa" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="80" y="164" width="720" height="104" rx="12" fill="#f2efff" stroke="#cbbfec"/><text x="102" y="191" class="tag">SELECT IN CONFIG</text><text x="102" y="223" class="title">Discovery</text><text x="102" y="252" class="body">Research waves using your prompt.</text>
+<path d="M440 268V290" fill="none" stroke="#8a9caa" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="80" y="300" width="720" height="104" rx="12" fill="#f2efff" stroke="#cbbfec"/><text x="102" y="327" class="tag">SELECT IN CONFIG</text><text x="102" y="359" class="title">Synthesis</text><text x="102" y="388" class="body">Group observations and preserve their evidence.</text>
+<path d="M440 404V426" fill="none" stroke="#8a9caa" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="80" y="436" width="720" height="104" rx="12" fill="#f2efff" stroke="#cbbfec"/><text x="102" y="463" class="tag">SELECT IN CONFIG</text><text x="102" y="495" class="title">Coverage</text><text x="102" y="524" class="body">Optional independent source review.</text>
+<path d="M440 540V562" fill="none" stroke="#8a9caa" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="80" y="572" width="720" height="104" rx="12" fill="#f2efff" stroke="#cbbfec"/><text x="102" y="599" class="tag">SELECT IN CONFIG</text><text x="102" y="631" class="title">Negative review</text><text x="102" y="660" class="body">Optional review of dispositions and grouping.</text>
+<path d="M440 676V698" fill="none" stroke="#8a9caa" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="80" y="708" width="720" height="104" rx="12" fill="#f2efff" stroke="#cbbfec"/><text x="102" y="735" class="tag">SELECT IN CONFIG</text><text x="102" y="767" class="title">Verification</text><text x="102" y="796" class="body">Test each eligible observation under its conditions.</text>
+<path d="M440 812V834" fill="none" stroke="#8a9caa" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="80" y="844" width="720" height="104" rx="12" fill="#f2efff" stroke="#cbbfec"/><text x="102" y="871" class="tag">SELECT IN CONFIG</text><text x="102" y="903" class="title">Reporting</text><text x="102" y="932" class="body">Write the report; code seals observation coverage.</text>
+<text x="80" y="1012" class="body">A discovery-only run keeps research without claiming verification.</text>
+</svg>

@@ -1,0 +1,94 @@
+{
+  "configVersion": 2,
+  "kind": "ack3-audit",
+  "method": "security-audit-v1",
+  "forceSearch": true,
+  "forceSearchStages": [
+    "discovery",
+    "coverage",
+    "negative-review"
+  ],
+  "nativeSearch": {
+    "searchConnection": {
+      "provider": "exa",
+      "apiKeyEnv": "EXA_API_KEY"
+    }
+  },
+  "id": "my-security-audit",
+  "objective": "Audit the source. Reproduce security-relevant behavior and document uncertainty.",
+  "target": {
+    "repository": "example/hello-vault",
+    "commit": "0123456789abcdef0123456789abcdef01234567",
+    "tree": "89abcdef0123456789abcdef0123456789abcdef"
+  },
+  "environment": {
+    "image": "registry.cloudflare.com/00000000000000000000000000000000/swarm-sandbox@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "environmentBindings": {},
+    "preflightCommands": [
+      "cd $SWARM_SOURCE_DIR && forge build",
+      "cd $SWARM_SOURCE_DIR && forge test"
+    ]
+  },
+  "modelPools": [
+    {
+      "id": "codex",
+      "backend": "codex",
+      "model": "your-codex-model",
+      "reasoningEffort": "high",
+      "credentialSource": "default-codex-account",
+      "agents": 2,
+      "required": true,
+      "subagents": {
+        "default": {
+          "mode": "disabled"
+        },
+        "stages": {}
+      }
+    },
+    {
+      "id": "dsh",
+      "backend": "dsh-chat-completions",
+      "provider": "your-provider",
+      "connection": {
+        "baseUrl": "https://llm.example.com/v1",
+        "apiKeyEnv": "PROVIDER_API_KEY"
+      },
+      "model": "your-provider/model-id",
+      "reasoningEffort": "high",
+      "thinking": "enabled",
+      "agents": 1,
+      "required": true,
+      "subagents": {
+        "default": {
+          "mode": "disabled"
+        },
+        "stages": {}
+      }
+    }
+  ],
+  "stageModelPools": {
+    "synthesis": "codex",
+    "coverage": "codex",
+    "negative-review": [
+      "codex",
+      "dsh"
+    ],
+    "verification": "codex",
+    "reporting": "codex"
+  },
+  "limits": {
+    "maxDiscoveryRuntimeMs": 18000000,
+    "maxModelCalls": 100,
+    "maxCostUsd": 20
+  },
+  "maxDiscoveryWaves": 8,
+  "stages": [
+    "discovery",
+    "synthesis",
+    "coverage",
+    "negative-review",
+    "verification",
+    "reporting"
+  ],
+  "promptFile": "prompts.json"
+}

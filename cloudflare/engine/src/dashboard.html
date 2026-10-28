@@ -1,0 +1,3063 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>swarm · Audit observatory</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0e0f12;
+        --surface: #17181c;
+        --raised: #212229;
+        --ink: #ededef;
+        --muted: #999aa5;
+        --line: #32333c;
+        --cyan: #00ffff;
+        --blue: #6b8aff;
+        --purple: #bc9cff;
+        --amber: #ffc978;
+        --green: #91dcb0;
+        --radius: 14px;
+        font-family:
+          Inter,
+          ui-sans-serif,
+          system-ui,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+        font-size: 14px;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+      }
+      button,
+      input,
+      select {
+        font: inherit;
+      }
+      button,
+      select,
+      input {
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: var(--raised);
+        color: var(--ink);
+        padding: 9px 12px;
+      }
+      button {
+        cursor: pointer;
+      }
+      button:hover {
+        border-color: #787a87;
+      }
+      button:disabled {
+        opacity: 0.4;
+        cursor: default;
+      }
+      button.primary {
+        background: var(--cyan);
+        border-color: var(--cyan);
+        color: #001e20;
+        font-weight: 700;
+      }
+      button.quiet {
+        background: transparent;
+      }
+      a {
+        color: var(--cyan);
+        text-underline-offset: 3px;
+      }
+      button:focus-visible,
+      a:focus-visible,
+      input:focus-visible,
+      select:focus-visible,
+      [tabindex]:focus-visible {
+        outline: 2px solid var(--cyan);
+        outline-offset: 4px;
+      }
+      input {
+        min-width: 0;
+        width: 100%;
+      }
+      h1,
+      h2,
+      h3,
+      p {
+        margin: 0;
+      }
+      h1 {
+        font-size: clamp(28px, 3vw, 42px);
+        letter-spacing: -1.5px;
+        font-weight: 600;
+      }
+      h2 {
+        font-size: 19px;
+        letter-spacing: -0.4px;
+        font-weight: 600;
+      }
+      h3 {
+        font-size: 14px;
+      }
+      small,
+      .muted {
+        color: var(--muted);
+      }
+      .mono {
+        font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      }
+      .eyebrow {
+        font-size: 11px;
+        letter-spacing: 1.8px;
+        text-transform: uppercase;
+        color: var(--muted);
+      }
+      header {
+        border-bottom: 1px solid var(--line);
+        padding: 20px 32px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 20px;
+      }
+      .brand {
+        font-size: 24px;
+        font-weight: 750;
+        letter-spacing: -1px;
+        display: flex;
+        align-items: center;
+        gap: 15px;
+      }
+      .brand i {
+        height: 20px;
+        width: 20px;
+        display: block;
+        background: var(--cyan);
+        clip-path: polygon(
+          0 25%,
+          25% 0,
+          75% 0,
+          100% 25%,
+          100% 75%,
+          75% 100%,
+          25% 100%,
+          0 75%
+        );
+      }
+      .header-right,
+      .actions,
+      .legend,
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      .pill {
+        font-size: 11px;
+        letter-spacing: 0.4px;
+        border: 1px solid var(--line);
+        border-radius: 20px;
+        padding: 5px 9px;
+        white-space: nowrap;
+      }
+      .pill.example {
+        color: var(--amber);
+        border-color: #775f37;
+      }
+      .pill.live {
+        color: var(--cyan);
+      }
+      .pill.failed, .stage.failed .marker { color: #ff8e9c; }
+      .pill.paused, .pill.stopped, .pill.incomplete, .pill.unknown, .stage.stopped .marker, .stage.incomplete .marker { color: var(--amber); }
+      .pill.completed { color: var(--green); }
+      .pill.running { color: var(--cyan); }
+      main {
+        max-width: 1480px;
+        margin: 0 auto;
+        padding: 30px 32px 50px;
+      }
+      .toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 18px;
+        margin-bottom: 27px;
+      }
+      .run-picker {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+      .run-picker select {
+        max-width: 420px;
+      }
+      .intro {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 24px;
+        margin-bottom: 28px;
+      }
+      .intro p {
+        color: var(--muted);
+        margin-top: 10px;
+        max-width: 740px;
+        line-height: 1.6;
+        overflow-wrap: anywhere;
+      }
+      .status {
+        display: inline-flex;
+        gap: 7px;
+        align-items: center;
+      }
+      .dot {
+        height: 7px;
+        width: 7px;
+        border-radius: 50%;
+        background: var(--muted);
+      }
+      .dot.running {
+        background: var(--cyan);
+        box-shadow: 0 0 12px #00ffff50;
+      }
+      .notice {
+        border-left: 3px solid var(--amber);
+        background: #ffc9780b;
+        padding: 12px 16px;
+        font-size: 12px;
+        line-height: 1.6;
+        margin-bottom: 24px;
+        color: #e4c69b;
+      }
+      .notice.error {
+        color: #ffb5b5;
+        border-color: #ffb5b5;
+        background: #ffb5b508;
+      }
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        overflow: hidden;
+        margin-bottom: 28px;
+      }
+      .stat {
+        padding: 20px 23px;
+        border-right: 1px solid var(--line);
+      }
+      .stat:last-child {
+        border: 0;
+      }
+      .stat-value {
+        font-size: 32px;
+        font-weight: 550;
+        letter-spacing: -1px;
+        margin: 9px 0 6px;
+      }
+      .stat-label {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .stat small {
+        display: block;
+        line-height: 1.5;
+        font-size: 11px;
+      }
+      .stage-flow {
+        display: flex;
+        gap: 6px;
+        overflow: auto;
+        padding: 2px 2px 14px;
+        margin-bottom: 12px;
+      }
+      .stage {
+        min-width: 140px;
+        flex: 1;
+        text-align: left;
+        padding: 14px;
+        background: var(--surface);
+        position: relative;
+        border-radius: 9px;
+      }
+      .stage strong {
+        display: block;
+        font-size: 12px;
+        margin: 9px 0;
+      }
+      .stage small {
+        display: block;
+        margin-top: 4px;
+        font-size: 10px;
+      }
+      .stage.complete .marker {
+        color: var(--green);
+      }
+      .stage.current {
+        border-color: var(--cyan);
+      }
+      .stage.selected {
+        background: #6b8aff17;
+        border-color: var(--blue);
+      }
+      .marker {
+        font:
+          11px ui-monospace,
+          monospace;
+        color: var(--muted);
+      }
+      .flow-arrow {
+        align-self: center;
+        color: var(--muted);
+      }
+      nav {
+        display: flex;
+        gap: 24px;
+        border-bottom: 1px solid var(--line);
+        margin: 10px 0 24px;
+      }
+      nav button {
+        border: 0;
+        border-radius: 0;
+        padding: 14px 0;
+        background: transparent;
+        color: var(--muted);
+        border-bottom: 2px solid transparent;
+      }
+      nav button.active {
+        color: var(--ink);
+        border-bottom-color: var(--cyan);
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1.65fr) minmax(270px, 1fr);
+        gap: 20px;
+      }
+      .panel {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        padding: 23px;
+        min-width: 0;
+      }
+      .panel-head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 15px;
+        margin-bottom: 20px;
+      }
+      .panel-head p {
+        font-size: 12px;
+        color: var(--muted);
+        margin-top: 7px;
+        line-height: 1.5;
+      }
+      .legend {
+        font-size: 10px;
+        gap: 13px;
+        color: var(--muted);
+      }
+      .legend i {
+        width: 7px;
+        height: 7px;
+        display: inline-block;
+        border-radius: 2px;
+        margin-right: 5px;
+      }
+      .chart {
+        overflow: auto;
+      }
+      .chart svg {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+      .chart text {
+        font-family: ui-monospace, monospace;
+      }
+      .chart [role="button"] {
+        cursor: pointer;
+      }
+      .chart [role="button"]:hover rect {
+        stroke: var(--cyan);
+        stroke-width: 2;
+      }
+      .chart-note {
+        font-size: 11px;
+        line-height: 1.5;
+        color: var(--muted);
+        margin-top: 13px;
+      }
+      .wave-progress { margin-bottom: 18px; }
+      .pool-progress { display: grid; gap: 12px; margin-bottom: 24px; }
+      .pool-progress:empty { display: none; }
+      .pool-row { display: grid; grid-template-columns: minmax(150px, 220px) 1fr; gap: 16px; align-items: center; }
+      .pool-row small { display: block; color: var(--muted); overflow-wrap: anywhere; }
+      .pool-waves { display: flex; gap: 6px; align-items: center; overflow-x: auto; min-width: 0; padding-bottom: 4px; }
+      .pool-wave { flex: none; padding: 8px 12px; border-bottom: 3px solid var(--blue); }
+      .pool-wave[data-complete="true"] { border-bottom-color: var(--cyan); }
+      .pool-wave[data-unresponsive="true"] { border-bottom-color: var(--amber); }
+      @media (max-width: 650px) { .pool-row { grid-template-columns: 1fr; gap: 6px; } }
+      #progress-roster { font-size: 14px; color: var(--ink); font-weight: 600; }
+      .wave-progress .panel-head { flex-wrap: wrap; }
+      .wave-progress label { min-width: 0; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+      .wave-progress select { max-width: min(420px, 100%); }
+      .lane-strip { display: flex; gap: 1px; margin: 16px 0 12px; height: 10px; }
+      .lane-segment { flex: 1; min-width: 0; border-radius: 3px; background: var(--lane-color); }
+      .lane-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(230px, 100%), 1fr)); gap: 10px; }
+      .lane { --lane-color: #777984; }
+      .lane[data-status="awaiting-result"] { --lane-color: var(--blue); }
+      .lane[data-status="unresponsive"] { --lane-color: var(--amber); }
+      .lane[data-status="returned"] { --lane-color: var(--amber); }
+      .lane[data-status="accepted"] { --lane-color: var(--cyan); }
+      .lane[data-status="rejected"], .lane[data-status="interrupted"] { --lane-color: #ff8e9c; }
+      .lane[data-status="unavailable"] { --lane-color: var(--purple); }
+      .lane-card { display: flex; flex-direction: column; align-items: flex-start; padding: 13px; text-align: left; border-left: 3px solid var(--lane-color); min-width: 0; }
+      .lane-card .lane-time { color: var(--ink); font-variant-numeric: tabular-nums; font-size: 16px; margin-top: 10px; }
+      .lane-card .bar { width: 100%; margin-top: 10px; }
+      .lane-card .bar span { background: var(--lane-color); }
+      .lane-card .bar.live span { background: repeating-linear-gradient(110deg, var(--lane-color) 0 8px, transparent 8px 11px); }
+      .lane-card.active { outline: 1px solid var(--cyan); }
+      .lane-card strong, .lane-card small { display: block; overflow-wrap: anywhere; }
+      .lane-card small { margin-top: 6px; color: var(--muted); line-height: 1.5; }
+      .lane-state { display: block; color: var(--lane-color); font-size: 11px; margin-bottom: 8px; }
+      .agent {
+        width: 100%;
+        padding: 12px 0;
+        text-align: left;
+        background: transparent;
+        border: 0;
+        border-radius: 0;
+        border-bottom: 1px solid var(--line);
+      }
+      .agent:last-child {
+        border-bottom: 0;
+      }
+      .agent-top {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        font-size: 12px;
+        margin-bottom: 8px;
+      }
+      .agent small {
+        font-size: 10px;
+        display: block;
+        margin-top: 7px;
+      }
+      .bar {
+        height: 6px;
+        border-radius: 5px;
+        background: #2a2b33;
+        overflow: hidden;
+      }
+      .bar span {
+        display: block;
+        height: 100%;
+        background: var(--blue);
+        border-radius: 5px;
+      }
+      .agent.active {
+        color: var(--cyan);
+      }
+      .span2 {
+        grid-column: 1/-1;
+      }
+      .filter-line {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 16px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .empty {
+        padding: 40px 15px;
+        text-align: center;
+        color: var(--muted);
+        line-height: 1.6;
+      }
+      .finding-grid {
+        display: grid;
+        grid-template-columns: 260px minmax(0, 1fr);
+        gap: 20px;
+      }
+      .finding-list {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        max-height: 560px;
+        overflow: auto;
+        margin-top: 12px;
+      }
+      .finding {
+        padding: 13px;
+        text-align: left;
+        background: var(--surface);
+      }
+      .finding.active {
+        border-color: var(--cyan);
+        background: #00ffff08;
+      }
+      .finding strong {
+        display: block;
+        font:
+          13px ui-monospace,
+          monospace;
+      }
+      .finding small {
+        display: block;
+        margin-top: 7px;
+        line-height: 1.6;
+        font-size: 10px;
+      }
+      .lineage-scroll {
+        overflow: auto;
+      }
+      .lineage-scroll svg {
+        min-width: 1000px;
+      }
+      .graph-key {
+        display: flex;
+        gap: 18px;
+        font-size: 11px;
+        color: var(--muted);
+        margin-bottom: 15px;
+        flex-wrap: wrap;
+      }
+      .graph-key span {
+        display: flex;
+        gap: 7px;
+        align-items: center;
+      }
+      .graph-key i {
+        display: block;
+        width: 9px;
+        height: 9px;
+        border: 2px solid var(--blue);
+        border-radius: 50%;
+      }
+      .details {
+        margin-top: 20px;
+        border-top: 1px solid var(--line);
+        padding-top: 18px;
+      }
+      .details h3 {
+        margin-bottom: 10px;
+      }
+      .details p {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.7;
+      }
+      .details .actions {
+        margin-top: 14px;
+      }
+      .facts {
+        display: flex;
+        gap: 24px;
+        flex-wrap: wrap;
+        margin: 18px 0;
+      }
+      .facts div {
+        font-size: 12px;
+      }
+      .facts small {
+        display: block;
+        font-size: 10px;
+        margin-bottom: 5px;
+      }
+      .table-wrap {
+        overflow: auto;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        font-size: 12px;
+      }
+      td,
+      th {
+        text-align: left;
+        padding: 13px 12px;
+        border-bottom: 1px solid var(--line);
+        white-space: nowrap;
+      }
+      th {
+        color: var(--muted);
+        font-size: 10px;
+        font-weight: 500;
+        text-transform: uppercase;
+        letter-spacing: 0.7px;
+      }
+      .right {
+        text-align: right;
+      }
+      .cost-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 20px;
+      }
+      .big-cost {
+        font-size: 40px;
+        letter-spacing: -1px;
+        margin: 20px 0 10px;
+      }
+      .fine {
+        font-size: 12px;
+        color: var(--muted);
+        line-height: 1.7;
+      }
+      .limits {
+        margin-top: 28px;
+        border-top: 1px solid var(--line);
+        padding-top: 18px;
+      }
+      .limits summary {
+        cursor: pointer;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .limits ul {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.7;
+        max-width: 1100px;
+      }
+      .limits li {
+        margin: 8px 0;
+      }
+      footer {
+        margin-top: 30px;
+        color: var(--muted);
+        font-size: 11px;
+        display: flex;
+        justify-content: space-between;
+        gap: 20px;
+        flex-wrap: wrap;
+      }
+      dialog {
+        background: var(--surface);
+        color: var(--ink);
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        padding: 28px;
+        max-width: min(900px, calc(100vw - 32px));
+        width: 900px;
+        max-height: 85vh;
+      }
+      dialog::backdrop {
+        background: #000a;
+        backdrop-filter: blur(3px);
+      }
+      dialog.narrow {
+        width: 480px;
+      }
+      .dialog-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 20px;
+        margin-bottom: 20px;
+      }
+      dialog label {
+        display: block;
+        font-size: 12px;
+        margin: 16px 0 8px;
+      }
+      dialog .actions {
+        margin-top: 22px;
+      }
+      dialog p {
+        line-height: 1.6;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      pre {
+        font-size: 12px;
+        line-height: 1.7;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        color: #c8cad4;
+      }
+      .source-file {
+        border-bottom: 1px solid var(--line);
+        padding: 15px 0;
+      }
+      .source-file h3 {
+        color: var(--cyan);
+        font-size: 12px;
+        margin-bottom: 12px;
+      }
+      .hidden,
+      [hidden] {
+        display: none !important;
+      }
+      @media (max-width: 850px) {
+        .brand .eyebrow {
+          display: none;
+        }
+        header {
+          padding: 18px 20px;
+        }
+        main {
+          padding: 22px 20px;
+        }
+        .grid,
+        .finding-grid {
+          grid-template-columns: 1fr;
+        }
+        .finding-list {
+          max-height: 190px;
+        }
+        .stats {
+          grid-template-columns: repeat(2, 1fr);
+        }
+        .stat:nth-child(2) {
+          border-right: 0;
+        }
+        .stat:nth-child(-n + 2) {
+          border-bottom: 1px solid var(--line);
+        }
+        .toolbar,
+        .intro {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+        .run-picker select {
+          max-width: calc(100vw - 42px);
+        }
+        .panel {
+          padding: 18px;
+        }
+        .cost-grid {
+          grid-template-columns: 1fr;
+        }
+        .header-right .eyebrow {
+          display: none;
+        }
+        .stat-value {
+          font-size: 27px;
+        }
+        .stage {
+          min-width: 130px;
+        }
+        nav {
+          gap: 22px;
+        }
+        .brand {
+          font-size: 22px;
+        }
+      }
+      @media (prefers-reduced-motion: no-preference) {
+        button {
+          transition:
+            border-color 0.15s,
+            background 0.15s;
+        }
+      }
+      .markdown-view { max-width: 88ch; margin: 0 auto; line-height: 1.8; overflow-wrap: anywhere; }
+      .markdown-view h1, .markdown-view h2, .markdown-view h3,
+      .markdown-view h4 { line-height: 1.3; margin: 1.5em 0 .65em; letter-spacing: -.02em; }
+      .markdown-view h1 { font-size: clamp(26px, 4vw, 36px); }
+      .markdown-view h2 { font-size: 24px; border-bottom: 1px solid var(--line); padding-bottom: .4em; }
+      .markdown-view h3 { font-size: 19px; }
+      .markdown-view p, .markdown-view ul, .markdown-view ol { margin: .85em 0; }
+      .markdown-view ul, .markdown-view ol { padding-left: 1.5em; }
+      .markdown-view li { margin: .3em 0; }
+      .markdown-view blockquote { border-left: 3px solid var(--blue); margin: 1.4em 0; padding: .2em 1em; color: var(--muted); }
+      .markdown-view pre, .document-source { white-space: pre-wrap; overflow-wrap: anywhere; padding: 18px; background: #0b1018; border: 1px solid var(--line); border-radius: 8px; line-height: 1.6; }
+      .markdown-view code { font-size: .9em; background: #ffffff08; border-radius: 3px; padding: .15em .3em; }
+      .markdown-view pre code { background: none; padding: 0; }
+      .markdown-view table { display: block; overflow-x: auto; max-width: 100%; border-collapse: collapse; margin: 1.4em 0; }
+      .markdown-view td, .markdown-view th { border: 1px solid var(--line); padding: 10px 14px; text-align: left; white-space: normal; }
+      .markdown-view th { background: #ffffff06; }
+      .markdown-view a { color: var(--blue); text-decoration: underline; text-underline-offset: 3px; }
+      .markdown-view hr { border: 0; border-top: 1px solid var(--line); margin: 2em 0; }
+      .markdown-image { color: var(--muted); font-style: italic; }
+      .report-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; margin-bottom: 24px; }
+      .report-controls label { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+      .report-controls input[type="checkbox"], #source-raw { width: auto; flex: none; }
+      .report-controls select { max-width: min(420px, calc(100vw - 150px)); }
+      #report-content { padding: clamp(18px, 4vw, 42px); }
+      #report-meta { overflow-wrap: anywhere; }
+      .agent-transcript { max-height: 680px; overflow: auto; margin-top: 16px; }
+      .log-entry { border-left: 2px solid var(--line); padding: 7px 10px; margin: 0 0 4px; background: #ffffff03; border-radius: 4px; }
+      .log-entry.message { border-color: var(--cyan); }
+      .log-entry.reasoning { border-color: var(--purple); }
+      .log-entry.error { border-color: var(--amber); }
+      .log-heading { display: inline-flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; font-size: 13px; }
+      .log-heading time { color: var(--muted); font-size: 11px; font-weight: normal; }
+      .log-entry pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 10px 0 0; line-height: 1.65; font-size: 13px; }
+      .log-entry.message pre, .log-entry.reasoning pre, .log-entry.output pre { font-family: inherit; font-size: 14px; }
+      .log-entry summary { cursor: pointer; }
+      .log-entry.tool > summary, .log-entry.error:has(.log-tool-input) > summary { display: flex; align-items: center; gap: 10px; list-style: none; min-height: 24px; }
+      .log-entry.tool > summary::before, .log-entry.error:has(.log-tool-input) > summary::before { content: "▸"; color: var(--muted); }
+      .log-entry[open] > summary::before { content: "▾"; }
+      .log-entry.tool .log-heading { flex: none; }
+      .log-entry.tool .log-excerpt { min-width: 0; margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .log-entry { content-visibility: auto; contain-intrinsic-size: auto 40px; }
+      .history-controls { display: flex; gap: 12px; align-items: center; margin-top: 12px; }
+      .config-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(200px,1fr)); gap: 18px; margin-bottom: 24px; }
+      .config-grid dt { font-size: 12px; color: var(--muted); }
+      .config-grid dd { margin: 6px 0 0; overflow-wrap: anywhere; }
+      .config-grid .wide { grid-column: span 2; }
+      @media(max-width:700px) { .config-grid .wide { grid-column: 1 / -1; } }
+      #configuration-json { max-height: 600px; overflow: auto; }
+      @media(max-width:700px) { .log-entry.tool .log-heading time, .log-entry.tool .log-meta { display: none; } }
+      .log-controls { flex-wrap: wrap; display: flex; align-items: center; gap: 16px; margin-top: 18px; }
+      .log-controls h3 { margin: 0; }
+      .log-controls label { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; }
+      .log-controls input { width: auto; }
+      .log-activity { border-left: 3px solid var(--cyan); padding: 12px 16px; background: #00dce507; font-size: 13px; line-height: 1.6; }
+      .log-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin: 18px 0; }
+      .log-toolbar label { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+      .log-search { flex: 1; min-width: 180px; }
+      .log-search input { width: 100%; }
+      .log-meta { color: var(--muted); font-size: 11px; }
+      .log-excerpt { display: block; margin-top: 6px; color: var(--muted); font: 12px/1.6 var(--mono, monospace); overflow-wrap: anywhere; }
+      details[open] > summary .log-excerpt { display: none; }
+      .log-tool-input, .log-tool-output { margin-top: 16px; }
+      .log-tool-output { border-top: 1px solid var(--line); padding-top: 16px; }
+      .log-status { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; padding: 8px 16px; margin-bottom: 4px; color: var(--muted); font-size: 11px; }
+      .log-status strong { font-size: 11px; font-weight: 400; }
+      .log-entry.retry { border-color: var(--amber); }
+      .log-entry.reasoning summary { color: #c6b3ec; }
+      .handover-row { border-top: 1px solid var(--line); }
+      .handover-row > summary { cursor: pointer; list-style: none; padding: 20px 4px; display: grid; gap: 10px; }
+      .handover-row > summary::-webkit-details-marker { display: none; }
+      .handover-row > summary strong { font-size: 15px; font-weight: 500; line-height: 1.65; max-width: 100ch; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+      .handover-row[open] > summary strong { display: block; }
+      .handover-row[open] { background: #ffffff02; }
+      .handover-meta { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; }
+      .handover-meta > code { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+      .outcome-badge { font-size: 11px; padding: 4px 8px; background: var(--raised); border-radius: 5px; text-transform: capitalize; }
+      .handover-dissent { color: var(--amber); font-size: 11px; }
+      .handover-body { padding: 0 20px 24px; }
+      .handover-body h3 { color: var(--muted); font-size: 12px; font-weight: 500; margin: 0 0 10px; }
+      .handover-body h4 { font-size: 12px; color: var(--muted); margin: 18px 0 8px; }
+      .handover-text { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.7; max-width: 90ch; }
+      .decision-flow { display: grid; gap: 22px; padding: 20px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; }
+      .decision-detail { border-top: 1px solid var(--line); }
+      .decision-detail summary { cursor: pointer; display: flex; align-items: baseline; gap: 10px 16px; flex-wrap: wrap; padding: 12px 0; }
+      .decision-author { min-width: 90px; font-weight: 600; font-size: 13px; }
+      .decision-status { font-size: 13px; }
+      .decision-detail code { font-size: 12px; color: var(--muted); }
+      .detail-hint { margin-left: auto; color: var(--muted); font-size: 11px; }
+      .decision-detail > summary .detail-hint::after { content: " +"; }
+      .decision-detail[open] > summary .detail-hint::after { content: " −"; }
+      .decision-evidence { padding: 4px 0 16px; }
+      .decision-evidence > .fine { margin-bottom: 10px; }
+      .source-row { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 14px; }
+      .source-author { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+      .source-link { padding: 5px 9px; font-size: 11px; }
+      .observation-evidence { margin-top: 16px; font-size: 13px; }
+      .observation-evidence > summary { cursor: pointer; padding: 8px 0; }
+      .handover-sources { display: grid; grid-template-columns: repeat(auto-fit,minmax(260px,1fr)); gap: 16px; padding: 20px 0; }
+      #handover-packet { margin: 18px 0; overflow-wrap: anywhere; font-size: 12px; color: var(--muted); }
+      #handover-packet summary { cursor: pointer; }
+      #handover-packet p { margin: 12px 0; }
+      #handover-search { min-width: min(340px,65vw); }
+      #handover-status { font-size: 12px; color: var(--muted); margin: 16px 0; }
+      [hidden] { display: none !important; }
+      main { max-width: 1440px; margin: auto; }
+      h1 { font-size: 28px; letter-spacing: -.8px; }
+      .intro { margin: 20px 0; }
+      #run-summary { font: 12px/1.6 ui-monospace, monospace; overflow-wrap: anywhere; }
+      #throughput-summary { display: none; }
+      .stage-flow { display: grid; grid-template-columns: repeat(6,minmax(0,1fr)); gap: 8px; overflow: visible; }
+      .stage { min-width: 0; padding: 12px; min-height: 104px; }
+      .stage strong { font-size: 13px; }
+      .stage .marker { font-size: 9px; letter-spacing: .4px; }
+      .flow-arrow { display: none; }
+      nav { position: sticky; top: 0; z-index: 5; background: var(--bg); }
+      .help { color: var(--muted); font-size: 12px; line-height: 1.65; margin: 14px 0; }
+      .help summary { cursor: pointer; }
+      .help p { max-width: 90ch; margin-top: 10px; }
+      .secondary-analysis > summary { padding: 18px 0; cursor: pointer; color: var(--muted); }
+      #agent-inspector { margin-bottom: 24px; scroll-margin-top: 70px; }
+      .inspector-toolbar { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; }
+      .inspector-toolbar label, .wave-controls label { display: flex; align-items: center; gap: 8px; }
+      .inspector-toolbar input, .wave-controls input, #inspector-raw { width: auto; }
+      .inspector-toolbar select { max-width: min(480px,70vw); }
+      .detail-tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--line); margin: 22px 0; padding-bottom: 8px; }
+      .detail-tabs button { background: transparent; border-color: transparent; color: var(--muted); }
+      .detail-tabs button[aria-pressed="true"] { background: var(--raised); color: var(--ink); border-color: var(--line); }
+      .environment-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+      .environment-grid > section { padding: 20px; background: var(--bg); border-radius: 10px; min-width: 0; }
+      .environment-state { font-size: 17px; margin: 12px 0 20px; }
+      .identity-list { margin: 0; }
+      .identity-list dt { color: var(--muted); font-size: 12px; margin-top: 16px; }
+      .identity-list dd { margin: 6px 0; line-height: 1.5; overflow-wrap: anywhere; }
+      .identity-list code { user-select: all; font-size: 12px; }
+      .environment-grid details { margin-top: 20px; }
+      .environment-grid summary { cursor: pointer; }
+      .environment-grid td { overflow-wrap: anywhere; white-space: normal; }
+      .prompt-content { white-space: pre-wrap; overflow-wrap: anywhere; font: 14px/1.8 ui-monospace,monospace; max-width: 100ch; padding: 24px; background: var(--bg); border-radius: 8px; }
+      .protocol-detail { margin-top: 24px; }
+      .protocol-detail summary { cursor: pointer; }
+      .wave-controls { display: grid; gap: 8px; }
+      .wave-controls select { max-width: min(460px,65vw); }
+      .pool-wave.selected { background: #114047; outline: 1px solid var(--cyan); }
+      .lane-strip { display: none; }
+      .lane-card { padding: 18px; }
+      .inspect-link { display: block; margin-top: 18px; font-size: 12px; color: var(--cyan); }
+      .agent-transcript { max-height: 70vh; }
+      .log-activity:empty { display: none; }
+      .log-toolbar { margin-bottom: 8px; }
+      @media (max-width: 750px) { .stage-flow { grid-template-columns: repeat(3,minmax(0,1fr)); } .environment-grid { grid-template-columns: 1fr; } .detail-tabs { flex-wrap: wrap; } nav { gap: 14px; overflow-x: auto; } nav button { white-space: nowrap; } }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="brand">
+        <i aria-hidden="true"></i>swarm
+        <span class="eyebrow">Audit observatory</span>
+      </div>
+      <div class="header-right">
+        <span id="mode" class="pill example">CONNECTING</span>
+      </div>
+    </header>
+    <main>
+      <div class="toolbar">
+        <div class="run-picker">
+          <span class="eyebrow">Audit run</span
+          ><select id="runs" aria-label="Audit run">
+            <option value="example">Example · document review</option></select
+          ><button id="more" hidden>Older runs</button
+          ><button id="refresh" title="Refresh current run">↻ Refresh</button>
+        </div>
+        <div class="actions">
+          <button id="example" class="quiet">Example</button
+          ><button id="export">Export snapshot ↓</button>
+        </div>
+      </div>
+      <div class="intro">
+        <div>
+          <div class="eyebrow" id="run-context">Recorded audit flow</div>
+          <div class="row"><h1>Audit overview</h1><span id="run-status" class="pill" role="status"></span></div>
+          <p id="run-summary"></p>
+        </div>
+        <div
+          class="mono muted"
+          id="freshness"
+          style="font-size: 11px; line-height: 1.8"
+        ></div>
+      </div>
+      <div id="notice" class="notice" role="status"></div>
+      <div id="error" class="notice error" role="alert" hidden></div>
+      <div class="stats" id="stats"></div>
+      <p class="chart-note" id="throughput-summary"></p>
+      <div class="stage-flow" id="stages" aria-label="Audit stages"></div>
+      <nav id="view-nav" aria-label="Dashboard views">
+        <button data-view="overview" class="active">Agents & activity</button
+        ><button data-view="lineage">Finding history</button
+        ><button data-view="handovers">Reviews &amp; evidence</button
+        ><button data-view="costs">Usage & cost</button
+        ><button data-view="report">Audit report</button><button data-view="configuration">Configuration</button>
+      </nav>
+      <section id="configuration" hidden><article class="panel"><h2>Run configuration</h2><div id="configuration-content"></div><details><summary>Configuration JSON</summary><pre id="configuration-json" class="document-source"></pre></details></article></section>
+      <section id="handovers" hidden>
+        <article class="panel">
+          <div class="panel-head"><div><h2>Reviews &amp; evidence</h2><p>Discovery → Independent review → Verification → Report</p></div><button id="handover-reload" class="quiet">Reload</button></div>
+          <div class="report-controls"><label>Search <input id="handover-search" type="search" placeholder="Observation, candidate, agent or evidence" aria-label="Search reviews and evidence"></label><label>Show <select id="handover-filter"><option value="all">All observations</option><option value="dissent">Review disagreements</option><option value="pending">Without accepted reviews</option></select></label></div>
+          <details class="help"><summary>How to read these decisions</summary><p>OBS identifies a source observation; C a candidate; U an unresolved reference. IDs do not encode severity. Retention and artifact acceptance do not establish vulnerability confirmation or severity.</p></details>
+          <p id="handover-status" role="status"></p><div id="handover-packet"></div><div id="handover-content"></div>
+        </article>
+      </section>
+      <section id="report" hidden>
+        <article class="panel">
+          <div class="panel-head"><div><h2>Audit report</h2><p id="report-status" role="status">No accepted report is available yet.</p></div></div>
+          <div class="report-controls" id="report-controls" hidden>
+            <label>Output <select id="report-artifact" aria-label="Report output"></select></label>
+            <label>Document <select id="report-file" aria-label="Report document"></select></label>
+            <label><input type="checkbox" id="report-raw"> Markdown source</label>
+            <button id="report-retry" class="quiet">Reload report</button>
+          </div>
+          <p id="report-meta" class="fine mono"></p>
+          <div id="report-content"></div>
+        </article>
+      </section>
+      <section id="overview">
+        <div class="filter-line">
+          <span id="filter-label">All stages · all waves</span
+          ><button id="clear" class="quiet">Clear selection</button>
+        </div>
+        <article class="panel wave-progress" aria-label="Agent progress by wave">
+          <div id="pool-progress" class="pool-progress" aria-label="Discovery progress by model pool"></div>
+          <div class="panel-head">
+            <div><h2>Agent progress</h2><p id="progress-summary" role="status"></p></div>
+            <div class="wave-controls"><label>Stage / wave <select id="progress-wave" aria-label="Select a wave to inspect agent status"></select></label><label class="fine"><input id="show-planned" type="checkbox"> Include unstarted waves</label></div>
+          </div>
+          <p id="progress-roster" class="chart-note"></p>
+          <p id="progress-time" class="chart-note"></p>
+          <div id="lane-strip" class="lane-strip" aria-hidden="true"></div>
+          <div id="lane-grid" class="lane-grid"></div>
+          <details class="help"><summary>Timing & status definitions</summary><p class="chart-note" id="progress-note"></p></details>
+        </article>
+        <article class="panel" id="agent-inspector" hidden tabindex="-1">
+          <div class="panel-head"><div><h2 id="inspector-title">Agent session</h2><p id="inspector-identity" class="fine"></p></div><button id="inspector-close" class="quiet">Close</button></div>
+          <div class="inspector-toolbar"><label>Attempt <select id="inspector-attempt" aria-label="Agent execution attempt"></select></label><button id="inspector-refresh" class="quiet">Refresh</button><label><input type="checkbox" id="inspector-follow" /> Follow output</label><button id="inspector-download" class="quiet" disabled>Download log ↓</button></div>
+          <div class="detail-tabs" role="group" aria-label="Agent details">
+            <button data-inspector-tab="output" aria-pressed="true">Output</button><button data-inspector-tab="prompt" aria-pressed="false">Prompt</button><button data-inspector-tab="environment" aria-pressed="false">Session & filesystem</button>
+          </div>
+          <section id="inspector-tab-output">
+            <p class="fine" id="inspector-status" role="status"></p>
+            <p id="inspector-activity" class="log-activity" role="status"></p>
+            <div class="log-toolbar"><label>Show <select id="inspector-filter"><option value="all">Conversation</option><option value="messages">Messages</option><option value="tools">Tools</option><option value="search">Search &amp; sources</option><option value="reasoning">Reasoning</option><option value="diagnostics">Diagnostics &amp; steps</option></select></label><label class="log-search"><input id="inspector-search" type="search" aria-label="Search recorded output" placeholder="Search loaded history…" autocomplete="off"></label><label><input type="checkbox" id="inspector-raw"> Raw events</label><span id="inspector-count" class="fine"></span></div>
+            <div id="inspector-transcript" class="agent-transcript" tabindex="0" aria-label="Readable agent transcript"></div>
+            <pre id="inspector-log" hidden tabindex="0" aria-label="Agent execution log" style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:600px;overflow:auto"></pre>
+            <div class="history-controls"><button id="inspector-more" class="quiet" hidden>Load more messages</button><button id="inspector-latest" class="quiet">Jump to latest</button></div>
+          </section>
+          <section id="inspector-tab-prompt" hidden><p class="fine" id="inspector-prompt-status"></p><pre id="inspector-prompt" class="prompt-content"></pre><details class="protocol-detail"><summary>Researcher protocol</summary><pre id="inspector-protocol" class="prompt-content"></pre></details></section>
+          <section id="inspector-tab-environment" hidden><div class="environment-grid"><section aria-label="Session and context" id="inspector-context"></section><section aria-label="Filesystem and workspace" id="inspector-filesystem"></section></div></section>
+        </article>
+        <details class="secondary-analysis"><summary>Wave comparison & usage details</summary><div class="grid">
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>Work across waves</h2>
+                <p>
+                  Compare waves, then select one to inspect its agents.
+                </p>
+              </div>
+            </div>
+            <label>Measure <select id="wave-metric" aria-label="Wave chart measure"><option value="tokens">Tokens</option><option value="time">Elapsed time</option><option value="throughput">Tokens / second</option></select></label>
+            <div class="legend" id="wave-legend">
+              <span><i style="background: var(--blue)"></i>Uncached input</span
+              ><span><i style="background: var(--purple)"></i>Cached input</span
+              ><span><i style="background: var(--cyan)"></i>Output</span
+              ><span
+                ><i style="background: var(--amber)"></i>Observations · right
+                axis</span
+              >
+            </div>
+            <div id="waves" class="chart"></div>
+            <div class="chart-note" id="wave-note"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>Assignment contributions</h2>
+                <p id="contributions-scope"></p>
+              </div>
+            </div>
+            <div id="agents"></div>
+          </article>
+          <article class="panel span2" id="endpoint-performance">
+            <div class="panel-head">
+              <div><h2>Endpoint response speed</h2><p id="performance-scope"></p></div>
+              <button id="performance-load">Load request timing</button>
+            </div>
+            <p id="performance-status" class="fine" role="status"></p>
+            <div id="performance-chart" class="chart"></div>
+            <div id="performance-table" class="table-wrap"></div>
+            <p id="performance-note" class="chart-note"></p>
+          </article>
+          <article class="panel span2" id="selection">
+            <div class="panel-head">
+              <div>
+                <h2 id="selection-title">Reading the run</h2>
+                <p id="selection-copy">
+                  Stage → wave → agent. Select a chart element to inspect its
+                  recorded usage.
+                </p>
+              </div>
+            </div>
+            <div id="selection-data"></div>
+            <div id="provisional"></div>
+          </article>
+        </div>
+        </details>
+      </section>
+      <section id="lineage" hidden>
+        <div class="finding-grid">
+          <aside>
+            <h2>Report & observations</h2>
+            <p class="fine" style="margin-top: 8px">
+              Reference IDs preserve the recorded evidence trail. They are not a
+              confirmed-finding count.
+            </p>
+            <label class="hidden" for="finding-search"
+              >Filter finding identifiers</label
+            ><input
+              id="finding-search"
+              placeholder="Filter identifiers or contributor…"
+              style="margin-top: 15px"
+            />
+            <div id="finding-list" class="finding-list"></div>
+          </aside>
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <h2 id="lineage-title">Finding history</h2>
+                <p id="lineage-subtitle">
+                  Select a report reference to trace its recorded sources.
+                </p>
+              </div>
+            </div>
+            <div class="graph-key">
+              <span><i></i>Observation</span
+              ><span
+                ><i style="border-color: var(--purple)"></i>Review /
+                reference</span
+              ><span
+                ><i style="border-color: var(--amber)"></i>Verification</span
+              ><span><i style="border-color: var(--cyan)"></i>Report</span>
+            </div>
+            <div id="lineage-graph" class="chart lineage-scroll"></div>
+            <div id="lineage-facts" class="facts"></div>
+            <div id="node-detail" class="details"></div>
+          </article>
+        </div>
+      </section>
+      <section id="costs" hidden>
+        <div class="cost-grid">
+          <article class="panel span2">
+            <h2>Cost</h2>
+            <div id="provider-cost" class="big-cost"></div>
+            <p id="cost-status" class="fine"></p>
+          </article>
+          <article class="panel span2">
+            <h2>By model</h2>
+            <div class="table-wrap" id="cost-table"></div>
+          </article>
+        </div>
+      </section>
+      <footer>
+        <span
+          >Terms:
+          <a
+            href="https://ack3.ai/research/glossary/findings/"
+            target="_blank"
+            rel="noopener noreferrer"
+            >findings</a
+          >
+          ·
+          <a
+            href="https://ack3.ai/research/glossary/severity/"
+            target="_blank"
+            rel="noopener noreferrer"
+            >severity</a
+          ></span
+        >
+      </footer>
+    </main>
+    <dialog id="source-dialog">
+      <div class="dialog-head">
+        <h2>Recorded source</h2>
+        <button data-close="source-dialog" aria-label="Close source document">
+          ×
+        </button>
+      </div>
+      <p id="source-meta"></p>
+      <div class="report-controls"><label>File <select id="source-file"></select></label><label><input type="checkbox" id="source-raw"> Markdown source</label></div>
+      <div id="source-body"></div>
+    </dialog>
+    <script nonce="__CSP_NONCE__">
+      "use strict";
+      const $ = (id) => document.getElementById(id),
+        esc = (x) =>
+          String(x ?? "").replace(
+            /[&<>"']/g,
+            (c) =>
+              ({
+                "&": "&amp;",
+                "<": "&lt;",
+                ">": "&gt;",
+                '"': "&quot;",
+                "'": "&#39;",
+              })[c],
+          );
+      const fmt = (x) =>
+          new Intl.NumberFormat("en", {
+            notation: "compact",
+            maximumFractionDigits: 1,
+          }).format(x || 0),
+        num = (x) => new Intl.NumberFormat("en").format(x || 0),
+        money = (x) =>
+          x == null
+            ? "Unavailable"
+            : new Intl.NumberFormat("en", {
+                style: "currency",
+                currency: "USD",
+                maximumFractionDigits: 3,
+              }).format(x);
+      const zero = () => ({
+        modelCalls: 0,
+        inputTokens: 0,
+        cachedInputTokens: 0,
+        rawInputTokens: 0,
+        outputTokens: 0,
+        costUsd: 0,
+        cacheAccountingComplete: true,
+        costAccountingComplete: true,
+      });
+      const raw = (u) =>
+          u.rawInputTokens ?? (u.inputTokens || 0) + (u.cachedInputTokens || 0),
+        tokens = (u) => raw(u) + (u.outputTokens || 0),
+        sum = (items) =>
+          items.reduce(
+            (a, u) => ({
+              modelCalls: a.modelCalls + u.modelCalls,
+              inputTokens: a.inputTokens + u.inputTokens,
+              cachedInputTokens:
+                a.cachedInputTokens + (u.cachedInputTokens || 0),
+              rawInputTokens: a.rawInputTokens + raw(u),
+              outputTokens: a.outputTokens + u.outputTokens,
+              costUsd: a.costUsd + u.costUsd,
+              costAccountingComplete: a.costAccountingComplete && u.costAccountingComplete === true,
+              cacheAccountingComplete:
+                a.cacheAccountingComplete && u.cacheAccountingComplete === true,
+            }),
+            zero(),
+          );
+      const stageNames = {
+        discovery: "Discovery",
+        preflight: "Preflight",
+        synthesis: "Synthesis",
+        coverage: "Coverage",
+        "negative-review": "Negative review",
+        verification: "Verification",
+        reporting: "Reporting",
+      };
+      const cachedLabel = (usage) => usage.cacheAccountingComplete === true
+        ? num(usage.cachedInputTokens || 0)
+        : usage.cachedInputTokens > 0 ? `${num(usage.cachedInputTokens)} recorded` : 'Unknown';
+      let inspectorKey = null, inspectorData = null, inspectorController = null, inspectorTimer = null, inspectorAttempt = null, inspectorOffset = 0, inspectorTail = "", inspectorTranscript = newAgentTranscript(), inspectorLoading = false;
+      let snapshot = null,
+        snapshotSampleAt = Date.now(),
+        waveMetric = "tokens",
+        isExample = false,
+        timer = null,
+        requestController = null,
+        sourceController = null,
+        reportController = null,
+        reportKey = null,
+        reportData = null,
+        performanceData = null,
+        performanceKey = null,
+        performanceController = null,
+        performanceLoading = false,
+        sourceData = null,
+        epoch = 0,
+        cursor = null,
+        view = "overview",
+        selectedStage = null,
+        selectedWave = null,
+        selectedAgent = null,
+        selectedFinding = null,
+        selectedNode = null;
+      function resetSelection() {
+        resetAgentInspector();
+        resetReport();
+        resetHandovers();
+        resetPerformance();
+        selectedStage =
+          selectedWave =
+          selectedAgent =
+          selectedFinding =
+          selectedNode =
+            null;
+      }
+      function showError(message) {
+        $("error").textContent = message;
+        $("error").hidden = !message;
+      }
+      function stopRequests() {
+        clearTimeout(timer);
+        requestController?.abort();
+        sourceController?.abort();
+        epoch++;
+      }
+      function showExample() {
+        stopRequests();
+        $("source-dialog").close();
+        $("source-body").replaceChildren();
+        loadExample();
+      }
+      async function api(path, signal) {
+        const r = await fetch(path, {
+          method: "GET",
+          credentials: "same-origin",
+          cache: "no-store",
+          redirect: "error",
+          referrerPolicy: "no-referrer",
+          signal,
+        });
+        if (!r.ok)
+          throw new Error(
+            r.status === 401 || r.status === 403
+              ? "Your Cloudflare Access session has expired. Reload and sign in again."
+              : `Read failed (${r.status}). The last snapshot remains visible.`,
+          );
+        return r.json();
+      }
+      function schedule() {
+        clearTimeout(timer);
+        const refresh = workflowRefreshState(snapshot);
+        if (
+          !isExample &&
+          !document.hidden &&
+          refresh.active
+        )
+          timer = setTimeout(() => loadRun(snapshot.run.id, false), 5000);
+      }
+      function workflowRefreshState(value) {
+        const status = value?.workflow?.status;
+        const knownTerminal = ["complete", "errored", "terminated"].includes(status);
+        const active = typeof status === "string" ? !knownTerminal : value?.run.status === "running";
+        if (typeof status !== "string") return {
+          active,
+          label: active ? "Workflow status unavailable · refreshing from saved progress" : "Saved run terminal · polling stopped",
+        };
+        if (knownTerminal) return { active: false, label: `Workflow ${status} · polling stopped` };
+        return {
+          active: true,
+          label: status === "unknown"
+            ? "Workflow status unknown · refreshing until resolved"
+            : `Workflow ${status} · refresh every 5s while visible`,
+        };
+      }
+      async function listRuns(append = false) {
+        stopRequests();
+        const current = epoch;
+        requestController = new AbortController();
+        try {
+          const data = await api(
+            `/dashboard/api/runs?limit=30${append && cursor ? "&before=" + encodeURIComponent(cursor) : ""}`,
+            requestController.signal,
+          );
+          if (current !== epoch) return;
+          if (!append) $("runs").replaceChildren();
+          for (const run of data.runs) {
+            if ([...$("runs").options].some((o) => o.value === run.id))
+              continue;
+            const option = document.createElement("option");
+            option.value = run.id;
+            option.textContent = `${run.id} · last saved ${run.status} · not checked`;
+            $("runs").append(option);
+          }
+          cursor = data.nextCursor;
+          $("more").hidden = !cursor;
+          if (!append && data.runs.length) await loadRun(data.runs[0].id, true);
+          else if (!append) {
+            snapshot = null;
+            showError("No saved runs are indexed yet.");
+            $("run-summary").textContent = "Connected · no indexed runs";
+            $("stats").replaceChildren();
+            $("stages").replaceChildren();
+            $("overview").hidden =
+              $("lineage").hidden =
+              $("costs").hidden =
+                true;
+          } else schedule();
+        } catch (e) {
+          if (e.name !== "AbortError" && current === epoch)
+            showError(e.message);
+        }
+      }
+      async function loadRun(id, reset) {
+        stopRequests();
+        const current = epoch;
+        requestController = new AbortController();
+        try {
+          const data = await api(
+            `/dashboard/api/runs/${encodeURIComponent(id)}`,
+            requestController.signal,
+          );
+          if (current !== epoch) return;
+          if (
+            data.schemaVersion !== 1 ||
+            !Array.isArray(data.agents) ||
+            !Array.isArray(data.findings)
+          )
+            throw new Error("Unsupported monitoring snapshot");
+          snapshot = data;
+          const option = [...$("runs").options].find(o => o.value === data.run.id);
+          if (option) option.textContent = `${data.run.id} · ${data.executionStatus || data.run.status}`;
+          snapshotSampleAt = Date.now();
+          isExample = false;
+          if (reset) resetSelection();
+          showError("");
+          render();
+        } catch (e) {
+          if (e.name !== "AbortError" && current === epoch)
+            showError(e.message);
+        } finally {
+          if (current === epoch) schedule();
+        }
+      }
+      function scopeWaves() {
+        return snapshot.waves.filter(
+          (w) =>
+            (!selectedStage || w.stageId === selectedStage) &&
+            (!selectedWave || key(w) === selectedWave),
+        );
+      }
+      const key = (w) => `${w.stageId}/${w.id}`;
+      function agentUsage(agent) {
+        if (!selectedStage && !selectedWave) return agent.usage;
+        return sum(
+          (snapshot.activity || [])
+            .filter(
+              (x) =>
+                x.agentId === agent.id &&
+                (!selectedStage || x.stageId === selectedStage) &&
+                (!selectedWave || `${x.stageId}/${x.waveId}` === selectedWave),
+            )
+            .map((x) => x.usage),
+        );
+      }
+      function costLabel(usage) {
+        const amount = usage?.costUsd;
+        if (!Number.isFinite(amount) || amount < 0) return "Unavailable";
+        if (usage.costAccountingComplete !== true && amount === 0) return "Unavailable";
+        const formatted = amount > 0 && amount < 0.000001 ? "<$0.000001" : new Intl.NumberFormat("en", {
+          style: "currency", currency: "USD", maximumFractionDigits: amount > 0 && amount < 0.01 ? 6 : 3,
+        }).format(amount);
+        return usage.costAccountingComplete === true ? formatted : `${formatted} · Incomplete`;
+      }
+      function costStatus(usage) {
+        return usage?.costAccountingComplete === true ? "Calculated from configured rates."
+          : usage?.costUsd > 0 ? "Some usage or pricing is missing."
+          : "Usage or pricing is missing.";
+      }
+      function duration(ms) {
+        if (ms == null || !Number.isFinite(ms) || ms < 0) return "Time unavailable";
+        if (ms > 0 && ms < 10_000) return `${Number((ms / 1000).toFixed(3))}s`;
+        const seconds = Math.floor(ms / 1000), minutes = Math.floor(seconds / 60), hours = Math.floor(minutes / 60);
+        return hours ? `${hours}h ${String(minutes % 60).padStart(2, "0")}m ${String(seconds % 60).padStart(2, "0")}s`
+          : minutes ? `${minutes}m ${String(seconds % 60).padStart(2, "0")}s` : `${seconds}s`;
+      }
+      function axisDuration(ms) {
+        const unit = ms >= 3_600_000 ? 3_600_000 : ms >= 60_000 ? 60_000 : 1000;
+        return `${Number((ms / unit).toFixed(1))}${unit === 3_600_000 ? "h" : unit === 60_000 ? "m" : "s"}`;
+      }
+      function elapsedTime(timing, now = Date.now()) {
+        if (timing?.elapsedMs == null) return null;
+        return timing.elapsedMs + (timing.live && !isExample ? Math.max(0, now - snapshotSampleAt) : 0);
+      }
+      function timingMarkup(timing) {
+        const elapsed = elapsedTime(timing);
+        if (elapsed == null) return '<span>Time unavailable</span>';
+        const title = `From ${timing.startedAt}${timing.finishedAt ? ` to ${timing.finishedAt}` : " · awaiting next recorded result"}`;
+        return `<span data-elapsed="${timing.elapsedMs}" data-ticking="${timing.live && !isExample}" title="${esc(title)}">${duration(elapsed)}</span>`;
+      }
+      function taskTimeLabel(task) {
+        if (task.status === "interrupted" && task.timing?.elapsedMs == null) return "Run ended · end time not recorded";
+        if (task.timing?.elapsedMs == null) return "Timing not recorded";
+        if (task.timing.basis === "single-task-wave") return "Single-task wave · includes saving result";
+        return task.timing.basis === "result" ? "Result received after" : task.timing.basis === "last-rejection"
+          ? "Last recorded rejection after" : task.timing.live ? "Awaiting result for" : "Awaited before run ended";
+      }
+      function rateText(value) {
+        return value == null || !Number.isFinite(value) ? "—" : value > 0 && value < 0.1
+          ? "<0.1" : new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 }).format(value);
+      }
+      function modelFreeTask(task) {
+        return task.providerClass === "deterministic" && task.status === "accepted"
+          && !task.usage?.modelCalls && !task.provisionalUsage?.modelCalls
+          && tokens(task.usage) === 0 && tokens(task.provisionalUsage) === 0;
+      }
+      function modelFreeWave(wave) {
+        return wave?.status === "complete" && wave.tasks?.length > 0 && wave.tasks.every(modelFreeTask);
+      }
+      function modelFreeStage(stage) {
+        const waves = snapshot.waves.filter(w => w.stageId === stage.id && w.status !== "not-run");
+        return stage.status === "complete" && waves.length > 0 && waves.every(modelFreeWave);
+      }
+      function throughputMarkup(rate, noModelCalls = false) {
+        if (noModelCalls) return '<span>Token throughput not applicable</span>';
+        if (!rate) return '<span>Throughput unavailable</span>';
+        return `<span title="Recorded input including cache, plus output, divided by elapsed wall time at the latest snapshot. Includes queueing, tools and retries; not model generation speed.">${rateText(rate.totalTokensPerSecond)} tokens/s · ${rateText(rate.outputTokensPerSecond)} output/s${rate.partial ? " · partial" : ""}${rate.provisional ? " · includes provisional" : ""}</span>`;
+      }
+      function updateClocks() {
+        if (!snapshot || document.hidden) return;
+        document.querySelectorAll('[data-ticking="true"]').forEach(el => {
+          el.textContent = duration(Number(el.dataset.elapsed) + Math.max(0, Date.now() - snapshotSampleAt));
+        });
+      }
+      function renderConfiguration() {
+        const config = snapshot.configuration;
+        if (!config) { $("configuration-content").textContent = "Configuration unavailable for this snapshot."; $("configuration-json").textContent = ""; return; }
+        const limits = config.limits || {}, runtime = config.runtime || {};
+        const rows = [
+          ["Maximum discovery waves", config.maxDiscoveryWaves ?? "Not recorded"],
+          ["Mandatory search stages", config.forceSearch === false ? "Off"
+            : Array.isArray(config.forceSearchStages)
+              ? config.forceSearchStages.map(stage => stageNames[stage] || stage).join(", ") || "None"
+              : config.forceSearch === true ? "All dismissal stages (legacy release)" : "Not recorded"],
+          ["Discovery time limit", limits.maxWallTimeMs == null ? "Not recorded" : duration(limits.maxWallTimeMs)],
+          ["Model call limit", limits.maxModelCalls ?? "Not set"],
+          ["Cost limit", limits.maxCostUsd == null ? "Not set" : money(limits.maxCostUsd)],
+          ["Container image", config.environment?.image || runtime.containerImageDigest || "Not recorded"],
+          ["Runtime", runtime.id || "Not recorded"],
+          ["Repository", config.target?.repository || "Not recorded"],
+          ["Commit", config.target?.commit || "Not recorded"],
+        ];
+        const pools = (config.pools || []).map(pool => `<tr><td>${esc(pool.id)}</td><td>${esc(pool.model)}</td><td>${num(pool.agents)}</td><td>${pool.required ? "Required" : "Optional"}</td><td>${esc(pool.reasoningEffort || "Not recorded")}</td></tr>`).join("");
+        $("configuration-content").innerHTML = `<dl class="config-grid">${rows.map(([name,value]) => `<div class="${name === "Container image" ? "wide" : ""}"><dt>${esc(name)}</dt><dd>${esc(value)}</dd></div>`).join("")}</dl><p class="fine">Discovery limits stop new research. Started work and later stages finish.</p><h3>Research model pools</h3><div class="table-wrap"><table><thead><tr><th>Pool</th><th>Model</th><th>Researchers</th><th>Participation</th><th>Reasoning</th></tr></thead><tbody>${pools}</tbody></table></div>`;
+        $("configuration-json").textContent = JSON.stringify(config, null, 2);
+      }
+      function render() {
+        if (!snapshot) return;
+        $("mode").textContent = isExample
+          ? "SYNTHETIC EXAMPLE"
+          : "PRIVATE AUDIT DATA";
+        $("mode").className = `pill ${isExample ? "example" : "live"}`;
+        $("more").hidden = isExample || !cursor;
+        const workflowStatus = snapshot.workflow?.status || "unavailable";
+        const workflowRefresh = workflowRefreshState(snapshot);
+        const executionStatus = snapshot.executionStatus || snapshot.run.status;
+        $("run-status").textContent = executionStatus === "incomplete" ? "Ended · no final seal" : executionStatus;
+        $("run-status").className = `pill ${executionStatus}`;
+        $("run-context").textContent =
+          `${snapshot.run.experimentId}`;
+        $("run-summary").textContent =
+          snapshot.run.id +
+          (snapshot.run.parentRunId
+            ? ` · resumed from ${snapshot.run.parentRunId}`
+            : "");
+        $("freshness").textContent =
+          `${workflowRefresh.label}\nUpdated ${new Date(snapshot.generatedAt).toLocaleTimeString()}`;
+        $("notice").hidden = !isExample && executionStatus !== "unknown" && executionStatus === snapshot.run.status && !snapshot.provisionalCompletions.length && !snapshot.freshness.receiptsTruncated;
+        $("notice").textContent = isExample
+          ? "Example data"
+          : `${executionStatus === "unknown" ? "Execution status unavailable. " : executionStatus === "paused" ? "Workflow paused. " : executionStatus !== snapshot.run.status ? "Workflow ended; saved run status is stale. Unfinished execution times are unknown. " : ""}${snapshot.provisionalCompletions.length} result(s) awaiting validation.${snapshot.freshness.receiptsTruncated ? " Receipt listing is incomplete." : ""}`;
+        const count = snapshot.findings.filter((f) => f.inReport).length;
+        const metrics = [
+          [
+            "Recorded tokens",
+            fmt(tokens(snapshot.recordedUsage)),
+            `${fmt(raw(snapshot.recordedUsage))} input · ${fmt(snapshot.recordedUsage.outputTokens)} output`,
+          ],
+          [
+            "Observations",
+            num(snapshot.nodes.filter((n) => n.kind === "observation").length),
+            "Recorded behavior and evidence",
+          ],
+          [
+            "Retained references",
+            num(count),
+            "Issues and open questions",
+          ],
+          [
+            "Cost",
+            costLabel(snapshot.recordedUsage),
+            costStatus(snapshot.recordedUsage),
+          ],
+        ];
+        $("stats").hidden = view !== "overview";
+        $("stages").hidden = view !== "overview";
+        $("stats").innerHTML = metrics
+          .map(
+            (m) =>
+              `<div class="stat"><div class="stat-label">${esc(m[0])}</div><div class="stat-value">${esc(m[1])}</div><small>${esc(m[2])}</small></div>`,
+          )
+          .join("");
+        $("throughput-summary").innerHTML = `Whole swarm: ${throughputMarkup(snapshot.throughput)} · End-to-end average, including pauses; updated with each snapshot.`;
+        $("stages").innerHTML = snapshot.stages
+          .map(
+            (s, i) =>
+              `${i ? '<span class="flow-arrow" aria-hidden="true">→</span>' : ""}<button class="stage ${esc(s.status)} ${selectedStage === s.id ? "selected" : ""}" data-stage="${esc(s.id)}" aria-pressed="${selectedStage === s.id}"><span class="marker">${String(i + 1).padStart(2, "0")} / ${esc(s.status.toUpperCase())}</span><strong>${esc(stageNames[s.kind] || s.label)}</strong><small>${timingMarkup(s.timing)}${s.timing?.live ? " · elapsed" : ""}</small></button>`,
+          )
+          .join("");
+        for (const section of ["overview", "lineage", "handovers", "costs", "report", "configuration"])
+          $(section).hidden = section !== view;
+        document.querySelectorAll("[data-view]").forEach((b) => {
+          b.classList.toggle("active", b.dataset.view === view);
+          b.setAttribute(
+            "aria-current",
+            b.dataset.view === view ? "page" : "false",
+          );
+        });
+        renderConfiguration();
+        renderOverview();
+        renderPerformance();
+        renderAgentInspector();
+        renderLineage();
+        renderCosts();
+        if (view === "report") renderReport();
+        if (view === "handovers") renderHandovers();
+      }
+      const taskStatusLabels = {
+        pending: "Planned", "awaiting-result": "Awaiting result", returned: "Returned · unvalidated",
+        accepted: "Accepted", rejected: "Attempt rejected", unavailable: "Unavailable",
+        interrupted: "Run ended · no result", "not-run": "Not run", unknown: "Status unknown",
+        unresponsive: "Container unresponsive",
+      };
+      function taskObservation(task, wave) {
+        if (!snapshot || !wave || task.status !== "awaiting-result") return null;
+        return (snapshot.observationHealth || []).find(h => h.runId === snapshot.run.id
+          && h.stageId === wave.stageId && h.waveId === (wave.sourceWaveId || wave.id)
+          && h.taskId === task.taskId && h.attempt === task.lastAttempt) || null;
+      }
+      function visibleTaskStatus(task, wave) {
+        return taskObservation(task, wave)?.status === "unresolved" ? "unresponsive" : task.status;
+      }
+      function observationMarkup(health) {
+        if (health?.status !== "unresolved") return "";
+        const time = value => value && Number.isFinite(Date.parse(value))
+          ? new Date(value).toLocaleString() : null;
+        const last = time(health.lastSuccessfulProcessAt), next = time(health.nextObservationAfter);
+        return `<small>${esc(last ? `Process last confirmed ${last}` : "Process status unavailable")}</small>`
+          + (next ? `<small>Next check ${esc(next)}</small>` : "");
+      }
+      function progressWave() {
+        const waves = snapshot.waves.filter(w => !selectedStage || w.stageId === selectedStage);
+        return waves.find(w => key(w) === selectedWave) || waves.find(w => w.status === "current")
+          || waves.find(w => ["failed", "stopped", "incomplete"].includes(w.status))
+          || [...waves].reverse().find(w => w.status === "complete") || waves[0];
+      }
+      function agentInspectionSelection() {
+        const scope = performanceSelection();
+        return scope?.taskId ? scope : null;
+      }
+      function resetAgentInspector() {
+        inspectorController?.abort();
+        clearTimeout(inspectorTimer);
+        inspectorController = inspectorTimer = inspectorData = inspectorKey = null;
+        inspectorLoading = false; inspectorAttempt = null; inspectorOffset = 0; inspectorTail = ""; inspectorTranscript = newAgentTranscript();
+        disclosureViews.delete($("inspector-context")); disclosureViews.delete($("inspector-filesystem"));
+      }
+      function renderAgentInspector() {
+        const selection = agentInspectionSelection();
+        const nextKey = selection ? JSON.stringify(selection) : null;
+        $("agent-inspector").hidden = !selection;
+        if (nextKey === inspectorKey) return;
+        resetAgentInspector(); inspectorKey = nextKey;
+        if (!selection) return;
+        $("inspector-title").textContent = agentLabel(selectedAgent);
+        $("inspector-identity").textContent = `${stageNames[snapshot.stages?.find(s => s.id === selection.stageId)?.kind] || selection.stageId} / ${selection.waveId}`;
+        setInspectorTab("output");
+        $("inspector-status").textContent = isExample ? "Prompt and logs require a real recorded execution." : "Reading agent records…";
+        $("inspector-prompt").textContent = "";
+        $("inspector-prompt-status").textContent = "";
+        $("inspector-protocol").textContent = "";
+        $("inspector-log").textContent = "";
+        $("inspector-log").hidden = true;
+        $("inspector-transcript").textContent = "";
+        $("inspector-transcript").hidden = false;
+        $("inspector-raw").checked = false;
+        $("inspector-filter").value = "all"; $("inspector-search").value = "";
+        $("inspector-activity").textContent = ""; $("inspector-count").textContent = "";
+        $("inspector-attempt").innerHTML = "";
+        $("inspector-context").textContent = "";
+        $("inspector-filesystem").textContent = "";
+        $("inspector-download").disabled = true;
+        $("inspector-follow").checked = false; $("inspector-more").hidden = true;
+        const task = progressWave()?.tasks?.find(task => task.taskId === selection.taskId);
+        $("inspector-refresh").disabled = modelFreeTask(task || {});
+        if (modelFreeTask(task || {})) {
+          $("inspector-status").textContent = "Code step.";
+          $("inspector-prompt-status").textContent = "No agent prompt: this step runs in the framework.";
+          $("inspector-activity").textContent = "Completed without a model call. Its result is included in the run’s accepted artifacts.";
+          $("inspector-follow").disabled = true;
+        } else if (!isExample) void loadAgentInspector();
+      }
+      function inspectorUrl(selection, attempt, offset) {
+        const query = new URLSearchParams({ stage: selection.stageId, wave: selection.waveId, offset: String(offset) });
+        if (attempt) query.set("attempt", attempt);
+        return `/dashboard/api/runs/${encodeURIComponent(selection.runId)}/agents/${encodeURIComponent(selection.taskId)}?${query}`;
+      }
+      function logEventText(event) {
+        const text = event.text.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
+        return `[${event.at || "time not recorded"} · ${event.stream}] ${text}${text.endsWith("\n") ? "" : "\n"}`;
+      }
+      function newAgentTranscript() {
+        return { pending: { stdout: { text: "", at: null }, stderr: { text: "", at: null } }, entries: [], nextId: 0, lastRecordedAt: null, activity: null };
+      }
+      function logValue(value) {
+        return typeof value === "string" ? value : value === undefined ? "" : JSON.stringify(value, null, 2);
+      }
+      function logFields(value) {
+        return value && typeof value === "object" && !Array.isArray(value)
+          ? Object.entries(value).map(([name, item]) => `${name}: ${logValue(item)}`).join("\n") : logValue(value);
+      }
+      function readableLogEntry(line, stream, at) {
+        const clean = line.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
+        let event;
+        try { event = JSON.parse(clean); } catch { return { kind: stream === "stderr" ? "error" : "output", title: stream === "stderr" ? "Diagnostic output" : "Output", text: clean, at }; }
+        if (!event || typeof event !== "object") return { kind: "output", title: "Output", text: clean, at };
+        const item = event.item;
+        if (item && typeof item === "object") {
+          const entry = { kind: "event", title: item.type || "Recorded event", text: logFields(item), at, folded: true,
+            key: typeof item.id === "string" ? `item:${item.id}` : undefined };
+          if (["agent_message", "reasoning"].includes(item.type)) {
+            return { ...entry, kind: item.type === "reasoning" ? "reasoning" : "message",
+              title: item.type === "reasoning" ? "Reasoning" : "Agent message", text: logValue(item.text), folded: item.type === "reasoning" };
+          }
+          if (item.type === "command_execution") return { ...entry, kind: item.exit_code ? "error" : "tool", tool: "Command",
+            title: "Command", status: item.status || event.type, command: logValue(item.command),
+            text: [item.command, item.aggregated_output].filter(Boolean).join("\n\n"),
+            output: logValue(item.aggregated_output), exitCode: item.exit_code, folded: true };
+          if (item.type === "mcp_tool_call") return { ...entry, kind: item.error || item.status === "failed" || item.result?.isError ? "error" : "tool",
+            searchTool: item.server === "exa" && ["web_search_exa", "web_fetch_exa"].includes(item.tool), tool: `${item.server || "MCP"} / ${item.tool || "tool"}`,
+            title: `Tool · ${item.server || "MCP"} / ${item.tool || "tool"}`, status: item.status,
+            command: logFields(item.arguments), output: item.result == null && item.error == null ? undefined : [logValue(item.result), logValue(item.error)].filter(Boolean).join("\n"),
+            text: [logFields(item.arguments), logValue(item.result), logValue(item.error)].filter(Boolean).join("\n\n") };
+          return entry;
+        }
+        const entry = { at, kind: "event", title: event.type || "Recorded event", text: logValue(event), folded: true };
+        if (event.type === "subscription_limits") return { ...entry, kind: "status", title: "Subscription limits",
+          text: (event.limits?.windows || []).map(window => `${window.name}: ${window.usedPercent == null ? "usage unknown" : `${Math.max(0, 100 - window.usedPercent)}% remaining`}${window.resetsAt ? ` · resets ${window.resetsAt}` : ""}`).join("\n") || "Quota unavailable",
+          folded: false };
+        if (event.role === "user" || event.type === "user_message") return { ...entry, kind: "message", title: "Prompt", text: logValue(event.content ?? event.text ?? event.message), folded: false };
+        if (["thinking", "text", "final"].includes(event.type)) return { ...entry,
+          kind: event.type === "thinking" ? "reasoning" : "message", folded: event.type === "thinking",
+          title: event.type === "thinking" ? "Reasoning" : event.type === "final" ? "Final response" : "Agent message",
+          text: logValue(event.text) + (event.truncated ? "\n[Truncated by the harness]" : "") };
+        if (event.type === "tool_call") return { ...entry, kind: "tool", title: `Tool · ${event.tool || "tool"}`, tool: event.tool || "tool",
+          key: typeof event.callId === "string" ? `call:${event.callId}` : undefined, status: "requested",
+          searchTool: ["web_search", "web_fetch", "mcp__exa__web_search_exa", "mcp__exa__web_fetch_exa"].includes(event.tool),
+          command: logFields(event.input), text: logFields(event.input), folded: true };
+        if (event.type === "tool_result") return { ...entry, kind: ["error", "failed"].includes(event.status) || event.result?.isError ? "error" : "tool", title: "Tool result",
+          key: typeof event.callId === "string" ? `call:${event.callId}` : undefined, result: true, status: event.status || "returned",
+          text: logValue(event.result) + (event.truncated ? "\n[Truncated by the harness]" : ""), folded: true };
+        if (event.type === "error" || event.type === "turn.failed" || event.reason?.error) return { ...entry,
+          kind: "error", title: "Execution error", text: logFields(event.error || event.reason?.error || event.message || event), folded: false };
+        if (["llm/retry", "llm/retry-started"].includes(event.type)) {
+          const data = event.data || event;
+          return { ...entry, kind: "retry", title: event.type === "llm/retry" ? "Retry scheduled" : "Retry started",
+            text: `Retry ${data.retry ?? "?"}${data.maxRetries != null ? ` of ${data.maxRetries}` : ""}${data.delayMs != null ? ` · backoff ${duration(data.delayMs)}` : ""}${data.failure?.code ? ` · ${data.failure.code}` : ""}`, folded: false };
+        }
+        const labels = { session: "Session opened", "thread.started": "Session opened", "turn.started": "Turn started",
+          "turn.completed": "Turn completed", turn_start: "Turn started", turn_end: "Turn ended",
+          step_start: "Provider step started", step_end: "Provider step ended" };
+        const label = labels[event.phase || event.type];
+        return label ? { ...entry, kind: "status", title: label, text: [event.step != null ? `Step ${event.step}` : "", event.turn != null ? `Turn ${event.turn}` : "", event.sessionId || event.thread_id || ""].filter(Boolean).join(" · "), folded: false }
+          : entry;
+      }
+      function readableLogEntries(line, stream, at) {
+        let event;
+        try { event = JSON.parse(line); } catch {}
+        if (["assistant", "user"].includes(event?.type) && Array.isArray(event.message?.content)) {
+          return event.message.content.map(block => {
+            const normalized = block.type === "tool_use" ? { type: "tool_call", tool: block.name, callId: block.id, input: block.input }
+              : block.type === "tool_result" ? { type: "tool_result", callId: block.tool_use_id,
+                status: block.is_error ? "failed" : "completed",
+                result: Array.isArray(block.content) ? block.content.filter(part => part.type === "text").map(part => part.text).join("\n") : block.content }
+              : { type: block.type === "thinking" ? "thinking" : "text", text: block.thinking ?? block.text ?? "" };
+            return readableLogEntry(JSON.stringify(normalized), stream, at);
+          });
+        }
+        return [readableLogEntry(line, stream, at)];
+      }
+      function appendAgentTranscript(state, events, complete = false) {
+        const add = (entry, observedAt) => {
+          if (!entry.text.trim() && !["status", "tool", "error"].includes(entry.kind)) return;
+          const priorIndex = entry.key ? state.entries.findIndex(item => item.key === entry.key) : -1;
+          const prior = state.entries[priorIndex];
+          // Match by harness call ID, never by adjacency: tools may finish out of order.
+          if (entry.result) entry = { ...entry, title: prior?.title || "Tool result", tool: prior?.tool,
+            command: prior?.command, searchTool: prior?.searchTool, output: entry.text, text: [prior?.command, entry.text].filter(Boolean).join("\n\n") };
+          if (entry.result && entry.searchTool && /^Error:/.test(entry.output || "")) entry.kind = "error";
+          entry = { ...entry, id: prior?.id ?? state.nextId++, at: prior?.at || entry.at, updatedAt: observedAt || entry.at };
+          if (entry.text.length > 4000 && entry.kind === "output") entry.folded = true;
+          if (priorIndex >= 0) state.entries[priorIndex] = entry; else state.entries.push(entry);
+          state.activity = { title: entry.title, status: entry.status, at: entry.updatedAt, kind: entry.kind };
+
+        };
+        for (const event of events) {
+          const pending = state.pending[event.stream];
+          if (!pending) continue;
+          if (event.at && Number.isFinite(Date.parse(event.at)) && (!state.lastRecordedAt || Date.parse(event.at) > Date.parse(state.lastRecordedAt))) state.lastRecordedAt = event.at;
+          if (!pending.text) pending.at = event.at;
+          pending.text += event.text;
+          let newline;
+          while ((newline = pending.text.indexOf("\n")) >= 0) {
+            const line = pending.text.slice(0, newline); pending.text = pending.text.slice(newline + 1);
+            for (const entry of readableLogEntries(line, event.stream, pending.at)) add(entry, event.at);
+            pending.at = event.at;
+          }
+
+        }
+        if (complete) for (const [stream, pending] of Object.entries(state.pending)) {
+          if (pending.text) for (const entry of readableLogEntries(pending.text, stream, pending.at)) add(entry, state.lastRecordedAt);
+          pending.text = "";
+        }
+      }
+      function transcriptEntries(state, filter = "all", search = "") {
+        const kinds = { messages: ["message", "output"], tools: ["tool"], reasoning: ["reasoning"], diagnostics: ["error", "retry", "event", "status"] };
+        const term = search.trim().toLowerCase();
+        return state.entries.filter(entry => ((filter === "all" && !["status", "event"].includes(entry.kind)) || kinds[filter]?.includes(entry.kind) || filter === "tools" && entry.tool || filter === "search" && entry.searchTool)
+          && (!term || `${entry.title}\n${entry.text}`.toLowerCase().includes(term)));
+      }
+      function searchToolStatus(entry) {
+        if (entry.kind === "error") return /TOOL_TIMEOUT|timed out|timeout/i.test(entry.output || "") ? "Timed out" : "Failed";
+        return entry.status === "completed" ? "Completed" : "No result recorded";
+      }
+      function searchTranscriptSummary(state) {
+        const calls = state.entries.filter(entry => entry.searchTool);
+        if (!calls.length) return "No search or source calls in loaded history.";
+        const counts = ["Completed", "Failed", "Timed out", "No result recorded"]
+          .map(status => [status, calls.filter(entry => searchToolStatus(entry) === status).length])
+          .filter(([, count]) => count).map(([status, count]) => `${count} ${status.toLowerCase()}`);
+        return `Search & sources in loaded history: ${counts.join(" · ")}. Tool completion does not mean a dismissal was accepted.`;
+      }
+      function agentTranscriptMarkup(state, filter = "all", search = "") {
+        return transcriptEntries(state, filter, search).map(entry => {
+          const date = entry.at ? new Date(entry.at) : null;
+          const time = date && Number.isFinite(date.getTime()) ? date.toLocaleTimeString() : "Time not recorded";
+          const span = Date.parse(entry.updatedAt) - Date.parse(entry.at);
+          const meta = [entry.searchTool ? searchToolStatus(entry) : entry.status, entry.exitCode != null ? `exit ${entry.exitCode}` : "", entry.key && span > 0 ? `${duration(span)}` : ""].filter(Boolean).join(" · ");
+          const heading = `<span class="log-heading"><strong>${esc(entry.title)}</strong>${meta ? `<span class="log-meta" title="Tool status and recorded request-to-result interval">${esc(meta)}</span>` : ""}<time title="${esc(entry.at || "")}">${esc(time)}</time></span>`;
+          if (entry.kind === "status") return `<div class="log-status">${heading}<span>${esc(entry.text)}</span></div>`;
+          const body = entry.command !== undefined
+            ? `<div class="log-tool-input"><span class="eyebrow">Input</span><pre>${esc(entry.command)}</pre></div>${entry.output !== undefined ? `<div class="log-tool-output"><span class="eyebrow">Output</span><pre>${esc(entry.output || "No text output")}</pre></div>` : '<p class="fine">Awaiting result.</p>'}`
+            : `<pre>${esc(entry.text)}</pre>`;
+          const excerpt = entry.folded ? `<span class="log-excerpt">${esc((entry.command || entry.text).replace(/\s+/g, " ").slice(0, 160))}</span>` : "";
+          return entry.folded ? `<details class="log-entry ${esc(entry.kind)}" data-log-id="${entry.id}"><summary>${heading}${excerpt}</summary>${body}</details>`
+            : `<article class="log-entry ${esc(entry.kind)}">${heading}${body}</article>`;
+        }).join("");
+      }
+      function transcriptActivity(state, logs, now = Date.now()) {
+        if (!logs || logs.mode === "not-recorded") return "No output yet";
+        if (logs.nextOffset < logs.chunkCount) return "More history available";
+        const last = state.lastRecordedAt ? Date.parse(state.lastRecordedAt) : NaN;
+        if (logs.complete) return `End of history${logs.truncated ? " · capture incomplete" : ""}`;
+        return Number.isFinite(last) ? `Last message ${duration(Math.max(0, now - last))} ago` : "Waiting for output";
+      }
+      function renderInspectorLog() {
+        const raw = $("inspector-raw").checked, host = $("inspector-transcript");
+        $("inspector-log").hidden = !raw; host.hidden = raw;
+        $("inspector-log").textContent = inspectorTail || "No output recorded yet.";
+        $("inspector-activity").textContent = transcriptActivity(inspectorTranscript, inspectorData?.logs);
+        const filter = $("inspector-filter").value, search = $("inspector-search").value;
+        const visible = transcriptEntries(inspectorTranscript, filter, search);
+        $("inspector-count").textContent = filter === "search" ? searchTranscriptSummary(inspectorTranscript) : `${visible.length} entries`;
+        if (raw) { if ($("inspector-follow").checked) $("inspector-log").scrollTop = $("inspector-log").scrollHeight; return; }
+        const scrollTop = host.scrollTop;
+        const opened = new Set([...host.querySelectorAll("details[open]")].map(node => node.dataset.logId));
+        host.innerHTML = agentTranscriptMarkup(inspectorTranscript, filter, search) || '<p class="fine">No matching messages in loaded history.</p>';
+        if (inspectorData?.prompt?.text && (!search || inspectorData.prompt.text.toLowerCase().includes(search.toLowerCase())) && ["all", "messages"].includes(filter))
+          host.insertAdjacentHTML("afterbegin", `<details class="log-entry prompt" data-log-id="prompt"><summary>Initial prompt</summary><pre>${esc(inspectorData.prompt.text)}</pre></details>`);
+        for (const node of host.querySelectorAll("details")) node.open = opened.has(node.dataset.logId);
+        host.scrollTop = $("inspector-follow").checked ? host.scrollHeight : scrollTop;
+        if (raw && $("inspector-follow").checked) $("inspector-log").scrollTop = $("inspector-log").scrollHeight;
+      }
+      const disclosureViews = new WeakMap();
+      function renderDisclosures(host, markup, scope) {
+        let state = disclosureViews.get(host);
+        if (!state || state.scope !== scope) {
+          state = { scope, markup: null, open: new Map() };
+          disclosureViews.set(host, state);
+        } else {
+          for (const node of host.querySelectorAll("details[data-disclosure]"))
+            state.open.set(node.dataset.disclosure, node.open);
+        }
+        // Leave unchanged content in place so selection, focus and scroll survive polling.
+        if (state.markup === markup) return;
+        const focused = document.activeElement;
+        const focusKey = host.contains(focused) && focused?.tagName === "SUMMARY"
+          ? focused.parentElement?.dataset.disclosure : null;
+        const scrollTop = host.scrollTop;
+        host.innerHTML = markup;
+        for (const node of host.querySelectorAll("details[data-disclosure]")) {
+          if (state.open.has(node.dataset.disclosure)) node.open = state.open.get(node.dataset.disclosure);
+          if (node.dataset.disclosure === focusKey) node.querySelector("summary")?.focus({ preventScroll: true });
+        }
+        host.scrollTop = scrollTop;
+        state.markup = markup;
+      }
+      const disclosureKey = (...parts) => esc(JSON.stringify(parts));
+      function contextLabel(context) {
+        if (context?.mismatch) return "Session evidence conflicts";
+        if (context?.mode === "new") return context.freshContextFallback ? "Fresh context · replacement attempt" : "Fresh context";
+        if (context?.mode === "resume") return context.sessionSource === "resume-request" || !context.sessionId ? "Resume requested" : "Resumed session";
+        return "Context continuity not recorded";
+      }
+      function setInspectorTab(tab) {
+        for (const name of ["output", "prompt", "environment"]) $("inspector-tab-" + name).hidden = name !== tab;
+        document.querySelectorAll("[data-inspector-tab]").forEach(button => button.setAttribute("aria-pressed", String(button.dataset.inspectorTab === tab)));
+      }
+      function contextMarkup(data) {
+        const context = data.context;
+        const rows = (data.attempts || []).map(a => `<tr><td>Attempt ${num(a.attempt)}</td><td>${esc(contextLabel(a.context))}</td><td class="mono">${esc(a.context?.sessionId || "Not recorded")}</td></tr>`).join("");
+        return `<h3>Conversation</h3><p class="environment-state">${esc(contextLabel(context))}</p>
+          <dl class="identity-list"><dt>Native session ID</dt><dd><code>${esc(context?.sessionId || "Not recorded")}</code></dd><dt>Recorded by</dt><dd>${esc(context?.sessionSource || "unavailable")}</dd>${context?.requestedSessionId ? `<dt>Requested session</dt><dd><code>${esc(context.requestedSessionId)}</code></dd>` : ""}</dl>
+          ${data.attempts.length > 1 ? `<details data-disclosure="attempts"><summary>Compare attempts (${data.attempts.length})</summary><div class="table-wrap"><table><thead><tr><th>Attempt</th><th>Context</th><th>Session ID</th></tr></thead><tbody>${rows}</tbody></table></div></details>` : ""}
+          <details class="help" data-disclosure="conversation-help"><summary>What does this mean?</summary><p>Equal native session IDs identify the same harness conversation. Shared workspace or shared findings do not imply shared conversation. A resumed session may have compacted history.</p></details>`;
+      }
+      function workspacePolicy(policy) {
+        return {continuation:"Persistent across waves", "fresh-pristine":"Fresh isolated workspace", control:"Dedicated task workspace"}[policy] || "Workspace policy not recorded";
+      }
+      function filesystemMarkup(fs) {
+        if (!fs) return '<p class="fine">Filesystem allocation not recorded.</p>';
+        const usage = {"first-recorded-use":"First recorded use", "reused-across-tasks":"Reused across tasks / waves", "reused-attempt":"Reused for another attempt", "retained-from-parent":"Reused from parent run", "not-recorded":"No execution recorded", unknown:"Allocation history unavailable"}[fs.usage] || "Allocation history unavailable";
+        const imports = {none:"None", "research-frontier":"Accepted research", "negative-review-packet-only":"Review evidence", "full-frontier":"Accepted evidence"}[fs.importedEvidence] || "Not recorded";
+        const rows = (fs.uses || []).map(use => `<tr><td>${esc(use.stageId)} / ${esc(use.waveId)}</td><td>${esc(use.taskId)}${use.selected ? " · selected" : ""}</td><td>${num(use.attempt)}</td></tr>`).join("");
+        return `<h3>Filesystem</h3><p class="environment-state">${esc(usage)}</p>
+          <dl class="identity-list"><dt>Workspace key</dt><dd><code>${esc(fs.workspaceKey)}</code></dd><dt>Configured policy</dt><dd>${esc(workspacePolicy(fs.policy))}</dd><dt>Imported evidence</dt><dd>${esc(imports)}</dd><dt>Owning run</dt><dd><code>${esc(fs.sourceRunId)}</code></dd></dl>
+          ${rows ? `<details data-disclosure="workspace-history"><summary>Workspace history (${num(fs.uses.length)}${fs.usesTruncated ? "+" : ""} uses)</summary><div class="table-wrap"><table><thead><tr><th>Stage / wave</th><th>Agent</th><th>Attempt</th></tr></thead><tbody>${rows}</tbody></table></div></details>` : ""}
+          <details class="help" data-disclosure="workspace-help"><summary>What does this mean?</summary><p>Evidence is copied; this does not share another agent’s live filesystem. The run and workspace key identify the allocation. Recorded reuse does not prove that files survived a container restart. A fresh conversation can reuse this filesystem.</p></details>`;
+      }
+      function handleInspectorVisibility() {
+        if (document.hidden) {
+          clearTimeout(inspectorTimer); inspectorController?.abort();
+          inspectorController = null; inspectorLoading = false;
+        } else if ($("inspector-follow").checked) void loadAgentInspector();
+      }
+      async function loadAgentInspector() {
+        const selection = agentInspectionSelection();
+        if (!selection || isExample || inspectorLoading) return;
+        inspectorLoading = true;
+        $("inspector-more").disabled = true;
+        const selectedKey = JSON.stringify(selection);
+        inspectorController?.abort(); clearTimeout(inspectorTimer);
+        const controller = inspectorController = new AbortController();
+        try {
+          const data = await api(inspectorUrl(selection, inspectorAttempt, inspectorOffset), controller.signal);
+          if (controller.signal.aborted || inspectorKey !== selectedKey || JSON.stringify(agentInspectionSelection()) !== selectedKey) return;
+          inspectorData = data; inspectorAttempt = data.selectedAttempt;
+          $("inspector-attempt").innerHTML = data.attempts.map(a => `<option value="${esc(a.id)}">Attempt ${num(a.attempt)} · ${esc(contextLabel(a.context))} · ${esc(new Date(a.recordedAt).toLocaleString())}</option>`).join("");
+          $("inspector-attempt").value = data.selectedAttempt || "";
+          renderDisclosures($("inspector-context"), contextMarkup(data), `${selectedKey}:${data.selectedAttempt}`);
+          renderDisclosures($("inspector-filesystem"), filesystemMarkup(data.filesystem), `${selectedKey}:${data.selectedAttempt}`);
+          $("inspector-prompt").textContent = data.prompt.text || (data.selectedAttempt ? "The exact prompt was not retained or could not be verified against its recorded digest." : "No execution attempt is recorded, so there is no delivered prompt to inspect.");
+          $("inspector-prompt-status").textContent = !data.selectedAttempt ? "No recorded execution" : data.prompt.status === "recorded" ? "Original recorded prompt" : data.prompt.status === "verified-reconstruction" ? "Verified from saved configuration." : "Exact prompt unavailable";
+          $("inspector-protocol").textContent = data.prompt.researcherProtocol || "";
+          $("inspector-protocol").closest("details").hidden = !data.prompt.researcherProtocol;
+          if (data.logs.mode === "stderr-tail-only") { inspectorTail = ""; inspectorTranscript = newAgentTranscript(); }
+          inspectorTail += data.logs.events.map(logEventText).join("");
+          inspectorOffset = data.logs.nextOffset;
+          appendAgentTranscript(inspectorTranscript, data.logs.events, data.logs.complete && data.logs.nextOffset >= data.logs.chunkCount);
+          renderInspectorLog();
+          const captured = data.logs.mode === "captured";
+          $("inspector-download").disabled = !data.selectedAttempt;
+          $("inspector-follow").disabled = !captured;
+          if (!captured) $("inspector-follow").checked = false;
+          $("inspector-status").textContent = captured
+            ? (data.logs.truncated ? "Capture incomplete: some output was not saved." : "")
+            : data.logs.mode === "stderr-tail-only" ? "Only diagnostic output was saved for this attempt."
+            : "No output saved yet.";
+          if (data.incomplete) $("inspector-status").textContent += " Recovery history listing is incomplete.";
+          if (data.selectedAttempt && data.attempts[0]?.id && data.attempts[0].id !== data.selectedAttempt) $("inspector-status").textContent += " A newer attempt is available.";
+          $("inspector-more").hidden = !captured || inspectorOffset >= data.logs.chunkCount;
+          if (captured && $("inspector-follow").checked && !document.hidden && (inspectorOffset < data.logs.chunkCount || !data.logs.complete))
+            inspectorTimer = setTimeout(loadAgentInspector, inspectorOffset < data.logs.chunkCount ? 0 : 5000);
+        } catch (error) {
+          if (!controller.signal.aborted && inspectorKey === selectedKey) {
+            $("inspector-status").textContent = `Could not read agent records: ${error.message}`;
+            if ($("inspector-follow").checked && !document.hidden) inspectorTimer = setTimeout(loadAgentInspector, 5000);
+          }
+        } finally {
+          if (inspectorController === controller) { inspectorLoading = false; $("inspector-more").disabled = false; }
+        }
+      }
+      async function downloadAgentLog() {
+        const selection = agentInspectionSelection();
+        if (!selection || !inspectorAttempt) return;
+        const attempt = inspectorAttempt, selectedKey = inspectorKey;
+        const controller = new AbortController();
+        inspectorController?.abort(); clearTimeout(inspectorTimer); inspectorController = controller;
+        $("inspector-download").disabled = true; inspectorLoading = false;
+        try {
+          const parts = []; let offset = 0, count = null;
+          for (let page = 0; page < 256; page++) {
+            const data = await api(inspectorUrl(selection, attempt, offset), controller.signal);
+            if (controller.signal.aborted || inspectorKey !== selectedKey || inspectorAttempt !== attempt) return;
+            if (count === null) count = data.logs.chunkCount;
+            parts.push(...data.logs.events.map(event => JSON.stringify(event) + "\n"));
+            if (data.logs.nextOffset <= offset || data.logs.nextOffset >= count) break;
+            offset = data.logs.nextOffset;
+          }
+          const blob = new Blob(parts, { type: "application/x-ndjson" }), url = URL.createObjectURL(blob), link = document.createElement("a");
+          link.href = url; link.download = `swarm-${selection.runId}-${selection.taskId}-log.jsonl`; link.click(); URL.revokeObjectURL(url);
+        } catch (error) {
+          if (!controller.signal.aborted) $("inspector-status").textContent = `Log download failed: ${error.message}`;
+        } finally { if (inspectorKey === selectedKey && inspectorAttempt === attempt) {
+          $("inspector-download").disabled = false;
+          if ($("inspector-follow").checked && !document.hidden) inspectorTimer = setTimeout(loadAgentInspector, 5000);
+        } }
+      }
+
+      function performanceSelection() {
+        if (!snapshot) return null;
+        const wave = progressWave();
+        if (!wave) return null;
+        const task = selectedAgent ? (wave.tasks || []).find(t => t.agentId === selectedAgent) : null;
+        if (selectedAgent && !task) return null;
+        return { runId: snapshot.run.id, stageId: wave.stageId, waveId: wave.sourceWaveId || wave.id, poolId: wave.modelPool || null, taskId: task?.taskId || null };
+      }
+      function resetPerformance() {
+        performanceController?.abort();
+        performanceController = null;
+        performanceData = performanceKey = null;
+        performanceLoading = false;
+      }
+      function performanceChart(groups) {
+        if (!groups.length) return '<div class="empty">Request timing is not recorded for these agents yet.</div>';
+        const width = 760, left = 290, right = 655, row = 58, height = 25 + groups.length * row;
+        const max = Math.max(1, ...groups.map(g => g.outputTokensPerSecond ?? 0));
+        return `<svg viewBox="0 0 ${width} ${height}" style="min-width:620px" role="img" aria-label="Reported output tokens per successful request second by endpoint and model">${groups.map((g, i) => {
+          const y = 15 + i * row;
+          const label = `${g.provider} · ${g.model}`;
+          return `<g><title>${esc(label)} · ${rateText(g.outputTokensPerSecond)} output/request second · ${g.measuredRequests}/${g.requests} measured requests</title><text x="0" y="${y + 12}" fill="#dedee6" font-size="12">${esc(label.length > 38 ? label.slice(0, 35) + "…" : label)}</text><text x="0" y="${y + 29}" fill="#999aa5" font-size="10">${esc(`Thinking: ${g.thinking ?? "not recorded"} · effort: ${g.reasoningEffort ?? "not recorded"}`)}</text><rect x="${left}" y="${y}" width="${right-left}" height="19" fill="#292c36" rx="3"/>${g.outputTokensPerSecond == null ? "" : `<rect x="${left}" y="${y}" width="${(right-left)*g.outputTokensPerSecond/max}" height="19" fill="#00dce5" rx="3"/>`}<text x="${right+10}" y="${y+14}" fill="#dedee6" font-size="12">${rateText(g.outputTokensPerSecond)}</text></g>`;
+        }).join("")}</svg>`;
+      }
+      function renderPerformance() {
+        const selection = performanceSelection(), selectedKey = selection ? JSON.stringify(selection) : null;
+        if (performanceKey !== selectedKey) { resetPerformance(); performanceKey = selectedKey; }
+        $("performance-scope").textContent = selection
+          ? `${selection.stageId} / ${selection.poolId ? selection.poolId + " / " : ""}${selection.waveId} · ${selection.taskId ? agentLabel(selectedAgent) : "all agents"}`
+          : "Select a wave containing this agent.";
+        $("performance-load").disabled = !selection || performanceLoading || isExample;
+        $("performance-load").textContent = performanceLoading ? "Reading receipts…" : performanceData ? "Refresh request timing" : "Load request timing";
+        $("performance-chart").innerHTML = performanceData ? performanceChart(performanceData.groups) : "";
+        $("performance-table").innerHTML = performanceData?.groups.length ? `<table><thead><tr><th>Endpoint / model</th><th>Measured requests</th><th>Output / request sec</th><th>Median first byte</th><th>Median response</th><th>Failed / aborted</th></tr></thead><tbody>${performanceData.groups.map(g => `<tr><td>${esc(g.provider)} · ${esc(g.model)}<br><small>${g.taskIds.length} agent task(s) · ${g.stream === null ? "streaming unknown" : g.stream ? "streaming" : "non-streaming"}</small></td><td>${g.measuredRequests} / ${g.requests}</td><td>${rateText(g.outputTokensPerSecond)}</td><td>${g.medianFirstByteMs == null ? "—" : `${rateText(g.medianFirstByteMs / 1000)}s`}<br><small>${g.firstByteRequests} samples</small></td><td>${duration(g.medianRequestMs)}</td><td>${g.failedOrAbortedRequests}</td></tr>`).join("")}</tbody></table>` : "";
+        $("performance-note").textContent = performanceData?.note || "Request time includes the endpoint’s queueing, response and network time. Agent, wave and stage rates above also include work between requests. Historical subscription agents may lack request timing. ";
+        if (!performanceLoading) $("performance-status").textContent = isExample
+          ? "Request timing is available for real runs."
+          : performanceData ? `${performanceData.receiptsWithTelemetry}/${performanceData.inspectedReceipts} saved attempts contain request timing · read ${new Date(performanceData.observedAt).toLocaleTimeString()}${performanceData.incomplete ? " · incomplete history" : ""}. In-flight requests are unknown.`
+          : "Load saved request measurements for the selected wave. Choose an agent to narrow the view.";
+      }
+      async function loadPerformance() {
+        const selection = performanceSelection();
+        if (!selection || isExample) return;
+        resetPerformance();
+        const requestKey = performanceKey = JSON.stringify(selection);
+        const controller = performanceController = new AbortController();
+        performanceLoading = true;
+        renderPerformance();
+        $("performance-status").textContent = "Reading saved request timing…";
+        const params = new URLSearchParams({ stage: selection.stageId, wave: selection.waveId });
+        if (selection.poolId) params.set("pool", selection.poolId);
+        if (selection.taskId) params.set("task", selection.taskId);
+        try {
+          const data = await api(`/dashboard/api/runs/${encodeURIComponent(selection.runId)}/performance?${params}`, controller.signal);
+          if (controller.signal.aborted || performanceKey !== requestKey || JSON.stringify(performanceSelection()) !== requestKey) return;
+          performanceData = data;
+          performanceLoading = false;
+          renderPerformance();
+        } catch (error) {
+          if (controller.signal.aborted || performanceKey !== requestKey) return;
+          performanceLoading = false;
+          renderPerformance();
+          $("performance-status").textContent = error.message;
+        }
+      }
+      function modelName(model) {
+        if (/^deepseek[:/-]/i.test(model)) return "DeepSeek";
+        return model;
+      }
+      function assignmentLabel(task) {
+        if (task.promptKind === "research" && Number.isSafeInteger(task.researcher))
+          return `${modelName(task.model)} · ${task.providerClass === "additive" ? "mirrors researcher" : "researcher"} ${task.researcher}`;
+        return task.agentId;
+      }
+      function agentLabel(id) {
+        const tasks = (snapshot?.waves || []).flatMap(w => w.tasks || []).filter(t => t.agentId === id);
+        const labels = [...new Set(tasks.map(assignmentLabel))];
+        return labels.length === 1 ? labels[0] : id;
+      }
+      function waveRoster(wave) {
+        const tasks = wave?.tasks || [];
+        const summarize = entries => {
+          const groups = new Map();
+          for (const t of entries) {
+            const group = JSON.stringify([t.modelPool || null, t.model, t.provider]);
+            const ambiguous = entries.some(other => modelName(other.model) === modelName(t.model)
+              && (other.modelPool !== t.modelPool || other.provider !== t.provider));
+            const label = modelName(t.model) + (ambiguous ? ` (${t.modelPool || t.provider})` : "");
+            const value = groups.get(group) || { label, count: 0 };
+            value.count++;
+            groups.set(group, value);
+          }
+          return [...groups.values()].map(g => `${g.count} ${g.label}`).join(" + ");
+        };
+        const research = tasks.filter(t => t.promptKind === "research");
+        const other = tasks.filter(t => t.promptKind !== "research");
+        return research.length
+          ? `Research agents in this wave: ${summarize(research)}${other.length ? ` · Additional jobs: ${summarize(other)}` : ""}`
+          : `Configured jobs in this wave: ${summarize(tasks) || "none"}`;
+      }
+      function discoveryPoolProgress(waves) {
+        const pools = new Map();
+        for (const wave of waves) {
+          const byPool = new Map();
+          for (const task of wave.tasks || []) {
+            if (task.promptKind !== "research" || !task.modelPool) continue;
+            const id = JSON.stringify([wave.stageId, task.modelPool]);
+            const pool = pools.get(id) || { id: task.modelPool, model: task.model, provider: task.provider, waves: [] };
+            pools.set(id, pool);
+            const tasks = byPool.get(id) || [];
+            tasks.push(task);
+            byPool.set(id, tasks);
+          }
+          for (const [id, tasks] of byPool) {
+            if (tasks.every(task => ["pending", "not-run"].includes(task.status))) continue;
+            const accepted = tasks.filter(task => task.status === "accepted").length;
+            const waiting = tasks.filter(task => visibleTaskStatus(task, wave) === "awaiting-result").length;
+            const unresponsive = tasks.filter(task => visibleTaskStatus(task, wave) === "unresponsive").length;
+            const returned = tasks.filter(task => task.status === "returned").length;
+            const other = [...new Set(tasks.map(task => task.status))]
+              .filter(status => !["accepted", "awaiting-result", "returned"].includes(status))
+              .map(status => `${tasks.filter(task => task.status === status).length} ${(taskStatusLabels[status] || taskStatusLabels.unknown).toLowerCase()}`);
+            const local = tasks[0].localWave;
+            pools.get(id).waves.push({ key: key(wave), label: Number.isSafeInteger(local) ? `Wave ${local}` : wave.id,
+              accepted, waiting, unresponsive, returned, other, total: tasks.length });
+          }
+        }
+        return [...pools.values()];
+      }
+      function poolProgressMarkup(waves) {
+        const pools = discoveryPoolProgress(waves);
+        if (!pools.length) return "";
+        return '<div><h3>Discovery waves</h3></div>'
+          + pools.map(pool => `<div class="pool-row"><div><strong>${esc(pool.id)}</strong><small>${esc(modelName(pool.model))} · ${esc(pool.provider)}</small></div><div class="pool-waves">`
+            + (pool.waves.length ? pool.waves.map(wave => {
+              const detail = `${wave.accepted}/${wave.total} accepted${wave.waiting ? ` · ${wave.waiting} awaiting result` : ""}${wave.unresponsive ? ` · ${wave.unresponsive} unresponsive` : ""}${wave.returned ? ` · ${wave.returned} returned` : ""}${wave.other.length ? ` · ${wave.other.join(" · ")}` : ""}`;
+              return `<button class="pool-wave ${selectedWave === wave.key ? "selected" : ""}" data-wave="${esc(wave.key)}" data-complete="${wave.accepted === wave.total}" data-unresponsive="${wave.unresponsive > 0}" title="${esc(detail)}" aria-label="${esc(`${pool.id} · ${wave.label} · ${detail}`)}">${esc(wave.label)}<small>${esc(detail)}</small></button>`;
+            }).join("") : '<span class="muted">Not started</span>') + '</div></div>').join("");
+      }
+      function assignmentWaves(id) {
+        const rows = (snapshot.activity || []).filter(x => x.agentId === id
+          && (!selectedStage || x.stageId === selectedStage)
+          && (!selectedWave || `${x.stageId}/${x.waveId}` === selectedWave));
+        const waves = [...new Set(rows.map(x => `${x.stageId}/${x.waveId}`))];
+        return waves.length ? `Recorded in ${waves.slice(0, 3).join(", ")}${waves.length > 3 ? ` + ${waves.length - 3} more waves` : ""}` : "No recorded execution in this scope";
+      }
+      function laneCard(task, waveKey = "", waveTiming = null) {
+        const wave = snapshot?.waves.find(w => key(w) === waveKey);
+        const status = visibleTaskStatus(task, wave);
+        const label = taskStatusLabels[status] || taskStatusLabels.unknown;
+        const recorded = tokens(task.usage), provisional = tokens(task.provisionalUsage);
+        const noModelCalls = modelFreeTask(task);
+        const hasUsage = recorded > 0 || task.usage?.modelCalls > 0 || ["accepted", "unavailable"].includes(task.status);
+        const usage = noModelCalls ? "No model calls · 0 tokens" : [hasUsage ? `${fmt(recorded)} recorded tokens` : "",
+          provisional ? `${fmt(provisional)} provisional tokens` : ""].filter(Boolean).join(" · ") || "Usage not recorded";
+        return `<button class="lane lane-card ${selectedAgent === task.agentId ? "active" : ""}" data-status="${esc(status)}" data-agent="${esc(task.agentId)}" data-task-wave="${esc(waveKey)}" aria-pressed="${selectedAgent === task.agentId}">
+          <span class="lane-state">${esc(label)}</span><strong>${esc(assignmentLabel(task))}</strong>
+          <small>${esc(modelName(task.model))} · ${esc(task.role)}</small>
+
+          <small class="lane-time">${timingMarkup(task.timing)}</small><small>${esc(taskTimeLabel(task))}</small>
+          <div class="bar ${task.timing?.live && status !== "unresponsive" ? "live" : ""}" aria-hidden="true"><span style="width:${Math.min(100, Math.max(0, (elapsedTime(task.timing) ?? 0) / Math.max(1, elapsedTime(waveTiming) ?? 1) * 100))}%"></span></div>
+          ${observationMarkup(taskObservation(task, wave))}
+          <small>${esc(usage)}</small>
+          <small>${throughputMarkup(task.throughput, noModelCalls)}</small>
+          ${task.lastAttempt ? `<small>Last observed attempt ${num(task.lastAttempt)}${task.rejectedAttempts ? ` · ${num(task.rejectedAttempts)} recorded rejections` : ""}</small>` : ""}
+          ${task.timing?.sourceRunId ? `<small>Original execution: ${esc(task.timing.sourceRunId)}</small>` : ""}
+          <span class="inspect-link">${noModelCalls ? "Open step →" : "Open session →"}</span></button>`;
+      }
+      function renderProgress() {
+        const wave = progressWave();
+        const waves = snapshot.waves.filter(w => !selectedStage || w.stageId === selectedStage);
+        $("pool-progress").innerHTML = poolProgressMarkup(waves);
+        $("progress-wave").innerHTML = waves.filter(w => $("show-planned").checked || !["pending", "planned", "not-run"].includes(w.status) || key(w) === key(wave || {})).map(w => `<option value="${esc(key(w))}">${esc(w.label)} · ${esc(w.status === "complete" ? "complete" : w.status)}</option>`).join("");
+        $("progress-wave").value = wave ? key(wave) : "";
+        const tasks = wave?.tasks || [];
+        const count = status => tasks.filter(t => visibleTaskStatus(t, wave) === status).length;
+        const otherStates = ["unresponsive", "rejected", "unavailable", "interrupted", "not-run", "unknown"]
+          .filter(status => count(status)).map(status => `${count(status)} ${taskStatusLabels[status].toLowerCase()}`);
+        $("progress-summary").textContent = wave
+          ? `${wave.status === "complete" ? "Complete" : wave.status === "current" ? "Current wave" : wave.status === "not-run" ? "Wave not run" : ["failed", "stopped", "incomplete"].includes(wave.status) ? `Run ${wave.status}` : "Planned wave"} · ${count("accepted")} accepted · ${count("returned")} returned · ${count("awaiting-result")} awaiting result${otherStates.length ? ` · ${otherStates.join(" · ")}` : ""} · ${tasks.length} configured jobs`
+          : "No configured waves.";
+        $("progress-roster").textContent = waveRoster(wave);
+        $("progress-time").innerHTML = `Wave elapsed: ${timingMarkup(wave?.timing)} · ${throughputMarkup(wave?.throughput, modelFreeWave(wave))}`;
+        $("lane-strip").innerHTML = tasks.map(t => `<span class="lane lane-segment" data-status="${esc(visibleTaskStatus(t, wave))}"></span>`).join("");
+        $("lane-grid").innerHTML = tasks.length ? tasks.map(t => laneCard(t, key(wave), wave.timing)).join("") : '<p class="empty">Agent status is unavailable in this snapshot.</p>';
+        $("progress-note").textContent = "Elapsed time includes startup, tools, retries and result collection. Returned results are awaiting validation; accepted outputs passed their task contract."
+          + (snapshot.freshness.receiptsTruncated ? " Receipt listing is incomplete; some returns may be missing." : "")
+          + (snapshot.freshness.legacyReceipts ? " Older receipts lack agent attribution." : "");
+      }
+      function renderOverview() {
+        renderProgress();
+        const waves = snapshot.waves.filter(
+            (w) => !selectedStage || w.stageId === selectedStage,
+          ),
+          visible = waves.filter((w) => ["complete", "current", "failed", "stopped", "incomplete"].includes(w.status));
+        $("filter-label").textContent = [
+          selectedStage || "All stages",
+          selectedWave?.split("/").slice(1).join("/") || "all waves",
+          selectedAgent ? agentLabel(selectedAgent) : "all assignments",
+        ].join(" · ");
+        const showTime = waveMetric === "time", showRate = waveMetric === "throughput";
+        const measure = w => showTime ? elapsedTime(w.timing) : showRate ? w.throughput?.totalTokensPerSecond ?? null : tokens(w.usage);
+        const measureLabel = w => showTime ? duration(measure(w)) : showRate ? `${rateText(measure(w))} recorded tokens/s${w.throughput?.partial ? " · partial" : ""}${w.throughput?.provisional ? " · includes provisional" : ""}` : `${num(tokens(w.usage))} tokens`;
+        $("wave-legend").hidden = showTime;
+        $("wave-legend").innerHTML = showRate
+          ? '<span><i style="background:var(--blue)"></i>Input · includes cache</span><span><i style="background:var(--cyan)"></i>Output</span>'
+          : '<span><i style="background:var(--blue)"></i>Uncached input</span><span><i style="background:var(--purple)"></i>Cached input</span><span><i style="background:var(--cyan)"></i>Output</span><span><i style="background:var(--amber)"></i>Observations · right axis</span>';
+        const width = Math.max(700, visible.length * 26 + 65),
+          height = 255,
+          top = 28,
+          bottom = 215,
+          max = Math.max(1, ...visible.map((w) => measure(w) ?? 0)),
+          maxObs = Math.max(1, ...visible.map((w) => w.observationCount)),
+          step = (width - 76) / Math.max(visible.length, 1);
+        let svg = `<svg viewBox="0 0 ${width} ${height}" style="min-width:${width}px" role="group" aria-label="${showTime ? "Elapsed time by wave" : showRate ? "Recorded tokens per second by wave" : "Token usage and observations by wave"}">`;
+        for (let i = 0; i <= 3; i++) {
+          const y = bottom - ((bottom - top) * i) / 3;
+          svg += `<line x1="48" y1="${y}" x2="${width - 30}" y2="${y}" stroke="#30313a"/><text x="40" y="${y + 4}" fill="#999aa5" font-size="10" text-anchor="end">${showTime ? axisDuration((max * i) / 3) : fmt((max * i) / 3)}</text><text x="${width - 25}" y="${y + 4}" fill="#ffc978" font-size="9">${showTime || showRate ? "" : Math.round((maxObs * i) / 3)}</text>`;
+        }
+        const points = [];
+        visible.forEach((w, i) => {
+          const x = 50 + i * step,
+            bw = Math.max(5, step - 7),
+            cached = w.usage.cachedInputTokens || 0,
+            values = showTime ? [elapsedTime(w.timing) ?? 0] : showRate
+              ? [w.throughput?.inputTokensPerSecond ?? 0, w.throughput?.outputTokensPerSecond ?? 0] : [
+              Math.max(0, raw(w.usage) - cached),
+              cached,
+              w.usage.outputTokens,
+            ],
+            colors = showTime ? [w.status === "complete" ? "#00ffff" : w.timing?.live ? "#6b8aff" : "#777984"] : showRate ? ["#6b8aff", "#00ffff"] : ["#6b8aff", "#bc9cff", "#00ffff"];
+          let y = bottom;
+          svg += `<g role="button" tabindex="0" data-wave="${esc(key(w))}" aria-label="${esc(w.label)}, ${esc(measureLabel(w))}, ${w.status}"><title>${esc(w.label)} · ${esc(measureLabel(w))} · ${w.status}</title><rect x="${x}" y="${top}" width="${bw}" height="${bottom - top}" fill="${selectedWave === key(w) ? "#ffffff09" : "transparent"}"/>`;
+          values.forEach((v, j) => {
+            const h = (v / max) * (bottom - top);
+            y -= h;
+            svg += `<rect x="${x}" y="${y}" width="${bw}" height="${h}" fill="${colors[j]}" rx="1"/>`;
+          });
+          if (measure(w) == null || measure(w) === 0)
+            svg += `<rect x="${x}" y="${bottom - 2}" width="${bw}" height="2" fill="#575964"/>`;
+          if (visible.length < 18 || i % 3 === 0 || i === visible.length - 1)
+            svg += `<text x="${x + bw / 2}" y="${bottom + 21}" fill="#999aa5" font-size="9" text-anchor="middle">${esc(w.id.replace(/^wave-/, ""))}</text>`;
+          svg += "</g>";
+          points.push(
+            `${x + bw / 2},${bottom - (w.observationCount / maxObs) * (bottom - top)}`,
+          );
+        });
+        if (!showTime && !showRate) svg += `<polyline points="${points.join(" ")}" fill="none" stroke="#ffc978" stroke-width="1.5" pointer-events="none"/>`;
+        svg += "</svg>";
+        $("waves").innerHTML = visible.length
+          ? svg
+          : '<div class="empty">No waves started in this scope.</div>';
+        $("wave-note").textContent =
+          "Chart shows started waves; planned waves remain in the Stage / wave selector. " + (showTime ? "Wave admission → seal. Blue bars await a seal; cyan bars are sealed; gray bars have no active clock. Pauses and retries are included. Missing times are not zero-duration work." : showRate
+            ? "Recorded input + output / wave elapsed seconds. Parallel agents share one elapsed-time span. Active waves are partial; unvalidated receipts are provisional. Updates with each snapshot, not each token. Missing timing or usage is unavailable, not zero speed."
+            : `${waves.filter((w) => w.status === "not-run").length} planned waves not run. Cache detail may be incomplete. Wave labels belong to their stage; zero usage does not establish a completed task.`);
+        const agents = snapshot.agents
+            .map((a) => ({ ...a, scoped: agentUsage(a) }))
+            .filter(
+              (a) => tokens(a.scoped) > 0 || (!selectedStage && !selectedWave)
+                || scopeWaves().some(w => (w.tasks || []).some(t => t.agentId === a.id)),
+            ),
+          maxAgent = Math.max(1, ...agents.map((a) => tokens(a.scoped)));
+        $("contributions-scope").textContent = `Usage scope: ${selectedWave || `${selectedStage || "All stages"} · all waves`}. Rows group research assignments and stage jobs across this scope, not concurrent agents. Report links cover the whole run.`;
+        $("agents").innerHTML = agents.length
+          ? agents
+              .sort((a, b) => tokens(b.scoped) - tokens(a.scoped))
+              .map(
+                (a) =>
+                  `<button class="agent ${selectedAgent === a.id ? "active" : ""}" data-agent="${esc(a.id)}"><div class="agent-top"><span>${esc(agentLabel(a.id))}</span><span class="mono">${fmt(tokens(a.scoped))}</span></div><div class="bar"><span style="width:${(tokens(a.scoped) / maxAgent) * 100}%"></span></div><small>${esc(assignmentWaves(a.id))}</small><small>${esc(a.model)} · ${a.linkedReportItems} report links · ${a.firstRecordedItems} earliest recorded</small></button>`,
+              )
+              .join("")
+          : '<div class="empty">No agent usage in this scope.</div>';
+        const chosen = snapshot.agents.find((a) => a.id === selectedAgent),
+          wave = snapshot.waves.find((w) => key(w) === selectedWave),
+          usage = chosen
+            ? agentUsage(chosen)
+            : sum(scopeWaves().map((w) => w.usage));
+        $("selection-title").textContent = chosen
+          ? `${agentLabel(chosen.id)} · ${chosen.model}`
+          : wave
+            ? wave.label
+            : selectedStage || "Whole run";
+        $("selection-copy").textContent = chosen
+          ? `${chosen.role} · ${chosen.observations} recorded observations · ${chosen.acceptedTasks} accepted tasks · ${chosen.rejectedAttempts} rejected attempts · Workspace ID: ${chosen.id}`
+          : wave
+            ? `${wave.status} · ${waveRoster(wave)} · ${wave.observationCount} observations`
+            : "Select stage, wave, or agent to narrow the accounting.";
+        $("selection-data").innerHTML = `<div class="facts">${[
+          ["Input", num(raw(usage))],
+          ["Cached input", cachedLabel(usage)],
+          ["Output", num(usage.outputTokens)],
+          ["Recorded calls", num(usage.modelCalls)],
+          ["Cost", costLabel(usage)],
+        ]
+          .map(
+            (x) =>
+              `<div><small>${esc(x[0])}</small><span class="mono">${esc(x[1])}</span></div>`,
+          )
+          .join(
+            "",
+          )}</div>${chosen ? `<button data-contributor="${esc(chosen.id)}" class="quiet">Trace this agent’s report links →</button>` : ""}`;
+        $("provisional").innerHTML = snapshot.provisionalCompletions.length
+          ? `<h3>Completed calls awaiting wave accounting</h3><p class="fine">${fmt(tokens(snapshot.provisionalUsage))} tokens reported provisionally. Kept separate from accepted usage; throughput labels provisional usage explicitly.</p><div class="table-wrap"><table><thead><tr><th>Stage / wave</th><th>Task / model</th><th>Tokens</th><th>Receipt time</th></tr></thead><tbody>${snapshot.provisionalCompletions.map((x) => `<tr><td>${esc(x.stageId)} / ${esc(x.waveId)}</td><td>${esc(x.taskId)} · ${esc(x.model)}</td><td>${fmt(tokens(x.usage))}</td><td>${esc(new Date(x.recordedAt).toLocaleTimeString())}</td></tr>`).join("")}</tbody></table></div>`
+          : "";
+      }
+      function renderLineage() {
+        const query = $("finding-search").value.toLowerCase(),
+          findings = snapshot.findings
+            .filter((f) =>
+              `${f.id} ${f.label} ${f.contributors.join(" ")}`
+                .toLowerCase()
+                .includes(query),
+            )
+            .sort(
+              (a, b) =>
+                Number(b.inReport) - Number(a.inReport) ||
+                a.id.localeCompare(b.id),
+            );
+        if (!findings.some((f) => f.id === selectedFinding)) {
+          selectedFinding = findings[0]?.id || null;
+          selectedNode = null;
+        }
+        const finding = findings.find((f) => f.id === selectedFinding);
+        $("finding-list").innerHTML =
+          findings
+            .map(
+              (f) =>
+                `<button data-finding="${esc(f.id)}" class="finding ${f.id === selectedFinding ? "active" : ""}"><strong>${esc(f.id)}</strong><small>${f.inReport ? "Included in report" : "Observation / intermediate reference"} · ${esc(f.disposition)}${f.dissent ? " · disagreement" : ""}<br>${f.contributors.length ? esc(f.contributors.join(" + ")) : "Source attribution unavailable"}</small></button>`,
+            )
+            .join("") ||
+          '<div class="empty">No recorded references match.</div>';
+        if (!finding) {
+          $("lineage-graph").innerHTML =
+            '<div class="empty">No structured finding history recorded yet.</div>';
+          $("lineage-facts").replaceChildren();
+          $("node-detail").replaceChildren();
+          return;
+        }
+        $("lineage-title").textContent = finding.label;
+        $("lineage-subtitle").textContent =
+          "Recorded links from first exploration to retained report. Click a node to inspect its evidence.";
+        const nodes = snapshot.nodes.filter((n) =>
+            finding.nodeIds.includes(n.id),
+          ),
+          cols = {
+            observation: 0,
+            review: 1,
+            reference: 2,
+            verification: 3,
+            report: 4,
+          },
+          counts = [0, 0, 0, 0, 0],
+          positions = new Map();
+        nodes
+          .sort(
+            (a, b) => cols[a.kind] - cols[b.kind] || a.waveIndex - b.waveIndex,
+          )
+          .forEach((n) => {
+            const col = cols[n.kind] ?? 2;
+            positions.set(n.id, {
+              x: 15 + col * 212,
+              y: 44 + counts[col]++ * 83,
+            });
+          });
+        const height = Math.max(190, Math.max(...counts) * 83 + 80),
+          color = (n) =>
+            n.kind === "observation"
+              ? "#6b8aff"
+              : n.kind === "report"
+                ? "#00ffff"
+                : n.kind === "verification"
+                  ? "#ffc978"
+                  : "#bc9cff";
+        let svg = `<svg viewBox="0 0 1070 ${height}" role="group" aria-label="Finding history for ${esc(finding.id)}">`;
+        ["OBSERVATIONS", "REVIEWS", "REFERENCES", "VERIFICATION", "REPORT"].forEach(
+          (s, i) =>
+            (svg += `<text x="${15 + i * 212}" y="20" fill="#999aa5" font-size="10">${s}</text>`),
+        );
+        for (const e of snapshot.edges) {
+          const a = positions.get(e.from),
+            b = positions.get(e.to);
+          if (!a || !b) continue;
+          svg += `<path d="M${a.x + 182} ${a.y + 28} C${a.x + 203} ${a.y + 28},${b.x - 25} ${b.y + 28},${b.x} ${b.y + 28}" stroke="#4c4f60" fill="none" stroke-width="1.5"/>`;
+        }
+        for (const n of nodes) {
+          const p = positions.get(n.id);
+          svg += `<g role="button" tabindex="0" data-node="${esc(n.id)}" aria-label="${esc(n.kind + ": " + n.label)}"><title>${esc(n.label)}</title><rect x="${p.x}" y="${p.y}" width="182" height="61" rx="7" fill="${selectedNode === n.id ? "#2b2e39" : "#202129"}" stroke="${color(n)}" stroke-opacity=".7"/><text x="${p.x + 10}" y="${p.y + 21}" fill="#ededef" font-size="10">${esc(n.label.slice(0, 25))}${n.label.length > 25 ? "…" : ""}</text><text x="${p.x + 10}" y="${p.y + 39}" fill="#999aa5" font-size="9">${esc((n.model || n.kind).slice(0, 26))}</text><text x="${p.x + 10}" y="${p.y + 52}" fill="#999aa5" font-size="8">${esc((n.waveId ? `${n.stageId} / ${n.waveId}` : "Structured identifier").slice(0, 33))}</text></g>`;
+        }
+        svg += "</svg>";
+        $("lineage-graph").innerHTML = svg;
+        const earliest = snapshot.waves.find(
+          (w) => w.index === finding.earliestWave,
+        );
+        $("lineage-facts").innerHTML = [
+          ["Earliest recorded wave", earliest?.label || "Unknown"],
+          [
+            "First recorded contributors",
+            finding.firstContributors.join(" + ") || "Unknown",
+          ],
+          [
+            "Verification",
+            (finding.verification || []).length
+              ? `${finding.verification.length} recorded outcome(s)`
+              : "Not recorded",
+          ],
+          ["Severity", "Not recorded"],
+        ]
+          .map((x) => `<div><small>${esc(x[0])}</small>${esc(x[1])}</div>`)
+          .join("");
+        const n =
+          nodes.find((n) => n.id === selectedNode) ||
+          nodes.find((n) => n.kind === "observation") ||
+          nodes[0];
+        if (n) {
+          selectedNode = n.id;
+          $("node-detail").innerHTML =
+            `<h3>${esc(n.label)}</h3><p>${esc(n.detail)}</p><div class="actions">${n.artifactDigest ? `<button data-source="${esc(n.artifactDigest)}">Open recorded source ↗</button>` : '<span class="fine">Source artifact not available for this node.</span>'}</div>`;
+        } else $("node-detail").replaceChildren();
+      }
+      function renderCosts() {
+        const models = new Map();
+        for (const a of snapshot.agents) {
+          const key = JSON.stringify([a.provider, a.model]);
+          const item = models.get(key) || { model: a.model, provider: a.provider, usage: zero() };
+          item.usage = sum([item.usage, a.usage]);
+          models.set(key, item);
+        }
+        $("provider-cost").textContent = costLabel(snapshot.recordedUsage);
+        $("cost-status").textContent = costStatus(snapshot.recordedUsage);
+        $("cost-table").innerHTML =
+          `<table><thead><tr><th>Model</th><th>Provider</th><th class="right">Input</th><th class="right">Cached</th><th class="right">Output</th><th class="right">Cost</th></tr></thead><tbody>${[
+            ...models.values(),
+          ].map(m => `<tr><td>${esc(m.model)}</td><td>${esc(m.provider || "Unknown")}</td><td class="right mono">${num(raw(m.usage))}</td><td class="right mono">${cachedLabel(m.usage)}</td><td class="right mono">${num(m.usage.outputTokens)}</td><td class="right mono">${esc(costLabel(m.usage))}</td></tr>`).join("")}</tbody></table>`;
+      }
+      function exampleDocument() {
+        const name = "example-report.md";
+        return { files: { [name]: "# Example audit report\n\nSynthetic document review — no private audit evidence.\n\n## Summary\n\nOne document needs clarification.\n\n| Outcome | Count |\n| --- | ---: |\n| Retained items | 1 |\n\n### Evidence\n\n- Reviewed the document inventory.\n- Preserved the original observation.\n\n```text\ndocument: example.md\nstatus: needs review\n```\n\n> This is a fictional example.\n" },
+          renderedFiles: { [name]: '<h1>Example audit report</h1><p>Synthetic document review — no private audit evidence.</p><h2>Summary</h2><p>One document needs clarification.</p><table><thead><tr><th>Outcome</th><th>Count</th></tr></thead><tbody><tr><td>Retained items</td><td>1</td></tr></tbody></table><h3>Evidence</h3><ul><li>Reviewed the document inventory.</li><li>Preserved the original observation.</li></ul><pre><code>document: example.md\nstatus: needs review\n</code></pre><blockquote><p>This is a fictional example.</p></blockquote>' } };
+      }
+      function documentElement(data, name, raw) {
+        const html = data.renderedFiles?.[name];
+        const element = document.createElement(!raw && typeof html === "string" ? "div" : "pre");
+        if (!raw && typeof html === "string") {
+          element.className = "markdown-view";
+          // Only our authenticated API's HTML-disabled Markdown renderer supplies this field.
+          element.innerHTML = html;
+        } else {
+          element.className = "document-source";
+          element.textContent = data.files[name];
+        }
+        return element;
+      }
+      function resetReport() {
+        reportController?.abort();
+        reportController = null;
+        reportKey = null;
+        reportData = null;
+        $("report-content").replaceChildren();
+        $("report-artifact").replaceChildren();
+        $("report-file").replaceChildren();
+        $("report-meta").textContent = "";
+        $("report-status").textContent = "No accepted report is available yet.";
+        $("report-controls").hidden = true;
+      }
+      function reportOutputs() {
+        const reports = (snapshot?.nodes || []).filter(n => n.kind === "report" && n.artifactDigest);
+        return reports.filter((n, index) => reports.findIndex(other => other.artifactDigest === n.artifactDigest) === index);
+      }
+      function renderReport() {
+        const reports = reportOutputs();
+        if (!reports.length) { resetReport(); return; }
+        const selected = $("report-artifact").value;
+        $("report-artifact").replaceChildren();
+        for (const report of reports) {
+          const option = document.createElement("option");
+          option.value = report.artifactDigest;
+          option.textContent = report.label;
+          $("report-artifact").append(option);
+        }
+        if (reports.some(n => n.artifactDigest === selected)) $("report-artifact").value = selected;
+        $("report-controls").hidden = false;
+        if (reportKey !== `${snapshot.run.id}:${$("report-artifact").value}`) loadReport();
+      }
+      async function loadReport() {
+        reportController?.abort();
+        const controller = reportController = new AbortController();
+        const runId = snapshot.run.id, digest = $("report-artifact").value;
+        reportKey = `${runId}:${digest}`;
+        reportData = null;
+        $("report-content").replaceChildren();
+        $("report-file").replaceChildren();
+        $("report-meta").textContent = "";
+        $("report-status").textContent = "Loading saved report…";
+        try {
+          const data = isExample ? exampleDocument() : await api(
+            `/dashboard/api/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(digest)}?render=markdown`, controller.signal);
+          if (reportController !== controller || snapshot?.run.id !== runId) return;
+          reportData = data;
+          const names = Object.keys(data.files).sort((a,b) => Number(b === "finding.md") - Number(a === "finding.md") || Number(/\.(md|markdown)$/i.test(b)) - Number(/\.(md|markdown)$/i.test(a)) || a.localeCompare(b));
+          for (const name of names) {
+            const option = document.createElement("option"); option.value = option.textContent = name; $("report-file").append(option);
+          }
+          $("report-status").textContent = names.length ? "Saved, accepted output" : "This output contains no document files.";
+          $("report-meta").textContent = `sha256:${digest}`;
+          renderReportDocument();
+        } catch (error) {
+          if (error.name !== "AbortError" && reportController === controller)
+            $("report-status").textContent = "Report could not be loaded. Use Reload report to try again.";
+        }
+      }
+      function renderReportDocument() {
+        $("report-content").replaceChildren();
+        const name = $("report-file").value;
+        if (reportData && Object.hasOwn(reportData.files, name))
+          $("report-content").append(documentElement(reportData, name, $("report-raw").checked));
+      }
+      let handoverData = null, handoverKey = null, handoverController = null, handoverRunId = null, handoverDataKey = null;
+      function resetHandovers() {
+        handoverController?.abort(); handoverController = null; handoverData = null; handoverKey = null; handoverRunId = null; handoverDataKey = null;
+        disclosureViews.delete($("handover-content")); disclosureViews.delete($("handover-packet"));
+        $("handover-content").replaceChildren(); $("handover-packet").replaceChildren();
+        $("handover-search").value = ""; $("handover-filter").value = "all";
+      }
+      async function loadHandovers() {
+        const runId = snapshot.run.id, generation = snapshot.run.stateGeneration;
+        if (handoverRunId !== runId) { resetHandovers(); handoverRunId = runId; }
+        handoverController?.abort();
+        const controller = handoverController = new AbortController();
+        handoverKey = `${runId}:${generation}`;
+        $("handover-status").textContent = handoverData ? "Updating reviews and evidence…" : "Reading reviews and evidence…";
+        try {
+          if (isExample) {
+            $("handover-status").textContent = "Select a saved audit to inspect its reviews and evidence.";
+            return;
+          }
+          const data = await api(`/dashboard/api/runs/${encodeURIComponent(runId)}/handovers`, controller.signal);
+          if (controller !== handoverController || snapshot?.run.id !== runId) return;
+          handoverData = data; handoverDataKey = `${runId}:${generation}`; renderHandovers();
+        } catch (error) {
+          if (error.name !== "AbortError" && controller === handoverController)
+            $("handover-status").textContent = "Could not load reviews and evidence. Use Reload to try again.";
+        }
+      }
+      function handoverSource(source) {
+        return source ? `<span class="source-author">${esc(modelName(source.model || "deterministic"))} <span class="fine">· ${esc(source.task)}</span></span> <button class="source-link quiet" data-source="${esc(source.digest)}" title="${esc(source.wave)}">Source ↗</button>`
+          : '<span class="fine">Source unavailable</span>';
+      }
+      function handoverOutcome(row) {
+        if (new Set(row.verification.map(v => `${v.behavior}/${v.exploitability}`)).size > 1) return "Mixed verification";
+        if (row.verification.some(v => v.exploitability === "supported")) return "Exploitability supported";
+        if (row.verification.some(v => v.behavior === "reproduced")) return "Behavior reproduced";
+        if (row.dissent) return "Review disagreement";
+        if (row.reviews.length) return [...new Set(row.reviews.map(r => r.finalDisposition))].join(" / ");
+        return row.dispositions.length ? [...new Set(row.dispositions.map(d => d.disposition))].join(" / ") : "Awaiting mapping";
+      }
+      function handoverRowMarkup(row) {
+        const observation = row.observation;
+        const refs = [...new Set([...row.dispositions.map(d => d.reference), ...row.reviews.map(d => d.finalReference)].filter(r => r !== "none"))];
+        const title = observation?.statement || observation?.rationale || "Observation content unavailable";
+        const fields = observation ? ("statement" in observation
+          ? [["Preconditions", observation.conditions.join("\n")], ["Consequence", observation.consequence], ["Evidence", observation.evidence.join("\n")]]
+          : [["Perspective", observation.perspective], ["Evidence", observation.referenceEvidence || "No separate evidence section recorded"]]) : [];
+        const rationale = text => text?.trim() === title.trim() ? '<p class="fine">Same as the recorded observation.</p>' : `<p class="handover-text">${esc(text)}</p>`;
+        const decision = (d, review) => `<details class="decision-detail" data-disclosure="${disclosureKey(row.id, review ? "review" : "mapping", d.source?.digest, d.source?.task, review ? d.finalReference : d.reference)}"><summary><span class="decision-author">${esc(modelName(d.source?.model || "deterministic"))}</span><span class="decision-status">${esc(review ? d.action + " → " + d.finalDisposition : d.disposition)}</span><code>${esc(review ? d.finalReference : d.reference)}</code><span class="detail-hint">Reason</span></summary><div class="decision-evidence">${rationale(d.rationale)}<div class="source-row">${handoverSource(d.source)}</div></div></details>`;
+        return `<details class="handover-row" data-disclosure="${disclosureKey(row.id, "row")}" data-observation="${esc(row.id)}"><summary><span class="handover-meta"><code>${esc(row.id)}</code>${row.dissent ? '<span class="handover-dissent">Review disagreement</span>' : ""}${handoverOutcome(row) !== "Review disagreement" ? `<span class="outcome-badge">${esc(handoverOutcome(row))}</span>` : ""}</span><strong>${esc(title)}</strong><span class="fine">${esc(refs.join(" · ") || "No retained reference")} · ${row.reviews.length} reviews <span class="detail-hint">View evidence ↓</span></span></summary>
+          <div class="handover-body"><div class="decision-flow">
+          <section><h3>Candidate mapping</h3>${row.dispositions.map(d => decision(d,false)).join("") || '<p class="fine">Not recorded</p>'}</section>
+          <section><h3>Independent reviews</h3>${row.reviews.map(d => decision(d,true)).join("") || '<p class="fine">No accepted review yet</p>'}</section>
+          <section><h3>Verification</h3>${row.verification.map(v => `<details class="decision-detail" data-disclosure="${disclosureKey(row.id, "verification", v.source?.digest, v.source?.task, v.reference)}"><summary><code>${esc(v.reference)}</code><span class="decision-status">${esc(v.behavior)}</span><span class="fine">Exploitability: ${esc(v.exploitability)}</span><span class="detail-hint">Evidence</span></summary><div class="decision-evidence"><p class="fine">${esc(v.evidenceMethod || "Evidence method not recorded")}</p><p class="handover-text">${esc(v.evidence)}</p><div class="source-row">${handoverSource(v.source)}</div></div></details>`).join("") || '<p class="fine">No structured verification outcome linked here. Check source files for narrative evidence.</p>'}</section></div>
+          <details class="observation-evidence" data-disclosure="${disclosureKey(row.id, "original")}"><summary>Original observation & evidence</summary><div class="source-row">${handoverSource(row.source)}</div>${fields.map(([name,value]) => `<h4>${esc(name)}</h4><p class="handover-text">${esc(value)}</p>`).join("")}</details>
+          <details class="observation-evidence" data-disclosure="${disclosureKey(row.id, "custody")}"><summary>Report coverage${row.custody.length ? " · retained" : " · not recorded"}</summary>${row.custody.map(c => `<p>Retained references: ${esc(c.references.join(", ") || "none")}</p>${(c.reportSections || []).map(link => `<p>Report section: ${esc(link.section)} · ${esc(link.reference)}</p>`).join("")}<div class="source-row">${handoverSource(c.source)}</div>`).join("") || '<p class="fine">No report coverage recorded yet.</p>'}<p class="fine">Retention and artifact acceptance do not establish vulnerability confirmation or severity.</p></details></div></details>`;
+      }
+      function renderHandovers() {
+        if (handoverKey !== `${snapshot.run.id}:${snapshot.run.stateGeneration}`) { loadHandovers(); return; }
+        if (!handoverData) return;
+        const data = handoverData, query = $("handover-search").value.toLowerCase(), filter = $("handover-filter").value;
+        const rows = data.rows.filter(row => (!query || JSON.stringify(row).toLowerCase().includes(query))
+          && (filter !== "dissent" || row.dissent) && (filter !== "pending" || !row.reviews.length));
+        $("handover-status").textContent = `${handoverDataKey !== handoverKey ? "Updating reviews and evidence… · " : ""}${rows.length} of ${data.rows.length} observations · ${data.rows.filter(row => row.dissent).length} review disagreements`;
+        renderDisclosures($("handover-packet"), `<details data-disclosure="packet"><summary>Review evidence & source files <span class="fine">· ${data.artifacts.length} outputs</span></summary><p>${esc(data.packetStatus)}</p>${data.packet ? `<p class="fine mono">SHA-256: ${esc(data.packet.inputSha256)} · ${data.packet.entries.length} entries</p><button id="handover-download" class="quiet">Download review evidence ↓</button>` : ""}<div class="handover-sources">${data.artifacts.map(a => `<div>${handoverSource(a)}<p class="fine">${esc(a.kinds.join(" · ") || "Document output")}</p></div>`).join("")}</div></details>`, snapshot.run.id);
+        renderDisclosures($("handover-content"), rows.map(handoverRowMarkup).join("") || '<div class="empty">No observations match this selection.</div>', snapshot.run.id);
+      }
+
+      function renderSource() {
+        $("source-body").replaceChildren();
+        const name = $("source-file").value;
+        if (name) $("source-body").append(documentElement(sourceData, name, $("source-raw").checked));
+      }
+      async function openSource(digest) {
+        sourceController?.abort();
+        sourceController = new AbortController();
+        sourceData = null;
+        $("source-file").replaceChildren();
+        $("source-raw").checked = false;
+        const current = epoch, runId = snapshot.run.id;
+        $("source-meta").textContent = `${runId} · sha256:${digest}`;
+        $("source-body").textContent = "Loading accepted source…";
+        $("source-dialog").showModal();
+        try {
+          const data = isExample ? exampleDocument() : await api(
+            `/dashboard/api/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(digest)}?render=markdown`, sourceController.signal);
+          if (current !== epoch || !$("source-dialog").open) return;
+          sourceData = data;
+          const names = Object.keys(data.files || {}).sort((a, b) => Number(!a.endsWith(".md")) - Number(!b.endsWith(".md")));
+          $("source-file").innerHTML = names.map(name => `<option value="${esc(name)}">${esc(name)}</option>`).join("");
+          renderSource();
+        } catch (e) {
+          if (e.name !== "AbortError" && current === epoch) $("source-body").textContent = e.message;
+        }
+      }
+      function loadExample() {
+        stopRequests();
+        isExample = true;
+        snapshot = exampleSnapshot();
+        resetSelection();
+        cursor = null;
+        $("runs").innerHTML =
+          '<option value="example">Example · document review</option>';
+        $("finding-search").value = "";
+        showError("");
+        render();
+      }
+      function exampleSnapshot() {
+        const now = new Date().toISOString(),
+          U = (x) => ({
+            modelCalls: 1,
+            inputTokens: x,
+            cachedInputTokens: Math.round(x * 0.6),
+            rawInputTokens: x + Math.round(x * 0.6),
+            outputTokens: Math.round(x * 0.08),
+            costUsd: 0,
+            cacheAccountingComplete: true,
+          }),
+          agents = [
+            { id: "codex-1", model: "Codex", role: "Researcher" },
+            { id: "deepseek-1", model: "DeepSeek", role: "Researcher" },
+            { id: "kimi-1", model: "Kimi", role: "Researcher" },
+          ].map((a) => ({
+            ...a,
+            provider: "example",
+            usage: zero(),
+            acceptedTasks: 0,
+            rejectedAttempts: 0,
+            observations: 0,
+            linkedReportItems: 0,
+            firstRecordedItems: 0,
+          })),
+          stages = [
+            ["explore", "discovery", 24],
+            ["synthesis", "synthesis", 1],
+            ["coverage", "coverage", 1],
+            ["review", "negative-review", 1],
+            ["verify", "verification", 1],
+            ["report", "reporting", 1],
+          ].map(([id, kind, waveCount]) => ({
+            id,
+            kind,
+            label: stageNames[kind],
+            status: "complete",
+            usage: zero(),
+            waveCount,
+            completedWaves: waveCount,
+          })),
+          waves = [],
+          activity = [];
+        for (const stage of stages)
+          for (let i = 0; i < stage.waveCount; i++) {
+            const wave = {
+              id: `wave-${i + 1}`,
+              stageId: stage.id,
+              index: waves.length,
+              label: `${stage.label} / wave-${i + 1}`,
+              status: "complete",
+              usage: zero(),
+              startedAt: new Date(Date.parse(now) - (28 - waves.length) * 180_000).toISOString(),
+              completedAt: new Date(Date.parse(now) - (28 - waves.length) * 180_000 + 150_000).toISOString(),
+              agentCount: stage.id === "explore" ? 3 : 1,
+              observationCount:
+                stage.id === "explore" && [1, 3, 7, 21].includes(i) ? 1 : 0,
+            };
+            for (const a of agents.slice(0, wave.agentCount)) {
+              const u = U(
+                7000 +
+                  i * 1100 +
+                  (a.id === "kimi-1" ? 1600 : a.id === "deepseek-1" ? 800 : 0),
+              );
+              if (a.id === "deepseek-1")
+                u.costUsd = (u.inputTokens * 0.3 + u.outputTokens * 0.5) / 1e6;
+              activity.push({
+                stageId: stage.id,
+                waveId: wave.id,
+                agentId: a.id,
+                usage: u,
+              });
+              wave.usage = sum([wave.usage, u]);
+              a.usage = sum([a.usage, u]);
+              a.acceptedTasks++;
+            }
+            stage.usage = sum([stage.usage, wave.usage]);
+            waves.push(wave);
+          }
+        for (const wave of waves) wave.timing = { startedAt: wave.startedAt, finishedAt: wave.completedAt, elapsedMs: 150_000, live: false, basis: "wave" };
+        for (const stage of stages) {
+          const entries = waves.filter(w => w.stageId === stage.id);
+          stage.timing = { startedAt: entries[0].startedAt, finishedAt: entries.at(-1).completedAt,
+            elapsedMs: Date.parse(entries.at(-1).completedAt) - Date.parse(entries[0].startedAt), live: false, basis: "stage-span" };
+        }
+        const nodes = [],
+          edges = [],
+          findings = [];
+        const digest = "a".repeat(64);
+        for (const [i, spec] of [
+          [
+            ["kimi-1", 1],
+            ["deepseek-1", 21],
+          ],
+          [["codex-1", 3]],
+          [["deepseek-1", 7]],
+        ].entries()) {
+          const ref = i === 2 ? "U-1" : `C-${i + 1}`,
+            nodeIds = [],
+            observationIds = [],
+            contributors = [];
+          for (const [a, wi] of spec) {
+            const agent = agents.find((v) => v.id === a),
+              id = `observation:${ref}:${a}`,
+              obsId = `OBS-${i + 1}-${a}`;
+            observationIds.push(obsId);
+            contributors.push(a);
+            agent.observations++;
+            agent.linkedReportItems++;
+            if (wi === spec[0][1]) agent.firstRecordedItems++;
+            nodes.push({
+              id,
+              kind: "observation",
+              label:
+                i === 0
+                  ? "Document ownership is unclear"
+                  : i === 1
+                    ? "A document version is stale"
+                    : "An index entry needs review",
+              detail: `Synthetic observation by ${a}. This source was explicitly linked to ${ref}. Shared context does not establish causal influence.`,
+              stageId: "explore",
+              waveId: `wave-${wi + 1}`,
+              waveIndex: wi,
+              model: agent.model,
+              agentId: a,
+              artifactId: id,
+              artifactDigest: digest,
+            });
+            nodeIds.push(id);
+            edges.push({
+              from: id,
+              to: `reference:${ref}`,
+              kind: "disposition",
+            });
+          }
+          nodes.push(
+            {
+              id: `reference:${ref}`,
+              kind: "reference",
+              label: ref,
+              detail:
+                "Synthetic synthesis reference grouping the explicitly linked observations.",
+              stageId: "synthesis",
+              waveId: "wave-1",
+              waveIndex: 24,
+              model: "Codex",
+              agentId: "codex-1",
+              artifactId: "synthesis",
+              artifactDigest: digest,
+            },
+            {
+              id: `review:${ref}`,
+              kind: "review",
+              label:
+                i === 2
+                  ? "Review: uncertainty retained"
+                  : "Review: candidate retained",
+              detail:
+                "Synthetic independent review decision. This is not a confirmation verdict.",
+              stageId: "review",
+              waveId: "wave-1",
+              waveIndex: 25,
+              model: "Codex",
+              agentId: "codex-1",
+              artifactId: "review",
+              artifactDigest: digest,
+            },
+            {
+              id: `report:${ref}`,
+              kind: "report",
+              label: `Report / ${ref}`,
+              detail:
+                "Synthetic report retention record. A retained identifier is not proof of a distinct confirmed finding.",
+              stageId: "report",
+              waveId: "wave-1",
+              waveIndex: 27,
+              model: "Codex",
+              agentId: "codex-1",
+              artifactId: "report",
+              artifactDigest: digest,
+            },
+          );
+          nodeIds.push(`reference:${ref}`, `review:${ref}`, `report:${ref}`);
+          edges.push(
+            { from: nodeIds[0], to: `review:${ref}`, kind: "review" },
+            { from: `review:${ref}`, to: `reference:${ref}`, kind: "review" },
+            { from: `reference:${ref}`, to: `report:${ref}`, kind: "report" },
+          );
+          findings.push({
+            id: ref,
+            label: ref,
+            disposition: i === 2 ? "unresolved" : "candidate",
+            inReport: true,
+            confirmation: "not-recorded",
+            verification: [],
+            severity: "not-recorded",
+            earliestWave: spec[0][1],
+            firstContributors: [spec[0][0]],
+            contributors,
+            observationIds,
+            nodeIds,
+            dissent: i === 2,
+          });
+        }
+        const verificationId = "verification:C-1";
+        const outcome = { nodeId: verificationId, behavior: "reproduced", exploitability: "unresolved",
+          evidence: "Synthetic document check reproduced the ownership ambiguity; impact remains unresolved." };
+        nodes.push({ id: verificationId, kind: "verification", label: "C-1: recorded verification",
+          detail: `Behavior: ${outcome.behavior}\nExploitability: ${outcome.exploitability}\n${outcome.evidence}`,
+          stageId: "verify", waveId: "wave-1", waveIndex: 26, model: "Codex", agentId: "codex-1",
+          artifactId: "verification", artifactDigest: digest });
+        findings[0].verification = [outcome];
+        findings[0].confirmation = "axes-recorded";
+        findings[0].nodeIds.push(verificationId);
+        edges.push({from: "reference:C-1", to: verificationId, kind: "review"},
+          {from: verificationId, to: "report:C-1", kind: "report"});
+        // Synthetic, explicitly illustrative rates use the same recorded usage/time basis.
+        const exampleRate = (usage, elapsedMs) => ({ elapsedMs, inputTokensPerSecond: raw(usage) * 1000 / elapsedMs,
+          outputTokensPerSecond: usage.outputTokens * 1000 / elapsedMs,
+          totalTokensPerSecond: tokens(usage) * 1000 / elapsedMs, partial: false, provisional: false });
+        const recordedUsage = sum(agents.map(a => a.usage));
+        const timing = { startedAt: waves[0].startedAt, finishedAt: waves.at(-1).completedAt,
+          elapsedMs: Date.parse(waves.at(-1).completedAt) - Date.parse(waves[0].startedAt), live: false, basis: "run-span" };
+        for (const item of [...stages, ...waves]) item.throughput = exampleRate(item.usage, item.timing.elapsedMs);
+        return {
+          schemaVersion: 1,
+          generatedAt: now,
+          run: {
+            id: "example-document-review",
+            experimentId: "synthetic-example",
+            status: "completed",
+            phase: "reporting",
+            rootRunId: "example-document-review",
+            parentRunId: null,
+            recoveryEpoch: 0,
+            stateGeneration: 1,
+            updatedAt: now,
+            createdAt: now,
+            terminalReason: null,
+          },
+          recordedUsage, timing, throughput: exampleRate(recordedUsage, timing.elapsedMs),
+          provisionalUsage: zero(),
+          stages,
+          waves: waves.map(w => ({ ...w, tasks: activity.filter(a => a.stageId === w.stageId && a.waveId === w.id).map(a => {
+            const agent = agents.find(v => v.id === a.agentId);
+            return { taskId: `${w.id}-${agent.id}`, agentId: agent.id, model: agent.model, provider: agent.provider,
+              ...(w.stageId === "explore" ? { promptKind: "research", modelPool: agent.id.replace(/-1$/, ""), localWave: Number(w.id.replace("wave-", "")) } : {}),
+              role: agent.role, status: "accepted", lastAttempt: null, lastReceiptAt: null,
+              rejectedAttempts: 0, usage: a.usage, provisionalUsage: sum([]),
+              throughput: exampleRate(a.usage, (agents.indexOf(agent) + 1) * 45_000),
+              timing: { startedAt: w.startedAt, finishedAt: new Date(Date.parse(w.startedAt) + (agents.indexOf(agent) + 1) * 45_000).toISOString(),
+                elapsedMs: (agents.indexOf(agent) + 1) * 45_000, live: false, basis: "result" } };
+          }) })),
+          agents,
+          activity,
+          findings,
+          nodes,
+          edges,
+          provisionalCompletions: [],
+          freshness: {
+            recordedAt: now,
+            liveReceipts: 0,
+            legacyReceipts: 0,
+            receiptsTruncated: false,
+            inFlightTokensKnown: false,
+          },
+          limitations: [
+            "All example data and usage are synthetic. No actual model performance, rate, or benchmark result is represented.",
+            "Earliest recorded contributors are tied by wave, not ordered by completion time. An explicit source link does not prove exclusive discovery or causal influence.",
+            "Confirmation and severity are not inferred. Optional structured verification outcomes show behavior and exploitability separately.",
+            "Child snapshots already include inherited checkpoint usage. Adding parent and child totals double counts shared work.",
+          ],
+        };
+      }
+      document.addEventListener("click", (e) => {
+        const b = e.target.closest('button,[role="button"]');
+        if (!b) return;
+        const d = b.dataset;
+        if (d.close) {
+          $(d.close).close();
+          return;
+        }
+        if (d.inspectorTab) {
+          setInspectorTab(d.inspectorTab);
+        } else if (d.view) {
+          view = d.view;
+          render();
+          $("view-nav").scrollIntoView({block:"start"});
+        } else if (d.stage) {
+          selectedStage = selectedStage === d.stage ? null : d.stage;
+          selectedWave = null;
+          view = "overview";
+          render();
+        } else if (d.wave) {
+          selectedWave = selectedWave === d.wave ? null : d.wave;
+          view = "overview";
+          render();
+        } else if (d.agent) {
+          if (d.taskWave) selectedWave = d.taskWave;
+          selectedAgent = selectedAgent === d.agent ? null : d.agent;
+          render();
+          if (selectedAgent && !$("agent-inspector").hidden) { $("agent-inspector").scrollIntoView({block:"start"}); $("agent-inspector").focus({preventScroll:true}); }
+        } else if (d.finding) {
+          selectedFinding = d.finding;
+          selectedNode = null;
+          renderLineage();
+        } else if (d.node) {
+          selectedNode = d.node;
+          renderLineage();
+        } else if (d.contributor) {
+          $("finding-search").value = d.contributor;
+          view = "lineage";
+          render();
+        } else if (d.source) openSource(d.source);
+      });
+      document.addEventListener("keydown", (e) => {
+        if (
+          (e.key === "Enter" || e.key === " ") &&
+          e.target.matches('svg [role="button"]')
+        ) {
+          e.preventDefault();
+          e.target.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        }
+      });
+      function connect() {
+        stopRequests();
+        snapshot = null;
+        isExample = false;
+        resetSelection();
+        $("stats").replaceChildren();
+        $("stages").replaceChildren();
+        $("runs").replaceChildren();
+        $("source-body").replaceChildren();
+        $("run-context").textContent = "Connecting";
+        $("freshness").textContent = "";
+        for (const id of ["overview", "lineage", "handovers", "costs", "report", "configuration"]) $(id).hidden = true;
+        $("mode").textContent = "CONNECTING";
+        $("run-summary").textContent = "Loading private audit index…";
+        $("notice").textContent = "Reading saved runs from this Worker.";
+        listRuns();
+      }
+      $("example").addEventListener("click", showExample);
+      $("refresh").addEventListener("click", () =>
+        isExample
+          ? loadExample()
+          : snapshot
+            ? loadRun(snapshot.run.id, false)
+            : listRuns(),
+      );
+      $("handover-reload").addEventListener("click", loadHandovers);
+      $("handover-search").addEventListener("input", renderHandovers);
+      $("handover-filter").addEventListener("change", renderHandovers);
+      $("handover-packet").addEventListener("click", e => {
+        if (e.target.id !== "handover-download" || !handoverData?.packet) return;
+        const url = URL.createObjectURL(new Blob([JSON.stringify(handoverData.packet,null,2)], {type:"application/json"}));
+        const a = document.createElement("a"); a.href = url; a.download = "negative-disposition-review-input.json"; a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      });
+      $("report-artifact").addEventListener("change", loadReport);
+      $("show-planned").addEventListener("change", renderProgress);
+      $("inspector-close").addEventListener("click", () => { selectedAgent = null; render(); $("lane-grid").scrollIntoView({block:"center"}); });
+      $("progress-wave").addEventListener("change", (e) => {
+        selectedWave = e.target.value || null;
+        selectedAgent = null;
+        render();
+      });
+      $("wave-metric").addEventListener("change", e => { waveMetric = e.target.value; renderOverview(); });
+      $("performance-load").addEventListener("click", loadPerformance);
+      setInterval(updateClocks, 1000);
+      $("report-file").addEventListener("change", renderReportDocument);
+      $("report-raw").addEventListener("change", renderReportDocument);
+      $("report-retry").addEventListener("click", loadReport);
+      $("source-raw").addEventListener("change", renderSource);
+      $("source-file").addEventListener("change", renderSource);
+      $("runs").addEventListener("change", () => {
+        resetReport();
+        if ($("runs").value !== "example") loadRun($("runs").value, true);
+      });
+      $("more").addEventListener("click", () => listRuns(true));
+      $("clear").addEventListener("click", () => {
+        selectedStage = selectedWave = selectedAgent = null;
+        render();
+      });
+      $("finding-search").addEventListener("input", renderLineage);
+      $("inspector-attempt").addEventListener("change", () => {
+        inspectorController?.abort(); clearTimeout(inspectorTimer); inspectorLoading = false;
+        inspectorAttempt = $("inspector-attempt").value || null; inspectorOffset = 0; inspectorTail = ""; inspectorTranscript = newAgentTranscript(); inspectorData = null;
+        $("inspector-context").textContent = "Reading selected session…";
+        $("inspector-filesystem").textContent = "Reading selected workspace…";
+        $("inspector-prompt").textContent = "";
+        $("inspector-prompt-status").textContent = "Reading selected attempt…";
+        $("inspector-protocol").textContent = "";
+        renderInspectorLog();
+        void loadAgentInspector();
+      });
+      $("inspector-more").addEventListener("click", () => { void loadAgentInspector(); });
+      $("inspector-latest").addEventListener("click", () => {
+        $("inspector-follow").checked = true; void loadAgentInspector();
+        $("inspector-transcript").scrollTop = $("inspector-transcript").scrollHeight;
+      });
+      $("inspector-transcript").addEventListener("scroll", () => {
+        const host = $("inspector-transcript");
+        if (!$("inspector-follow").checked && !$("inspector-more").hidden && host.scrollTop > 0 && host.scrollHeight - host.scrollTop - host.clientHeight < 80) void loadAgentInspector();
+      });
+      $("inspector-refresh").addEventListener("click", () => { void loadAgentInspector(); });
+      $("inspector-follow").addEventListener("change", () => {
+        clearTimeout(inspectorTimer); if ($("inspector-follow").checked) void loadAgentInspector();
+      });
+      $("inspector-raw").addEventListener("change", renderInspectorLog);
+      $("inspector-filter").addEventListener("change", renderInspectorLog);
+      $("inspector-search").addEventListener("input", renderInspectorLog);
+      $("inspector-download").addEventListener("click", () => { void downloadAgentLog(); });
+      window.addEventListener("pagehide", resetAgentInspector);
+      document.addEventListener("visibilitychange", handleInspectorVisibility);
+      $("export").addEventListener("click", () => {
+        if (!snapshot) return;
+        const blob = new Blob(
+            [
+              JSON.stringify(
+                {
+                  snapshot,
+                  endpointPerformance: performanceData,
+                  exportedAt: new Date().toISOString(),
+                  synthetic: isExample,
+                },
+                null,
+                2,
+              ),
+            ],
+            { type: "application/json" },
+          ),
+          url = URL.createObjectURL(blob),
+          a = document.createElement("a");
+        a.href = url;
+        a.download = `swarm-${snapshot.run.id.replace(/[^a-z0-9._-]/gi, "_")}-snapshot.json`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      });
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden) stopRequests();
+        else schedule();
+      });
+      window.addEventListener("pagehide", () => {
+        reportController?.abort();
+        performanceController?.abort();
+        stopRequests();
+      });
+      $("source-dialog").addEventListener("close", () =>
+        sourceController?.abort(),
+      );
+      connect();
+    </script>
+  </body>
+</html>

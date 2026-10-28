@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "allowJs": true,
+    "outDir": "dist-release",
+    "rootDir": ".",
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": ["src/**/*.ts", "container/subscription-limits.mjs", "container/reasoning-config.mjs", "tools/audit0-control.ts", "tools/audit0-control-lib.ts", "tools/export-release.ts", "tools/publish-release.ts", "tools/runtime-slot-seed.ts", "tools/runtime-slot-seed-lib.ts"]
+}

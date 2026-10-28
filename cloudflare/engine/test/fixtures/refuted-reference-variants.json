@@ -1,0 +1,26 @@
+{
+  "complete": true,
+  "observations": [
+    {
+      "id": "OPEN-OBS-1",
+      "disposition": "refuted",
+      "reference": "",
+      "rationale": "Focused evidence refutes the first adjacent hypothesis.",
+      "referenceEvidence": "Focused trace shows that the adjacent hypothesis does not reproduce."
+    },
+    {
+      "id": "OPEN-OBS-2",
+      "disposition": "refuted",
+      "reference": null,
+      "rationale": "Focused evidence refutes the second adjacent hypothesis.",
+      "referenceEvidence": "A focused negative control rejects the second adjacent hypothesis."
+    },
+    {
+      "id": "OPEN-OBS-3",
+      "disposition": "refuted",
+      "reference": "REF-3",
+      "rationale": "Focused evidence refutes the third labeled hypothesis.",
+      "referenceEvidence": "A focused reproduction rejects the labeled candidate while retaining its negative evidence."
+    }
+  ]
+}

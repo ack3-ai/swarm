@@ -1,0 +1,84 @@
+{
+  "configVersion": 2,
+  "kind": "ack3-audit",
+  "method": "security-audit-v1",
+  "forceSearch": false,
+  "nativeSearch": false,
+  "id": "audit0-hello-vault",
+  "objective": "Conduct a bounded security review of the pinned HelloVault snapshot and deliver evidence for every candidate found with plausible High or Critical impact within the authorized local scope.",
+  "target": {
+    "commit": "0123456789abcdef0123456789abcdef01234567",
+    "repository": "example/hello-vault",
+    "environment": "disposable-non-production",
+    "tree": "89abcdef0123456789abcdef0123456789abcdef",
+    "runtime": {
+      "environmentBindings": {},
+      "preflightCommands": [
+        "cd $SWARM_SOURCE_DIR && forge build",
+        "cd $SWARM_SOURCE_DIR && forge test"
+      ]
+    }
+  },
+  "limits": {
+    "maxCostUsd": 2,
+    "maxModelCalls": 80,
+    "maxDiscoveryRuntimeMs": 18000000
+  },
+  "maxDiscoveryWaves": 64,
+  "modelPools": [
+    {
+      "id": "luna",
+      "backend": "codex",
+      "model": "gpt-codex-a",
+      "reasoningEffort": "max",
+      "subagents": {
+        "default": {
+          "mode": "disabled"
+        },
+        "stages": {}
+      },
+      "credentialSource": "default-codex-account",
+      "agents": 3,
+      "required": true
+    },
+    {
+      "id": "deepseek",
+      "backend": "dsh-chat-completions",
+      "provider": "provider-a",
+      "connection": {
+        "baseUrl": "https://llm-a.example.com/v1",
+        "apiKeyEnv": "PROVIDER_A_API_KEY"
+      },
+      "model": "deepseek-v4-flash",
+      "reasoningEffort": "max",
+      "thinking": "enabled",
+      "subagents": {
+        "default": {
+          "mode": "disabled"
+        },
+        "stages": {}
+      },
+      "agents": 3,
+      "required": false
+    }
+  ],
+  "stageModelPools": {
+    "synthesis": "luna",
+    "coverage": "luna",
+    "negative-review": [
+      "luna",
+      "deepseek"
+    ],
+    "verification": "luna",
+    "reporting": "luna"
+  },
+  "stages": [
+    "discovery",
+    "synthesis",
+    "coverage",
+    "negative-review",
+    "verification",
+    "reporting"
+  ],
+  "promptFile": "../../../../docs/examples/prompts.json"
+}

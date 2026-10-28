@@ -1,0 +1,23 @@
+# Copy to a private .tfvars file. Secret values go only in TF_VAR_service_credentials.
+cloudflare_account_id   = "00000000000000000000000000000000"
+service_hostname        = "swarm.example-subdomain.workers.dev"
+dashboard_email_domains = ["example.com"]
+
+# Optional deployment shape. Unset jurisdiction and location use Cloudflare's defaults.
+# runtime_slot_count = 3
+# data_jurisdiction  = "fedramp"
+# r2_location        = "enam"
+
+# Optional: store a default Codex login, needed only for audits with Codex pools.
+# codex_login = true
+
+# Optional account members and their role IDs.
+# account_members         = ["admin@example.com"]
+# account_member_role_ids = ["<role-id>"]
+
+# Secrets Store names for model provider keys and subscription accounts
+# referenced by audit configurations. Keep only the ones your audits use.
+runtime_secret_bindings = {
+  PROVIDER_API_KEY        = "swarm-provider-api-key"
+  CLAUDE_CODE_OAUTH_TOKEN = "swarm-claude-code-oauth-token"
+}

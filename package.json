@@ -1,0 +1,18 @@
+{
+  "name": "@ack3/swarm-workspace",
+  "private": true,
+  "license": "Apache-2.0",
+  "scripts": {
+    "audit0": "pnpm --filter @ack3/cloudflare-experiment-engine audit0",
+    "audit0:acceptance": "pnpm --filter @ack3/cloudflare-experiment-engine audit0:acceptance",
+    "build": "pnpm --filter @ack3/cloudflare-experiment-engine build",
+    "check": "pnpm --filter @ack3/cloudflare-experiment-engine check",
+    "deploy:worker": "pnpm --filter @ack3/cloudflare-experiment-engine deploy:worker",
+    "test": "pnpm --filter @ack3/cloudflare-experiment-engine test",
+    "typecheck": "pnpm --filter @ack3/cloudflare-experiment-engine typecheck"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "packageManager": "pnpm@10.15.1"
+}

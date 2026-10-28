@@ -1,0 +1,12 @@
+lib/
+dist/
+node_modules/
+coverage/
+.local/
+.env
+*.log
+*.tgz
+.DS_Store
+
+# Your own settings (copy private.example/ to private/)
+/private/

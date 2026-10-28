@@ -1,0 +1,8 @@
+{
+  "discovery": "Look for vulnerabilities that could lead to loss of funds, unauthorized access or denial of service, and support each one with a test or a precise code reference.",
+  "synthesis": "Merge observations that share a root cause, and keep separate those that need different conditions or fixes.",
+  "coverage": "Examine the parts of the target that earlier research covered least and report any new vulnerabilities.",
+  "negative-review": "Re-examine each refutation and merge decision, and reopen any that the evidence does not support.",
+  "verification": "Write or run a test for each finding where possible, and state whether an attacker could exploit it in practice.",
+  "reporting": "Write a clear audit report for the target's developers, with the impact, evidence and a recommended fix for each finding."
+}
