@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { stripTypeScriptTypes } from 'node:module'
 import { expect, it, vi } from 'vitest'
-import { getSandbox } from '@cloudflare/sandbox'
+import { getAgentSandbox } from '../src/agent-sandbox-client.js'
 import { canonicalJson, sha256 } from '../src/canonical.js'
 import { AgentExecutionReceiptIntegrityError } from '../src/agent-execution-receipt.js'
 import { executionLaunchGraceMs, SandboxAgentProvider } from '../src/sandbox-provider.js'
@@ -16,7 +16,7 @@ import {
 } from '../src/workflow-outcome.js'
 import { agentProcessWaitSliceMs, waveStepConfig, workflowBootstrapProgress } from '../src/workflow-step-config.js'
 
-vi.mock('@cloudflare/sandbox', () => ({ getSandbox: vi.fn() }))
+vi.mock('../src/agent-sandbox-client.js', () => ({ getAgentSandbox: vi.fn() }))
 vi.mock('../src/agent-process.js', () => ({
   agentProcessId: (digest: string) => `agent-${digest.slice(0, 40)}`,
   waitForAgentProcess: async () => 'unavailable',
@@ -31,7 +31,7 @@ it('keeps launch revocation grace independent from the observation slice', () =>
 it('keeps an admitted long-running Sandbox alive across Workflow observation gaps', async () => {
   const setKeepAlive = vi.fn(async () => {})
   const sandbox = { setKeepAlive } as any
-  vi.mocked(getSandbox).mockReturnValueOnce(sandbox)
+  vi.mocked(getAgentSandbox).mockReturnValueOnce(sandbox)
   const provider = new SandboxAgentProvider({ ACK3_CODEX_WORKSPACE_ID: 'synthetic', ACK3_CODEX_AUTH_JSON: '{}' } as any)
   Object.assign(provider, {
     executionReceipts: { get: async () => null },
@@ -48,16 +48,16 @@ it('keeps an admitted long-running Sandbox alive across Workflow observation gap
       reasoning: 'none', promptKind: 'research', output: { requiredFiles: [] } },
   }
   await expect(provider.run(request as any)).rejects.toMatchObject({ name: 'AgentExecutionPending' })
-  expect(getSandbox).toHaveBeenCalledWith(undefined, expect.any(String), expect.objectContaining({
+  expect(getAgentSandbox).toHaveBeenCalledWith(undefined, expect.any(String), expect.objectContaining({
     keepAlive: true,
-    sleepAfter: '30m',
+    inactivityTimeoutMs: 30 * 60_000,
   }))
   expect(setKeepAlive).toHaveBeenCalledWith(true)
 })
 
 it('recovers an exact successful durable receipt without waiting for Sandbox keep-alive', async () => {
   const setKeepAlive = vi.fn(() => new Promise<void>(() => {}))
-  vi.mocked(getSandbox).mockClear()
+  vi.mocked(getAgentSandbox).mockClear()
   const provider = new SandboxAgentProvider({ ACK3_CODEX_WORKSPACE_ID: 'synthetic', ACK3_CODEX_AUTH_JSON: '{}' } as any)
   const runInSandbox = vi.fn()
   Object.assign(provider, {
@@ -78,13 +78,13 @@ it('recovers an exact successful durable receipt without waiting for Sandbox kee
   }
   await expect(provider.run(request as any)).resolves.toMatchObject({ status: 'accepted', actorId: 'durable' })
   expect(setKeepAlive).not.toHaveBeenCalled()
-  expect(getSandbox).not.toHaveBeenCalled()
+  expect(getAgentSandbox).not.toHaveBeenCalled()
   expect(runInSandbox).not.toHaveBeenCalled()
 })
 
 it('keeps Sandbox lifetime confirmation for a nonzero receipt that may need native custody', async () => {
   const setKeepAlive = vi.fn(async () => {})
-  vi.mocked(getSandbox).mockReturnValueOnce({ setKeepAlive } as any)
+  vi.mocked(getAgentSandbox).mockReturnValueOnce({ setKeepAlive } as any)
   const provider = new SandboxAgentProvider({ ACK3_CODEX_WORKSPACE_ID: 'synthetic', ACK3_CODEX_AUTH_JSON: '{}' } as any)
   const result = { status: 'additive-unavailable' }
   const runInSandbox = vi.fn(async () => result)
@@ -104,7 +104,7 @@ it('keeps Sandbox lifetime confirmation for a nonzero receipt that may need nati
 })
 
 it('classifies a durable receipt read outage before container access or paid repair', async () => {
-  vi.mocked(getSandbox).mockClear()
+  vi.mocked(getAgentSandbox).mockClear()
   const provider = new SandboxAgentProvider({ ACK3_CODEX_WORKSPACE_ID: 'synthetic', ACK3_CODEX_AUTH_JSON: '{}' } as any)
   Object.assign(provider, { executionReceipts: { get: async () => { throw new Error('R2 unavailable') } } })
   const request = {
@@ -115,11 +115,11 @@ it('classifies a durable receipt read outage before container access or paid rep
   await expect(provider.run(request as any)).rejects.toMatchObject({
     name: 'TransientRunFailure', message: 'durable execution receipt observation is temporarily unavailable',
   })
-  expect(getSandbox).not.toHaveBeenCalled()
+  expect(getAgentSandbox).not.toHaveBeenCalled()
 })
 
 it('keeps a corrupt durable receipt in the integrity-failure category', async () => {
-  vi.mocked(getSandbox).mockClear()
+  vi.mocked(getAgentSandbox).mockClear()
   const provider = new SandboxAgentProvider({ ACK3_CODEX_WORKSPACE_ID: 'synthetic', ACK3_CODEX_AUTH_JSON: '{}' } as any)
   Object.assign(provider, { executionReceipts: { get: async () => {
     throw new AgentExecutionReceiptIntegrityError('agent execution receipt provenance mismatch')
@@ -132,19 +132,19 @@ it('keeps a corrupt durable receipt in the integrity-failure category', async ()
   await expect(provider.run(request as any)).rejects.toMatchObject({
     name: 'PermanentRunFailure', category: 'integrity-failed',
   })
-  expect(getSandbox).not.toHaveBeenCalled()
+  expect(getAgentSandbox).not.toHaveBeenCalled()
 })
 
 it('disables keep-alive before terminal workspace destruction', async () => {
   const setKeepAlive = vi.fn(async () => {})
   const destroy = vi.fn(async () => {})
-  vi.mocked(getSandbox).mockReturnValueOnce({ setKeepAlive, destroy } as any)
+  vi.mocked(getAgentSandbox).mockReturnValueOnce({ setKeepAlive, destroy } as any)
   const provider = new SandboxAgentProvider({} as any)
   await expect(provider.disposeWorkspace({ runId: 'terminal', workspaceKey: 'lane' }))
     .resolves.toMatchObject({ status: 'destroyed' })
-  expect(getSandbox).toHaveBeenLastCalledWith(undefined, expect.any(String), expect.objectContaining({
+  expect(getAgentSandbox).toHaveBeenLastCalledWith(undefined, expect.any(String), expect.objectContaining({
     keepAlive: false,
-    sleepAfter: '30m',
+    inactivityTimeoutMs: 30 * 60_000,
   }))
   expect(setKeepAlive).toHaveBeenCalledWith(false)
   expect(destroy).toHaveBeenCalledOnce()
@@ -154,7 +154,7 @@ it('defers terminal disposal when keep-alive stalls and never destroys after a l
   let release!: () => void
   const setKeepAlive = vi.fn(() => new Promise<void>(resolve => { release = resolve }))
   const destroy = vi.fn(async () => {})
-  vi.mocked(getSandbox).mockReturnValueOnce({ setKeepAlive, destroy } as any)
+  vi.mocked(getAgentSandbox).mockReturnValueOnce({ setKeepAlive, destroy } as any)
   const provider = new SandboxAgentProvider({} as any)
   await expect(provider.disposeWorkspace({ runId: 'terminal', workspaceKey: 'lane' }))
     .resolves.toMatchObject({ status: 'deferred' })
@@ -168,7 +168,7 @@ it('defers terminal disposal when keep-alive stalls and never destroys after a l
 it('does not execute or destroy under an unconfirmed Sandbox lifetime setting', async () => {
   const configureError = new Error('synthetic configuration failure')
   const runInSandbox = vi.fn(async () => { throw new Error('must not execute') })
-  vi.mocked(getSandbox).mockReturnValueOnce({
+  vi.mocked(getAgentSandbox).mockReturnValueOnce({
     setKeepAlive: vi.fn(async () => { throw configureError }),
   } as any)
   const provider = new SandboxAgentProvider({ ACK3_CODEX_WORKSPACE_ID: 'synthetic', ACK3_CODEX_AUTH_JSON: '{}' } as any)
@@ -188,7 +188,7 @@ it('does not execute or destroy under an unconfirmed Sandbox lifetime setting', 
   expect(runInSandbox).not.toHaveBeenCalled()
 
   const destroy = vi.fn(async () => {})
-  vi.mocked(getSandbox).mockReturnValueOnce({
+  vi.mocked(getAgentSandbox).mockReturnValueOnce({
     setKeepAlive: vi.fn(async () => { throw configureError }), destroy,
   } as any)
   await expect(provider.disposeWorkspace({ runId: 'terminal', workspaceKey: 'lane' }))
@@ -208,7 +208,7 @@ it('keeps diagnostic observers outside Sandbox lifecycle ownership', () => {
     expect(end).toBeGreaterThan(start)
     const diagnostic = source.slice(start, end)
     expect(diagnostic).toContain('durableLaneDiagnostic')
-    expect(diagnostic).not.toContain('getSandbox')
+    expect(diagnostic).not.toContain('getAgentSandbox')
   }
 })
 
@@ -438,7 +438,7 @@ it('persists a sealed-boundary stop before terminal lane cleanup', async () => {
     machineState = {
       ...machineState, status: 'stopped', terminalReason: 'operator-requested-stop-at-sealed-wave-boundary',
     }
-  }, snapshot: () => structuredClone(machineState) }
+  }, view: () => structuredClone(machineState) }
   const instance = workflow({
     RunMachine: { fromState: async () => machine },
     disposeTerminalWorkspaces: async (_provider: unknown, _definition: unknown, state: { status: string }) => {
@@ -483,7 +483,7 @@ it('adopts an identical committed bootstrap after its write acknowledgement is l
   let durable: typeof persisted | null = null
   let creations = 0
   const machine = (state: typeof persisted) => ({
-    start: async () => {}, snapshot: () => structuredClone(state),
+    start: async () => {}, snapshot: () => structuredClone(state), view: () => structuredClone(state),
   })
   const RunMachine = {
     create: async () => { creations += 1; return machine(persisted) },
@@ -517,7 +517,7 @@ it('adopts the same committed resume bootstrap without rebuilding its child line
   }
   const resume = vi.fn()
   const fromState = vi.fn(async (_definition: unknown, state: typeof persisted) => ({
-    snapshot: () => structuredClone(state),
+    snapshot: () => structuredClone(state), view: () => structuredClone(state),
   }))
   const store = {
     getCheckpoint: async () => ({ digest: checkpointDigest, body: {
@@ -554,6 +554,7 @@ it('publishes every checkpoint before committing its advanced cursor', async () 
     RunMachine: { fromState: async (_definition: unknown, state: typeof durable) => ({
       value: state,
       snapshot() { return structuredClone(this.value) },
+      view() { return structuredClone(this.value) },
     }) },
     advanceExperimentOneWave: async ({ machine, onCheckpoint }: any) => {
       waveCalls += 1

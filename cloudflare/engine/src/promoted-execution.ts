@@ -28,6 +28,7 @@ type ReceiptReader = Pick<R2AgentExecutionReceiptStore, 'get'>
 type RequestReader = Pick<R2AgentExecutionLogStore, 'getRequest'>
 
 function receiptUsage(result: {
+  subscriptionWaits?: ProviderUsage['subscriptionWaits']
   inputTokens: number
   rawInputTokens?: number
   cachedInputTokens?: number
@@ -38,6 +39,7 @@ function receiptUsage(result: {
 }): ProviderUsage {
   return {
     modelCalls: 1,
+    ...(result.subscriptionWaits === undefined ? {} : { subscriptionWaits: result.subscriptionWaits }),
     inputTokens: result.inputTokens,
     ...(result.rawInputTokens === undefined ? {} : { rawInputTokens: result.rawInputTokens }),
     ...(result.cachedInputTokens === undefined ? {} : { cachedInputTokens: result.cachedInputTokens }),

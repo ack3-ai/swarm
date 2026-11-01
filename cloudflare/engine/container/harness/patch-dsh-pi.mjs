@@ -1,4 +1,4 @@
-// Pinned native adapter compatibility patch. No provider proxy or hidden retry.
+// Pinned native adapter compatibility patch. No provider proxy or task replay.
 // Keep SDK HTTP facts before pi-ai flattens errors, and distinguish reported
 // usage (including zero cache) from its initialized, unknown zero counters.
 // Exact source digests fail the build closed when either dependency changes.
@@ -71,6 +71,50 @@ function classifyPiAiError(message) {`.trimStart()],
       ['case "error":\n\t\t\tyield {\n\t\t\t\ttype: "usage",', 'case "error":\n\t\t\tif (event.error._dshUsageReported !== false) yield {\n\t\t\t\ttype: "usage",'],
     ],
   },
+  {
+    name: '@deepseek-ai/dsh-llm-retry', version: '0.2.1-rc.2',
+    file: 'lib/index.js',
+    digest: 'cbb99f1c5038e4a9167aedf333343cb3e3adfb5c9f45a37ef7562b024429d050',
+    replacements: [
+      // Keep journal attempt numbers monotonic, but count ordinary failures
+      // separately. Rebuild the projection from the native journal on upgrade.
+      ['stateVersion: 1,', 'stateVersion: 2,'],
+      ['retry: z$1.number().int().nonnegative(),',
+        'retry: z$1.number().int().nonnegative(),\n\tordinaryRetries: z$1.number().int().nonnegative(),'],
+      ['retry: event.data.retry,',
+        'retry: event.data.retry,\n\t\t\t\t\tordinaryRetries: (entry?.ordinaryRetries ?? entry?.retry ?? 0) + (event.data.subscriptionWait === true ? 0 : 1),'],
+      ['const retry = previousRetry + 1;',
+        'const retry = previousRetry + 1;\n\t\tconst ordinaryRetry = (previous?.ordinaryRetries ?? previousRetry) + 1;'],
+      ['} else delayMs = failure.providerRetryAfterMs;\n\t\telse delayMs = localDelay(policy, retry, random);',
+        '} else delayMs = failure.providerRetryAfterMs;\n\t\telse delayMs = localDelay(policy, ordinaryRetry, random);'],
+      ['function cancellableDelay(delayMs, signal) {', `
+// Only a native 429 with Retry-After proves a resetting provider window.
+// Spend caps and exhausted credits have no reset evidence and retain the
+// ordinary bounded retry policy.
+function ack3ResettingWindow(failure) {
+    return process.env.ACK3_PROVIDER_WINDOW_WAIT === "1"
+        && failure.code === "RATE_LIMIT" && failure.status === 429
+        && Number.isFinite(failure.providerRetryAfterMs)
+        && failure.providerRetryAfterMs > 0 && failure.providerRetryAfterMs <= 86400000;
+}
+function cancellableDelay(delayMs, signal) {`.trimStart()],
+      ['\t\tagent.session.append("llm/retry", eventData);\n\t\tif (!await cancellableDelay(delayMs, fusedSignal)) return;',
+        `\t\tagent.session.append("llm/retry", { ...eventData,\n\t\t\t...(ack3ResettingWindow(failure) ? { subscriptionWait: true } : {}) });
+\t\tconst windowStartedAt = ack3ResettingWindow(failure) ? Date.now() : null;
+\t\tif (!await cancellableDelay(delayMs, fusedSignal)) return;
+\t\tif (windowStartedAt !== null) process.stderr.write(JSON.stringify({
+\t\t\ttype: "subscription_wait",
+\t\t\twait: { provider: "dsh", sessionId: agent.id,
+\t\t\t\tstartedAt: new Date(windowStartedAt).toISOString(),
+\t\t\t\tresumedAt: new Date().toISOString(),
+\t\t\t\tresetsAt: new Date(windowStartedAt + delayMs).toISOString() }
+\t\t}) + "\\n");`],
+      ['if (policy.mode === "normal" && previousRetry >= policy.maxRetries) return next();',
+        'if (policy.mode === "normal" && (previous?.ordinaryRetries ?? previousRetry) >= policy.maxRetries && !ack3ResettingWindow(failure)) return next();'],
+      ['if (policy.mode === "normal") return next();\n\t\t\tdelayMs = localDelay(policy, retry, random);',
+        'if (policy.mode === "normal" && !ack3ResettingWindow(failure)) return next();\n\t\t\tdelayMs = ack3ResettingWindow(failure) ? failure.providerRetryAfterMs : localDelay(policy, ordinaryRetry, random);'],
+    ],
+  },
 ]
 
 // Validate every input before writing either package.
@@ -91,4 +135,4 @@ for (const edit of edits) {
   outputs.push({ path, source })
 }
 for (const { path, source } of outputs) await writeFile(path, source)
-console.log('Patched pinned native DSH/pi HTTP metadata and usage boundary')
+console.log('Patched pinned native DSH/pi HTTP metadata, usage and window retry boundary')

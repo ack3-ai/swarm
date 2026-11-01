@@ -36,7 +36,10 @@ it.each(['required', 'optional', 'unavailable', 'unresolved', 'failed-search', '
         : request.attempt === 1 && mode === 'empty-citation' ? { researchQueries: [] }
         : request.attempt === 1 || mode === 'unavailable' ? {} : { researchQueries: [query] }) }]
     const submission = JSON.parse(raw.files['.swarm/submission.json']!)
-    return { ...raw, protocol: { ...raw.protocol, research: { ...raw.protocol.research!, leadChecks } },
+    // The engine reads the protocol from the submission, where an empty citation list cites nothing.
+    const protocolLeadChecks = leadChecks.map(check => 'researchQueries' in check && check.researchQueries.length === 0
+      ? Object.fromEntries(Object.entries(check).filter(([key]) => key !== 'researchQueries')) as typeof check : check)
+    return { ...raw, protocol: { ...raw.protocol, research: { ...raw.protocol.research!, leadChecks: protocolLeadChecks } },
       files: { ...raw.files, '.swarm/submission.json': JSON.stringify({ ...submission, leadChecks }) },
       ...(mode === 'failed-search' ? { nativeSearchEvidence: { schemaVersion: 1 as const, source: 'codex-exa' as const,
         completed: [], failed: 1, incomplete: 0 } } : {}),

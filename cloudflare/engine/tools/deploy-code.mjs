@@ -12,7 +12,7 @@ const uuid = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i
 // Its upload metadata must describe module contents only.
 export function uploadMetadata(build, settings) {
   assert.equal(settings.bindings?.find(b => b.name === 'ENGINE_ROLE')?.text, 'front-door')
-  assert.equal(settings.bindings.some(b => b.name === 'Sandbox' || b.type === 'workflow'), false)
+  assert.equal(settings.bindings.some(b => ['Sandbox', 'AGENT_SANDBOX'].includes(b.name) || b.type === 'workflow'), false)
   assert.equal(settings.bindings.find(b => b.name === 'VERSION_METADATA')?.type, 'version_metadata')
   assert.equal(build.compatibility_date, settings.compatibility_date, 'compatibility changes need normal publication')
   assert.deepEqual(build.compatibility_flags, settings.compatibility_flags)

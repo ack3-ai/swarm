@@ -12,6 +12,7 @@ import type {
 import { sha256 } from './canonical.js'
 import { verificationAssignments } from './protocol-transforms.js'
 import { requiresSubmission, SUBMISSION_PATH } from './submission.js'
+import { OUTPUT_FILE_MAX_BYTES, SUBMISSION_MAX_BYTES } from './output-limits.js'
 import { researchEvidencePaths, researchIndexPath, researchPredecessor } from './accepted-mounts.js'
 
 /** Fill {{NAME}} placeholders literally. */
@@ -144,7 +145,7 @@ function submissionInstruction(definition: ExperimentDefinition, task: TaskDefin
       : shape
   const searchShape = searchRequired
     ? scopedShape.replace(/"(conclusion|disposition|finalDisposition|exploitability)":"[^"]+"/,
-      '$&,"researchQueries":[]') : scopedShape
+      '$&,"researchQueries":["..."]') : scopedShape
   const queryInstruction = searchRequired ? `\n${text.searchQueries}` : ''
   const referenceInstruction = task.promptKind === 'coverage-challenge'
     ? `\n${fill(text.coverageReferences, { OBSERVATION_PREFIX: task.observationPrefix ?? '' })}`
@@ -162,7 +163,8 @@ function submissionInstruction(definition: ExperimentDefinition, task: TaskDefin
 
 ${fill(text.handoffIntro, { SUBMISSION_FILE: `/workspace/results/${SUBMISSION_PATH}` })}
 ${searchShape}${queryInstruction}${referenceInstruction}${evidenceMethodInstruction}${reportSectionsInstruction}${leadReconciliationInstruction}${nextExperimentInstruction}
-${text.handoffClosing}`
+${text.handoffClosing}
+Output limits (UTF-8 bytes): each file at most ${OUTPUT_FILE_MAX_BYTES}; ${SUBMISSION_PATH} at most ${SUBMISSION_MAX_BYTES}. Keep reasoning concise without dropping required observations, evidence, or dissent.${task.promptKind === 'synthesis' ? '\nCover every input observation exactly once. Allowed dispositions: candidate, refuted, unresolved. Every candidate or unresolved reference must appear in retainedReferences; refuted observations use reference none. Keep detailed evidence in the ledger and concise rationales in the structured submission.' : ''}`
 }
 
 function nativeSearchInstruction(definition: ExperimentDefinition, tool: string): string {

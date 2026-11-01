@@ -86,6 +86,7 @@ function coordinator(failFirstRouteReservation = false, requestedImageDigest?: s
   const validateResume = vi.fn(async () => ({}))
   class Store {
     async retiredUnmaterializedRoute() { return null }
+    async retiredRunWorkflow() { return { status: 'errored' } }
     async getStateIfPresent() { return null }
     async reserveRunRoute() {
       if (failNext) {
@@ -148,7 +149,7 @@ function coordinator(failFirstRouteReservation = false, requestedImageDigest?: s
     'json',
     'runIdPattern',
     'digestPattern',
-    'R2ArtifactStore',
+    'R2ArtifactStore', 'R2AgentExecutionReceiptStore', 'R2AgentExecutionLogStore',
     'prepareFailedWaveRecovery',
     'prepareTerminalCompletionRecovery',
     'prepareCheckpointRuntimeTransition',
@@ -175,7 +176,7 @@ function coordinator(failFirstRouteReservation = false, requestedImageDigest?: s
     (value: unknown, status = 200, headers = {}) => Response.json(value, { status, headers }),
     /^[a-z0-9][a-z0-9._-]{0,99}$/,
     /^[a-f0-9]{64}$/,
-    class {},
+    class {}, class {}, class {},
     prepareFailedWaveRecovery,
     prepareTerminalCompletionRecovery,
     prepareCheckpointRuntimeTransition,
@@ -379,6 +380,21 @@ describe('front-door runtime reservation', () => {
     const changedRuntime = await instance.fetch(recoveryRequest({ runtimeId: runtimeA.id }))
     expect(changedRuntime.status).toBe(409)
     expect(await changedRuntime.json()).toMatchObject({ error: 'run already exists: recovery-child' })
+  })
+
+  it('forwards explicit synthesis repair custody and binds it to the child reservation', async () => {
+    const { instance, prepareFailedWaveRecovery, targetFetch } = coordinator()
+    const repairQuarantined = { taskId: 'synthesizer', requestDigest: 'a'.repeat(64), outputDigest: 'b'.repeat(64) }
+    expect((await instance.fetch(recoveryRequest({ repairQuarantined }))).status).toBe(202)
+    expect(prepareFailedWaveRecovery.mock.calls[0]?.[0]).toMatchObject({ repairQuarantined })
+    const dispatch = targetFetch.mock.calls.find(([url]) => url.endsWith('/audit-recoveries'))!
+    expect(JSON.parse(String(dispatch[1]!.body))).toMatchObject({ repairQuarantined })
+    expect((await instance.fetch(recoveryRequest({ repairQuarantined: {
+      ...repairQuarantined, outputDigest: 'c'.repeat(64),
+    } }))).status).toBe(409)
+    expect((await coordinator().instance.fetch(recoveryRequest({ repairQuarantined: {
+      ...repairQuarantined, outputDigest: 'bad',
+    } }))).status).toBe(400)
   })
 
   it('rechecks a fenced unobservable task before reservation and route dispatch', async () => {

@@ -17,7 +17,7 @@ it('honors a saved stop after cohorts drain without moving the discovery cursor'
   const running = workflowProgress(state)
   const definition = { stages: [{ kind: 'preparation' }, { kind: 'discovery' }, { kind: 'synthesis' }] }
   const checkpoint = { digest: 'b'.repeat(64), body: { cursor: state.cursor } }
-  const machine = { snapshot: () => structuredClone(state),
+  const machine = { view: () => structuredClone(state),
     seal: vi.fn(async () => { state.checkpoints.push(checkpoint); return checkpoint }),
     stop: async (reason: string) => { state = { ...state, status: 'stopped', terminalReason: reason } } }
   const store = { ensureSchema: async () => {}, getState: async () => structuredClone(state),

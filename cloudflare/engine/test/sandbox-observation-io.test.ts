@@ -1,12 +1,12 @@
 import { expect, it, vi } from 'vitest'
-import { getSandbox } from '@cloudflare/sandbox'
+import { getAgentSandbox } from '../src/agent-sandbox-client.js'
 import { waitForAgentProcess } from '../src/agent-process.js'
 import { SandboxAgentProvider, agentProcessEnvironment, agentObservationIncidentMaxMs,
   terminalLogDrainMs } from '../src/sandbox-provider.js'
 import { expiredObservationCooldownMs } from '../src/agent-observation-cooldown.js'
 import { AgentExecutionPending } from '../src/run-errors.js'
 
-vi.mock('@cloudflare/sandbox', () => ({ getSandbox: vi.fn() }))
+vi.mock('../src/agent-sandbox-client.js', () => ({ getAgentSandbox: vi.fn() }))
 vi.mock('../src/agent-process.js', () => ({
   agentProcessId: (digest: string) => `agent-${digest.slice(0, 40)}`,
   waitForAgentProcess: vi.fn(async (_process: unknown, _slice: number, _interval: number,
@@ -36,12 +36,12 @@ it('bounds a sustained core observation outage without touching its admitted pro
   const incidentSince = new Date(Date.now() - agentObservationIncidentMaxMs - 1).toISOString()
   provider.observationHealth = { get: async () => ({ requestDigest: digest, incidentSince,
     nextObservationAfter: new Date(Date.now() + 60_000).toISOString() }) }
-  vi.mocked(getSandbox).mockClear()
+  vi.mocked(getAgentSandbox).mockClear()
   await expect(provider.run(request as any)).rejects.toMatchObject({
     category: 'session-recovery-unavailable', retryable: false,
   })
   expect(provider.executionReceipts.get).toHaveBeenCalledTimes(2)
-  expect(getSandbox).not.toHaveBeenCalled()
+  expect(getAgentSandbox).not.toHaveBeenCalled()
 })
 
 it('prefers a late exact receipt over the core observation-outage boundary', async () => {
@@ -58,9 +58,9 @@ it('prefers a late exact receipt over the core observation-outage boundary', asy
   provider.observationHealth = { get: async () => ({ requestDigest: digest,
     incidentSince: new Date(Date.now() - agentObservationIncidentMaxMs - 1).toISOString(),
     nextObservationAfter: null }) }
-  vi.mocked(getSandbox).mockClear()
+  vi.mocked(getAgentSandbox).mockClear()
   await expect(provider.run(request as any)).resolves.toMatchObject({ actorId: 'retained-session' })
-  expect(getSandbox).not.toHaveBeenCalled()
+  expect(getAgentSandbox).not.toHaveBeenCalled()
 })
 
 it('does not turn an unreadable late receipt into an absent receipt', async () => {
@@ -76,9 +76,9 @@ it('does not turn an unreadable late receipt into an absent receipt', async () =
   provider.observationHealth = { get: async () => ({ requestDigest: digest,
     incidentSince: new Date(Date.now() - agentObservationIncidentMaxMs - 1).toISOString(),
     nextObservationAfter: null }) }
-  vi.mocked(getSandbox).mockClear()
+  vi.mocked(getAgentSandbox).mockClear()
   await expect(provider.run(request as any)).rejects.toMatchObject({ retryable: true })
-  expect(getSandbox).not.toHaveBeenCalled()
+  expect(getAgentSandbox).not.toHaveBeenCalled()
 })
 
 it('yields an admitted attempt when result-file observation hangs, with no late launch', async () => {
@@ -128,7 +128,7 @@ it('yields an admitted attempt when the initial lifetime RPC hangs, with no late
   const launch = vi.spyOn(provider, 'runInSandbox')
   let resolveLifetime!: () => void
   const sandbox = { setKeepAlive: vi.fn(() => new Promise<void>(resolve => { resolveLifetime = resolve })) }
-  vi.mocked(getSandbox).mockReturnValue(sandbox as any)
+  vi.mocked(getAgentSandbox).mockReturnValue(sandbox as any)
   await expect(provider.run(request as any)).rejects.toBeInstanceOf(AgentExecutionPending)
   resolveLifetime()
   await Promise.resolve()
@@ -146,16 +146,16 @@ it('checks an exact durable receipt before an active observation cooldown', asyn
   provider.executionReceipts = { get: async () => receipt }
   provider.observationCooldowns = { get: async () => Date.now() + 60_000 }
   provider.observationHealth = { get: async () => null, recordProcessSuccess: vi.fn() }
-  vi.mocked(getSandbox).mockClear()
+  vi.mocked(getAgentSandbox).mockClear()
   await expect(provider.run(request as any)).rejects.toBeInstanceOf(AgentExecutionPending)
-  expect(getSandbox).not.toHaveBeenCalled()
+  expect(getAgentSandbox).not.toHaveBeenCalled()
   receipt = {
     requestDigest: 'a'.repeat(64), exitCode: 0, actorId: 'synthetic-session',
     files: {}, inputTokens: 1, outputTokens: 1, costUsd: 0, stderr: '',
   }
   const result = await provider.run(request as any)
   expect(result.actorId).toBe('synthetic-session')
-  expect(getSandbox).not.toHaveBeenCalled()
+  expect(getAgentSandbox).not.toHaveBeenCalled()
 })
 
 it('picks up an exact local receipt after the bounded cooldown without starting an agent', async () => {
@@ -184,9 +184,9 @@ it('picks up an exact local receipt after the bounded cooldown without starting 
       }) })),
       getProcess: vi.fn(), startProcess: vi.fn(), mkdir: vi.fn(),
     }
-    vi.mocked(getSandbox).mockClear().mockReturnValue(sandbox as any)
+    vi.mocked(getAgentSandbox).mockClear().mockReturnValue(sandbox as any)
     await expect(provider.run(request as any)).rejects.toBeInstanceOf(AgentExecutionPending)
-    expect(getSandbox).not.toHaveBeenCalled()
+    expect(getAgentSandbox).not.toHaveBeenCalled()
     await vi.advanceTimersByTimeAsync(expiredObservationCooldownMs + 1)
     const result = await provider.run(request as any)
     expect(result.actorId).toBe('local-receipt')
@@ -228,10 +228,10 @@ it('accepts a late exact receipt during an unresolved incident before any Sandbo
     files: {}, inputTokens: 1, outputTokens: 1, costUsd: 0, stderr: '',
   }) }
   provider.observationHealth = { recordProcessSuccess: vi.fn() }
-  vi.mocked(getSandbox).mockClear()
+  vi.mocked(getAgentSandbox).mockClear()
   const result = await provider.run(request as any)
   expect(result.actorId).toBe('original-session')
-  expect(getSandbox).not.toHaveBeenCalled()
+  expect(getAgentSandbox).not.toHaveBeenCalled()
   expect(provider.observationHealth.recordProcessSuccess).not.toHaveBeenCalled()
 })
 
@@ -246,7 +246,7 @@ it('allows the first launch after a pre-claim observation outage', async () => {
     incidentSince: null, nextObservationAfter: null }) }
   provider.observationCooldowns = { get: async () => null }
   const setKeepAlive = vi.fn(async () => {})
-  vi.mocked(getSandbox).mockReturnValue({ setKeepAlive } as any)
+  vi.mocked(getAgentSandbox).mockReturnValue({ setKeepAlive } as any)
   const reattach = vi.spyOn(provider, 'runInSandbox').mockResolvedValue({ actorId: 'first-launch' })
   expect((await provider.run(request as any)).actorId).toBe('first-launch')
   expect(provider.executionReceipts.getStart).toHaveBeenCalledOnce()
@@ -265,7 +265,7 @@ it('retains an existing launch claim and skips lifetime mutation during unresolv
     incidentSince: new Date(Date.now() - 11 * 60_000).toISOString(), nextObservationAfter: null }) }
   provider.observationCooldowns = { get: async () => null }
   const setKeepAlive = vi.fn(async () => {})
-  vi.mocked(getSandbox).mockReturnValue({ setKeepAlive } as any)
+  vi.mocked(getAgentSandbox).mockReturnValue({ setKeepAlive } as any)
   const reattach = vi.spyOn(provider, 'runInSandbox').mockRejectedValue(new AgentExecutionPending('same-process', 'unavailable'))
   await expect(provider.run(request as any)).rejects.toBeInstanceOf(AgentExecutionPending)
   expect(provider.executionReceipts.getStart).toHaveBeenCalledOnce()
@@ -286,7 +286,7 @@ it('records all-unavailable status probes as a failed observation without a new 
     exists: vi.fn(async () => ({ exists: false })),
     getProcess: vi.fn(async () => ({ id: 'original-process' })),
     startProcess: vi.fn(), mkdir: vi.fn() }
-  vi.mocked(getSandbox).mockReturnValue(sandbox as any)
+  vi.mocked(getAgentSandbox).mockReturnValue(sandbox as any)
   await expect(provider.run(request as any)).rejects.toBeInstanceOf(AgentExecutionPending)
   expect(provider.observationHealth.recordFailure).toHaveBeenCalledWith(
     expect.any(Object), expect.any(String), 'process-status-unavailable', expect.any(Date))
@@ -409,19 +409,19 @@ it('diagnoses the terminal observation-loss route with native metrics without to
   try {
     const env = { ACK3_CODEX_WORKSPACE_ID: 'synthetic', ACK3_CLOUDFLARE_ACCOUNT_ID: 'c'.repeat(32),
       CLOUDFLARE_OBSERVABILITY_TOKEN: { get: async () => 'monitor-private-token' },
-      VERSION_METADATA: { id: 'runtime-version' }, Sandbox: { idFromName: vi.fn(() => ({ toString: () => actorId })) } }
+      VERSION_METADATA: { id: 'runtime-version' }, AGENT_SANDBOX: { idFromName: vi.fn(() => ({ toString: () => actorId })) } }
     const provider = new SandboxAgentProvider(env as any) as any
     provider.assertProviderCredentials = () => {}
     let digest = ''
     provider.executionReceipts = { get: async (_run: string, requestDigest: string) => { digest = requestDigest; return null } }
     provider.observationHealth = { get: async () => ({ requestDigest: digest, firstFailedAt,
       incidentSince: new Date(Date.now() - agentObservationIncidentMaxMs - 1).toISOString(), nextObservationAfter: null }) }
-    vi.mocked(getSandbox).mockClear()
+    vi.mocked(getAgentSandbox).mockClear()
     await expect(provider.run(request as any)).rejects.toMatchObject({
       category: 'session-recovery-unavailable', retryable: false,
       message: expect.stringContaining('suspected-memory-exhaustion'),
     })
-    expect(getSandbox).not.toHaveBeenCalled()
+    expect(getAgentSandbox).not.toHaveBeenCalled()
     expect(fetcher).toHaveBeenCalledTimes(1)
     const diagnostic = JSON.parse(logged.mock.calls.at(-1)![0])
     expect(diagnostic).toMatchObject({ event: 'observation-resource-assessment', workerVersionId: 'runtime-version',
@@ -457,4 +457,20 @@ it('passes only the selected subscription to each native runner', () => {
   expect(claude.CLAUDE_CODE_OAUTH_TOKEN).toBe(env.CLAUDE_TEAM_OAUTH_TOKEN)
   expect(claude.ACK3_CODEX_WORKSPACE_ID).toBeUndefined()
   expect(claude.CLOUDFLARE_OBSERVABILITY_TOKEN).toBeUndefined()
+})
+
+it('exposes only selected header credentials to its native process', () => {
+  const connection = { baseUrl: 'https://model.example.com/v1', apiKeyEnv: 'LOCAL_MODEL_API_KEY',
+    headersEnv: { 'CF-Access-Client-Id': 'LOCAL_MODEL_HEADER_ID_API_KEY', 'CF-Access-Client-Secret': 'LOCAL_MODEL_HEADER_SECRET_API_KEY' } }
+  const selected = { ...request, task: { ...request.task, backend: 'dsh-chat-completions', providerClass: 'additive', connection } }
+  const env = { LOCAL_MODEL_API_KEY: 'origin-key', LOCAL_MODEL_HEADER_ID_API_KEY: 'selected-id',
+    LOCAL_MODEL_HEADER_SECRET_API_KEY: 'selected-secret', OTHER_ACCESS_CLIENT_SECRET: 'not-selected',
+    CLOUDFLARE_OBSERVABILITY_TOKEN: 'monitor-only' }
+  const resolved = agentProcessEnvironment(selected as any, env as any, {})
+  expect(resolved.LOCAL_MODEL_HEADER_ID_API_KEY).toBe('selected-id')
+  expect(resolved.LOCAL_MODEL_HEADER_SECRET_API_KEY).toBe('selected-secret')
+  expect(resolved.OTHER_ACCESS_CLIENT_SECRET).toBeUndefined()
+  expect(resolved.CLOUDFLARE_OBSERVABILITY_TOKEN).toBeUndefined()
+  expect(() => agentProcessEnvironment(selected as any, { ...env, LOCAL_MODEL_HEADER_SECRET_API_KEY: '' } as any, {}))
+    .toThrow('LOCAL_MODEL_HEADER_SECRET_API_KEY is missing')
 })

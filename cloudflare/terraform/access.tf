@@ -7,7 +7,7 @@ resource "cloudflare_zero_trust_access_identity_provider" "email" {
 
 resource "cloudflare_zero_trust_access_policy" "dashboard" {
   account_id       = var.cloudflare_account_id
-  name             = "ACK3 Swarm dashboard"
+  name             = "Swarm dashboard"
   decision         = "allow"
   session_duration = "8h"
   include = concat(

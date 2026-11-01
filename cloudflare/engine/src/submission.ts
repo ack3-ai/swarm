@@ -1,4 +1,5 @@
 import MarkdownIt from 'markdown-it'
+import { SUBMISSION_MAX_BYTES } from './output-limits.js'
 import type {
   ArtifactRecord,
   ChallengeObservation,
@@ -46,7 +47,11 @@ function record(value: unknown, label: string, keys: readonly string[], issues: 
     && keys.some(k => ['conclusion', 'disposition', 'finalDisposition', 'exploitability'].includes(k))
     ? ['researchQueries'] : [])].toSorted()
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-    issues.push(`${label} must contain exactly: ${expected.join(', ')}`)
+    const missing = expected.filter(key => !actual.includes(key))
+    const unexpected = actual.filter(key => !expected.includes(key))
+    issues.push(`${label} must contain exactly: ${expected.join(', ')}`
+      + (missing.length === 0 ? '' : `; missing: ${missing.join(', ')}`)
+      + (unexpected.length === 0 ? '' : `; unexpected: ${unexpected.join(', ')}`))
   }
   return value as Record<string, unknown>
 }
@@ -101,7 +106,11 @@ function exactSet(actual: readonly string[], expected: readonly string[], label:
 }
 
 function researchQueries(item: Record<string, unknown>, label: string, issues: string[]) {
-  return item.researchQueries === undefined ? {} : {
+  // An empty list cites no searches, the same as leaving the field out; records
+  // that must cite searches are checked against the session's native search evidence.
+  const omitted = item.researchQueries === undefined
+    || (Array.isArray(item.researchQueries) && item.researchQueries.length === 0)
+  return omitted ? {} : {
     researchQueries: strings(item.researchQueries, `${label}.researchQueries`, issues, false),
   }
 }
@@ -201,7 +210,7 @@ function parseEnvelope(content: string | undefined, issues: string[]): Record<st
     issues.push(`missing required output file: ${SUBMISSION_PATH}`)
     return null
   }
-  if (new TextEncoder().encode(content).byteLength > 256_000) {
+  if (new TextEncoder().encode(content).byteLength > SUBMISSION_MAX_BYTES) {
     issues.push('structured submission is too large')
     return null
   }

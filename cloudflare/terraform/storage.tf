@@ -4,7 +4,7 @@ locals {
 
 resource "cloudflare_r2_bucket" "experiment_packages" {
   account_id    = var.cloudflare_account_id
-  name          = "ack3-experiment-packages"
+  name          = "${var.resource_prefix}-experiment-packages"
   jurisdiction  = local.r2_jurisdiction
   location      = var.r2_location
   storage_class = "Standard"
@@ -42,7 +42,7 @@ resource "cloudflare_r2_bucket_lock" "experiment_packages" {
 
 resource "cloudflare_r2_bucket" "experiment_artifacts" {
   account_id    = var.cloudflare_account_id
-  name          = "ack3-experiment-artifacts"
+  name          = "${var.resource_prefix}-experiment-artifacts"
   jurisdiction  = local.r2_jurisdiction
   location      = var.r2_location
   storage_class = "Standard"
@@ -81,7 +81,7 @@ resource "cloudflare_r2_bucket_lock" "experiment_artifacts" {
 
 resource "cloudflare_d1_database" "experiment_index" {
   account_id   = var.cloudflare_account_id
-  name         = "ack3-experiment-index"
+  name         = "${var.resource_prefix}-experiment-index"
   jurisdiction = var.data_jurisdiction
   read_replication = {
     mode = "disabled"

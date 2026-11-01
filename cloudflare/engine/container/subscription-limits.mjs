@@ -45,3 +45,24 @@ export function latestSubscriptionLimits(stdout) {
   }
   return latest
 }
+
+/** Completed native quota waits; overlapping agents must not extend the clock twice. */
+export function validSubscriptionWaits(value) {
+  return value === undefined || (Array.isArray(value) && value.every(wait => wait !== null
+    && typeof wait === 'object' && ['claude', 'dsh'].includes(wait.provider)
+    && typeof wait.sessionId === 'string' && /^[a-zA-Z0-9._:-]{8,200}$/.test(wait.sessionId)
+    && ['startedAt', 'resumedAt', 'resetsAt'].every(key => typeof wait[key] === 'string'
+      && Number.isFinite(Date.parse(wait[key])))
+    && Date.parse(wait.resumedAt) >= Date.parse(wait.startedAt)
+    && Date.parse(wait.resumedAt) >= Date.parse(wait.resetsAt)))
+}
+
+export function subscriptionWaits(stdout) {
+  const waits = []
+  for (const line of stdout.split('\n')) {
+    let event
+    try { event = JSON.parse(line) } catch { continue }
+    if (event.type === 'subscription_wait' && validSubscriptionWaits([event.wait])) waits.push(event.wait)
+  }
+  return waits.length === 0 ? undefined : waits
+}

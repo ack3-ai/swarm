@@ -22,14 +22,14 @@ export async function runtimeCodeUploadForm(bytes, settings, containers) {
     ['EXA_API_KEY', 'secrets_store_secret'],
     ['CLOUDFLARE_OBSERVABILITY_TOKEN', 'secrets_store_secret'],
     ['VERSION_METADATA', 'version_metadata'],
-    ['Sandbox', 'durable_object_namespace'],
+    ['AGENT_SANDBOX', 'durable_object_namespace'],
     ['AUDIT_WORKFLOW', 'workflow'],
     ['RUNTIME_ISOLATION_WORKFLOW', 'workflow'],
   ]) assert.equal(named(name)?.type, type, `${name} binding is missing or changed`)
   assert.match(named('ACK3_CLOUDFLARE_ACCOUNT_ID')?.text ?? '', /^[0-9a-f]{32}$/i,
     'ACK3_CLOUDFLARE_ACCOUNT_ID binding is missing; configure the reserved idle slot before code rotation')
-  assert.ok(Array.isArray(containers) && containers.filter(item => item?.class_name === 'Sandbox').length === 1,
-    'native Sandbox container metadata is missing or ambiguous; refusing code-only publication')
+  assert.ok(Array.isArray(containers) && containers.filter(item => item?.class_name === 'AgentSandbox').length === 1,
+    'native agent sandbox container metadata is missing or ambiguous; refusing code-only publication')
   const end = bytes.indexOf('\r\n')
   assert.ok(end > 2 && end < 200, 'Wrangler multipart output is invalid')
   const boundary = bytes.subarray(2, end).toString()

@@ -13,6 +13,32 @@ import { captureDiscoveryRequests, mirroredResearchPrompt, researchReasoningText
 import { researchEvidencePaths, researchPredecessor } from '../src/accepted-mounts.js'
 
 describe('experiment config compiler', () => {
+  it('carries an explicit Codex access program to the scheduled task', () => {
+    const program: any = structuredClone(document)
+    program.modelPools[0].model = 'codex-program-model'
+    program.modelPools[0].cyberAccessProgram = 'example_program'
+    const definition = compileExperimentConfig(program).definition
+    expect(definition.pools[0]!.cyberAccessProgram).toBe('example_program')
+    expect(definition.stages.find(stage => stage.kind === 'discovery')!.waves[0]!.tasks
+      .find(task => task.modelPool === program.modelPools[0].id)?.cyberAccessProgram).toBe('example_program')
+
+    for (const name of ['', 'Example', '-flag', 'a b', 'x'.repeat(65)]) {
+      program.modelPools[0].cyberAccessProgram = name
+      expect(() => compileExperimentConfig(program)).toThrow('invalid cyberAccessProgram')
+    }
+    program.modelPools[0].cyberAccessProgram = 'example_program'
+    program.modelPools[1].cyberAccessProgram = 'example_program'
+    expect(() => compileExperimentConfig(program)).toThrow('invalid cyberAccessProgram')
+  })
+
+  it('accepts an opt-in usage-window wait only as a boolean on a DSH connection', () => {
+    const windowed: any = structuredClone(document)
+    windowed.modelPools[1].connection.usageWindowWait = true
+    expect(compileExperimentConfig(windowed).definition.pools[1]!.connection?.usageWindowWait).toBe(true)
+    windowed.modelPools[1].connection.usageWindowWait = 'yes'
+    expect(() => compileExperimentConfig(windowed)).toThrow('invalid usageWindowWait')
+  })
+
   it('defaults both harnesses to official Exa and rejects retired routing', () => {
     const manifest = { ...document, forceSearch: true, nativeSearch: {} }
     expect(compileExperimentConfig(manifest).definition.nativeSearch?.searchConnection)

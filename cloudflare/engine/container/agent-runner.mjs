@@ -5,15 +5,19 @@ import { dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { claudeUsage } from './claude-usage.mjs'
 import { readCodexSubscription } from './codex-subscription.mjs'
-import { latestSubscriptionLimits } from './subscription-limits.mjs'
+import { latestSubscriptionLimits, subscriptionWaits } from './subscription-limits.mjs'
 import { codexUsage } from './codex-usage.mjs'
 import { dshUsage } from './dsh-usage.mjs'
 import { dshCost } from './dsh-cost.mjs'
 import { claudeNativeSearchEvidence, codexNativeSearchEvidence, codexExaSearchEvidence, dshNativeSearchAttempted, dshNativeSearchEvidence,
   readCodexNativeJournal } from './native-search-evidence.mjs'
 import { codexAuthCredentials, createAgentLogWriter } from './agent-log-writer.mjs'
-import { renderDshReasoningPatch, validateCoreReasoning, codexExaConfig } from './reasoning-config.mjs'
+import { renderDshReasoningPatch, validateCoreReasoning, codexExaConfig, modelHeaderCredentialNames, validCodexAccessProgram } from './reasoning-config.mjs'
 import { collectAgentOutputFiles } from './output-files.mjs'
+
+// Agents run as UID 10001. Durable Object containers keep root capabilities across
+// a user change unless they are dropped, and file permissions would not apply.
+const agentUser = ['--reuid=10001', '--regid=10001', '--init-groups', '--inh-caps=-all', '--ambient-caps=-all']
 
 const [requestPath, resultPath] = process.argv.slice(2)
 if (!requestPath || !resultPath) throw new Error('request and result paths are required')
@@ -23,6 +27,9 @@ for (const value of [request.prompt, request.model, request.taskId, request.runI
 }
 if (!/^[a-f0-9]{64}$/.test(request.requestDigest ?? '')) throw new Error('invalid agent request digest')
 if (request.providerClass === 'core') validateCoreReasoning(request)
+if (!validCodexAccessProgram(request.backend, request.cyberAccessProgram)) {
+  throw new Error('invalid Codex cyber access program')
+}
 const subagents = request.subagents ?? { mode: 'disabled' }
 if (subagents?.mode !== 'disabled'
     && !(subagents?.mode === 'native' && Number.isSafeInteger(subagents.maxConcurrent)
@@ -70,7 +77,7 @@ async function execute(command, args, env, input) {
       settled = true
       if (request.providerClass === 'core' && request.backend !== 'claude') {
         const limits = await readCodexSubscription(env, {
-          command: 'setpriv', prefix: ['--reuid=10001', '--regid=10001', '--init-groups', 'codex'],
+          command: 'setpriv', prefix: [...agentUser, 'codex'],
         })
         const text = `${JSON.stringify({ type: 'subscription_limits', limits })}\n`
         value.stdout += text
@@ -94,6 +101,8 @@ async function execute(command, args, env, input) {
   })
 }
 
+// Native CLIs read the full prompt from stdin: a single argv is bounded by
+// Linux MAX_ARG_STRLEN, even when the model accepts a much larger context.
 let execution
 let providerRequests = []
 let nativeSearchEvidence
@@ -102,7 +111,7 @@ let usage = {
   cacheAccountingComplete: false, providerHttpStatus: null, providerErrorCode: null, provider: null, costUsd: null,
 }
 if (request.backend === 'claude') {
-  execution = await execute('setpriv', ['--reuid=10001', '--regid=10001', '--init-groups',
+  execution = await execute('setpriv', [...agentUser,
     'node', '/usr/local/bin/claude-runner.mjs'], { ...process.env, HOME: '/workspace/home' }, JSON.stringify(request))
   usage = claudeUsage(execution.stdout)
   nativeSearchEvidence = claudeNativeSearchEvidence(execution.stdout)
@@ -111,6 +120,7 @@ if (request.backend === 'claude') {
   if (!/^[a-f0-9-]{36}$/i.test(workspaceId ?? '')) throw new Error('ACK3 organization workspace is not configured')
   const executionOptions = [
     '--model', request.model,
+    ...(request.cyberAccessProgram === undefined ? [] : ['--cyber-access-program', request.cyberAccessProgram]),
     ...(subagents.mode === 'native'
       ? ['--config', 'agents.enabled=true', '--config', `agents.max_concurrent_threads_per_session=${subagents.maxConcurrent}`]
       : ['--disable', 'multi_agent', '--disable', 'multi_agent_v2', '--config', 'agents.enabled=false']),
@@ -127,12 +137,12 @@ if (request.backend === 'claude') {
     '--config', `forced_chatgpt_workspace_id="${workspaceId}"`,
     'exec',
     ...(request.continuationMode === 'resume'
-      ? ['resume', ...executionOptions, request.sessionId, request.prompt]
-      : [...executionOptions, '--cd', request.workingDirectory, request.prompt]),
+      ? ['resume', ...executionOptions, request.sessionId, '-']
+      : [...executionOptions, '--cd', request.workingDirectory, '-']),
   ]
-  execution = await execute('setpriv', ['--reuid=10001', '--regid=10001', '--init-groups', 'codex', ...args], {
+  execution = await execute('setpriv', [...agentUser, 'codex', ...args], {
     ...process.env, HOME: '/workspace/home', CODEX_HOME: '/codex-home',
-  })
+  }, request.prompt)
   usage = codexUsage(execution.stdout)
   if (request.searchConnection?.provider === 'exa') usage.costAccountingComplete = false
   if (request.enableNativeSearch === true) {
@@ -147,17 +157,21 @@ if (request.backend === 'claude') {
   if (!/^[A-Z][A-Z0-9_]*$/.test(apiKeyEnv ?? '') || !process.env[apiKeyEnv]?.trim()) {
     throw new Error('native DSH provider credential is not configured')
   }
+  for (const name of modelHeaderCredentialNames(request.connection)) {
+    if (!process.env[name]?.trim()) throw new Error('model header credential is not configured')
+  }
   // The supervisor's HOME layer owns native search plugins; do not insert them twice.
   await writeFile('/opt/dsh-home/profiles/native-worker/cordis.patch.yml',
     renderDshReasoningPatch({ ...request, searchConnection: undefined }), { mode: 0o600 })
   execution = await execute('setpriv', [
-    '--reuid=10001', '--regid=10001', '--init-groups', 'dsh',
-    '--profile', 'native-worker', '--json', request.prompt,
+    ...agentUser, 'dsh',
+    '--profile', 'native-worker', '--json', '-',
   ], {
     ...process.env,
     HOME: '/workspace/home', DSH_HOME: '/opt/dsh-home', DSH_PERMISSION_MODE: 'danger-full-access',
     DSH_TELEMETRY_MODE: 'DISABLED', DSH_TOOLS_MODE: 'native', DEEPSEEK_SWARM_NATIVE_SEARCH: 'false',
-  })
+    ACK3_PROVIDER_WINDOW_WAIT: request.connection?.usageWindowWait === true ? '1' : '0',
+  }, request.prompt)
   const directUsage = dshUsage(execution.stdout)
   nativeSearchEvidence = dshNativeSearchEvidence(execution.stdout)
   usage = {
@@ -171,6 +185,9 @@ if (request.backend === 'claude') {
 }
 
 const files = await collectAgentOutputFiles(request.expectedFiles)
+const waits = request.backend === 'claude' ? subscriptionWaits(execution.stdout)
+  : request.backend === 'dsh-chat-completions' && request.connection?.usageWindowWait === true
+    ? subscriptionWaits(execution.stderr) : undefined
 const result = {
   exitCode: execution.code,
   actorId: String(usage.actorId ?? `${request.providerClass}-${request.runId}-${request.taskId}-${request.attempt}-${randomUUID()}`),
@@ -187,6 +204,7 @@ const result = {
   ...(latestSubscriptionLimits(execution.stdout) === undefined ? {} : {
     subscriptionLimits: latestSubscriptionLimits(execution.stdout),
   }),
+  ...(waits === undefined ? {} : { subscriptionWaits: waits }),
   ...(nativeSearchEvidence === undefined ? {} : { nativeSearchEvidence }),
   costUsd: request.providerClass === 'additive' && Number.isFinite(usage.costUsd) ? usage.costUsd : 0,
   stderr: execution.stderr.slice(-20_000),

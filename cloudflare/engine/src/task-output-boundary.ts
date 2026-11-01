@@ -1,6 +1,6 @@
-import type { ISandbox } from '@cloudflare/sandbox'
+import type { SandboxClient } from './agent-sandbox-client.js'
 
-type OutputSandbox = Pick<ISandbox, 'deleteFile' | 'exists'>
+type OutputSandbox = Pick<SandboxClient, 'deleteFile' | 'exists'>
 
 const safeOutputPath = /^[A-Za-z0-9.][A-Za-z0-9._/-]{0,239}$/
 

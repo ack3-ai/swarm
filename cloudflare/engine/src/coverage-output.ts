@@ -1,7 +1,7 @@
-import type { ISandbox } from '@cloudflare/sandbox'
+import type { SandboxClient } from './agent-sandbox-client.js'
 import { PermanentRunFailure, TransientRunFailure } from './run-errors.js'
 
-type CoverageSandbox = Pick<ISandbox, 'exists' | 'writeFile' | 'exec'>
+type CoverageSandbox = Pick<SandboxClient, 'exists' | 'writeFile' | 'exec'>
 
 export const coverageChallengeInitialDocument =
   '# Coverage challenge\n\n## Independent coverage\n\n## Observation ledger\n\n## Candidate supplement\n'

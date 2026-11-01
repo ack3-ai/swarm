@@ -64,11 +64,17 @@ it('keeps an admitted run nonterminal when recovery observation also exhausts re
     { name: 'advance-or-poll-1', limit: 3 },
     { name: 'dispose-completed-workspaces', limit: 10 },
   ])
+  expect(step.sleep).toHaveBeenCalledTimes(1)
   expect(step.sleep).toHaveBeenCalledWith('agent-poll-backoff-0', '30 seconds')
   expect(instance.recordTerminalFailure).not.toHaveBeenCalled()
 })
 
-it('continues the same admitted run after a Cloudflare sleep-boundary failure', async () => {
+it.each([
+  { observationOutage: false, retryFails: false },
+  { observationOutage: true, retryFails: false },
+  { observationOutage: false, retryFails: true },
+  { observationOutage: true, retryFails: true },
+])('bounds sleep recovery (observation outage: $observationOutage, retry fails: $retryFails)', async ({ observationOutage, retryFails }) => {
   const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8')
   const code = stripTypeScriptTypes(source.slice(
     source.indexOf('export class AuditWorkflow'),
@@ -105,25 +111,50 @@ it('continues the same admitted run after a Cloudflare sleep-boundary failure', 
   }
   const completed = { ...running, status: 'completed', terminalReason: 'completed' }
   const platformFailure = new Error('internal error; reference = fixture-platform-reference')
+  const retryFailure = new Error('internal error; reference = fixture-retry-reference')
+  const operations: string[] = []
   const instance = new Workflow()
   instance.recordTerminalFailure = vi.fn(async () => {})
   instance.workflowStepError = (error: unknown) => error
+  let observationCycles = 0
   const step = {
     do: vi.fn(async (name: string) => {
+      operations.push(name)
       if (name === 'initialize-index') return { ready: true }
       if (name === 'bootstrap-run') return running
-      if (name === 'advance-or-poll-0') return running
-      if (name === 'advance-or-poll-1') return completed
+      if (name.startsWith('advance-or-poll-')) {
+        observationCycles += 1
+        // Bound the regression if the old catch-and-continue loop returns.
+        if (observationCycles > 3) throw new NonRetryableError('fixture detected repeated observation cycles')
+        if (observationCycles === 2) return completed
+        if (observationOutage) throw platformFailure
+        return running
+      }
+      if (name.startsWith('recover-wave-state-')) throw platformFailure
       if (name === 'dispose-completed-workspaces') return { ready: true }
       throw new Error(`unexpected step ${name}`)
     }),
     sleep: vi.fn(async (name: string) => {
+      operations.push(name)
       if (name === 'agent-poll-backoff-0') throw platformFailure
+      if (retryFails) throw retryFailure
     }),
   }
 
-  await expect(instance.run({ payload: { runId: 'platform-outage' } }, step))
-    .resolves.toEqual(completed)
-  expect(step.sleep).toHaveBeenCalledTimes(1)
+  const execution = instance.run({ payload: { runId: 'platform-outage' } }, step)
+  if (retryFails) await expect(execution).rejects.toBe(retryFailure)
+  else await expect(execution).resolves.toEqual(completed)
+  expect(observationCycles).toBe(retryFails ? 1 : 2)
+  expect(operations).toEqual([
+    'initialize-index', 'bootstrap-run', 'advance-or-poll-0',
+    ...(observationOutage ? ['recover-wave-state-0'] : []),
+    'agent-poll-backoff-0', 'agent-poll-backoff-retry-0',
+    ...(retryFails ? [] : ['advance-or-poll-1', 'dispose-completed-workspaces']),
+  ])
+  expect(step.sleep.mock.calls).toEqual([
+    ['agent-poll-backoff-0', observationOutage ? '30 seconds' : '15 seconds'],
+    ['agent-poll-backoff-retry-0', '30 seconds'],
+  ])
   expect(instance.recordTerminalFailure).not.toHaveBeenCalled()
+  expect(running.status).toBe('running')
 })

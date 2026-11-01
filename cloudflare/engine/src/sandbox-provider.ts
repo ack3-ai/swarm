@@ -1,4 +1,5 @@
-import { getSandbox, type ISandbox } from '@cloudflare/sandbox'
+import { modelHeaderCredentialNames } from '../container/reasoning-config.mjs'
+import { getAgentSandbox, type SandboxClient } from './agent-sandbox-client.js'
 import type { AgentProvider, AgentRequest, AgentResult } from './contracts.js'
 import type { Env } from './env.js'
 import { canonicalJson, sha256 } from './canonical.js'
@@ -68,7 +69,7 @@ export const agentLogReadMaxBytes = 256 * 1024
 export const agentLogFinalDrainSlices = 8
 // Keep one read-only Sandbox observation below the Workflow step's 30-minute
 // deadline. Expiry retains the exact paid attempt and never revokes its owner.
-// Give peers a prompt chance to settle when one Sandbox SDK observation hangs.
+// Give peers a prompt chance to settle when one sandbox observation hangs.
 // A later Workflow poll reattaches to the same admitted process and exact receipt.
 export const agentSandboxObservationMs = 2 * 60_000
 export const agentSandboxLaunchPrerequisiteMs = 60_000
@@ -122,6 +123,7 @@ function executionRequestBody(request: AgentRequest, workspaceId: string) {
   return {
     prompt: request.prompt, model: request.task.model, providerClass: request.task.providerClass,
     backend: taskBackend(request.task),
+    ...(request.task.cyberAccessProgram === undefined ? {} : { cyberAccessProgram: request.task.cyberAccessProgram }),
     ...(request.task.credentialSource === undefined ? {} : { credentialSource: request.task.credentialSource }),
     ...(request.task.provider === undefined ? {} : { provider: request.task.provider }),
     ...(request.task.connection === undefined ? {} : { connection: request.task.connection }),
@@ -174,6 +176,7 @@ export function agentProcessEnvironment(request: AgentRequest, env: Env,
         ...targetWorkspaceEnvironment,
         ...scopedTargetEnvironment,
         [request.task.connection!.apiKeyEnv]: resolvedKey(request.task.connection!.apiKeyEnv),
+        ...Object.fromEntries(modelHeaderCredentialNames(request.task.connection).map(name => [name, resolvedKey(name)])),
         ...(request.nativeSearchConnection === undefined ? {} : {
           [request.nativeSearchConnection.apiKeyEnv]: resolvedKey(request.nativeSearchConnection.apiKeyEnv),
         }),
@@ -235,11 +238,10 @@ export class SandboxAgentProvider implements AgentProvider {
     // Keeping the lane ID stable preserves its checkout and scratch custody.
     const sandboxId = `a0-${(await sha256(`${request.workspaceAllocationRunId ?? request.runId}:${request.task.workspaceKey}`)).slice(0, 30)}`
     if (request.retainedSandboxObjectId !== undefined
-      && this.env.Sandbox.idFromName(sandboxId).toString() !== request.retainedSandboxObjectId) {
+      && this.env.AGENT_SANDBOX.idFromName(sandboxId).toString() !== request.retainedSandboxObjectId) {
       throw new PermanentRunFailure('retained Sandbox namespace or actor identity changed', 'integrity-failed')
     }
-    // getSandbox() starts asynchronous option RPCs in SDK 0.12.9. Complete
-    // exact successful receipt recovery before even acquiring that stub.
+    // Complete exact successful receipt recovery before touching the sandbox.
     const requestDigest = await sha256(canonicalJson(executionRequestBody(request, this.env.ACK3_CODEX_WORKSPACE_ID)))
     let durableCached: import('./agent-execution-receipt.js').AgentExecutionReceipt | null
     try {
@@ -283,7 +285,7 @@ export class SandboxAgentProvider implements AgentProvider {
       }
       if (terminal !== null) return agentResultFromExecutionReceipt(request, terminal, requestDigest)
       let actorId = ''
-      try { actorId = this.env.Sandbox.idFromName(sandboxId).toString() } catch { /* Missing diagnostic identity stays unknown. */ }
+      try { actorId = this.env.AGENT_SANDBOX.idFromName(sandboxId).toString() } catch { /* Missing diagnostic identity stays unknown. */ }
       const resources = await lookupObservationResourceLoss({ env: this.env, actorId,
         firstFailedAt: health.firstFailedAt ?? health.incidentSince, memoryLimitMiB: containerCapacity.memoryMiB })
       lifecycleLog('observation-resource-assessment', {
@@ -318,18 +320,15 @@ export class SandboxAgentProvider implements AgentProvider {
         throw new AgentExecutionPending(agentProcessId(requestDigest), 'unavailable')
       }
     }
-    const sandbox = getSandbox(this.env.Sandbox, sandboxId, {
+    const sandbox = getAgentSandbox(this.env.AGENT_SANDBOX, sandboxId,
       // Model calls and continuation scratch can outlive Workflow scheduling
       // gaps. Cloudflare stops an idle Sandbox and loses its processes/files;
       // disposal below remains the explicit terminal lifecycle boundary.
-      ...(!retainedClaim || health?.incidentSince === null
-        ? { keepAlive: true, sleepAfter: '30m',
+      !retainedClaim || health?.incidentSince === null
+        ? { keepAlive: true, inactivityTimeoutMs: 30 * 60_000,
           labels: { experiment: request.experimentId, run: request.runId, lane: request.task.workspaceKey } }
-        : {}),
-      enableDefaultSession: false, normalizeId: true, transport: 'rpc',
-    })
-    // getSandbox() applies options asynchronously in SDK 0.12.9. Await the
-    // critical lifetime setting before an admitted agent can start work.
+        : {})
+    // Await the critical lifetime setting before an admitted agent can start work.
     const processId = agentProcessId(requestDigest)
     if (!retainedClaim || health?.incidentSince === null) {
       try {
@@ -433,6 +432,9 @@ export class SandboxAgentProvider implements AgentProvider {
     if ((await this.credential(connection.apiKeyEnv)) === null) {
       throw new PermanentRunFailure(`additive provider credential is missing for ${request.task.id}`, 'missing-credentials')
     }
+    for (const name of modelHeaderCredentialNames(connection)) {
+      if ((await this.credential(name)) === null) throw new PermanentRunFailure(`model header credential ${name} is missing`, 'missing-credentials')
+    }
     if (request.nativeSearchConnection !== undefined) {
       if ((await this.credential(request.nativeSearchConnection.apiKeyEnv)) === null) {
         throw new PermanentRunFailure(`native search credential is missing for ${request.task.id}`, 'missing-credentials')
@@ -449,7 +451,7 @@ export class SandboxAgentProvider implements AgentProvider {
     return values
   }
 
-  private async runInSandbox(sandbox: ISandbox, request: AgentRequest, observationIncident = false,
+  private async runInSandbox(sandbox: SandboxClient, request: AgentRequest, observationIncident = false,
     observationIdentity?: AgentObservationIdentity, observedRequestDigest?: string): Promise<AgentResult> {
     const sandboxId = `a0-${(await sha256(`${request.workspaceAllocationRunId ?? request.runId}:${request.task.workspaceKey}`)).slice(0, 30)}`
     const requestPath = '/workspace/private/agent-request.json'
@@ -528,7 +530,7 @@ export class SandboxAgentProvider implements AgentProvider {
       const targetEnvironment = await this.runtimeEnvironment(request.releaseDigest)
       const nativeDshHttp2 = usesNativeDshHttp2(request.task)
       const credentialEnv = { ...this.env }
-      for (const name of [request.task.connection?.apiKeyEnv, request.nativeSearchConnection?.apiKeyEnv,
+      for (const name of [request.task.connection?.apiKeyEnv, ...modelHeaderCredentialNames(request.task.connection), request.nativeSearchConnection?.apiKeyEnv,
         request.task.credentialSource === undefined ? undefined : subscriptionCredentialSource(request.task)]) {
         if (name !== undefined) {
           const value = await this.credential(name)
@@ -646,7 +648,6 @@ export class SandboxAgentProvider implements AgentProvider {
         const guardedLaunch = `sh -c 'if mkdir ${launchFencePath} 2>/dev/null; then : > ${launchFencePath}/owner; else exit 75; fi; for i in $(seq 1 ${Math.ceil(workflowAttemptTimeoutMs / 1_000)}); do if [ -f ${launchReadyPath} ]; then exec node ${wrapperPath} ${requestPath} ${resultPath}; fi; sleep 1; done; exit 74'`
         process = await sandbox.startProcess(guardedLaunch, {
           processId,
-          autoCleanup: false,
           cwd: '/workspace/source',
           env: processEnvironment,
         })
@@ -855,7 +856,7 @@ export class SandboxAgentProvider implements AgentProvider {
   }
 
   private async captureAgentLogs(
-    sandbox: ISandbox,
+    sandbox: SandboxClient,
     request: AgentRequest,
     requestDigest: string,
     terminal: boolean,
@@ -914,7 +915,7 @@ export class SandboxAgentProvider implements AgentProvider {
     }
   }
 
-  private async drainAgentLogs(sandbox: ISandbox, request: AgentRequest, requestDigest: string): Promise<void> {
+  private async drainAgentLogs(sandbox: SandboxClient, request: AgentRequest, requestDigest: string): Promise<void> {
     const completed = await boundedTerminalLogDrain(async active => {
       for (let slice = 0; slice < agentLogFinalDrainSlices; slice += 1) {
         if (!active()) return
@@ -959,7 +960,7 @@ export class SandboxAgentProvider implements AgentProvider {
   }
 
   private async agentResult(
-    sandbox: ISandbox,
+    sandbox: SandboxClient,
     request: AgentRequest,
     result: import('./agent-execution-receipt.js').AgentExecutionReceipt,
     requestDigest: string,
@@ -1000,10 +1001,10 @@ export class SandboxAgentProvider implements AgentProvider {
     freshSuffix?: string
   }): Promise<WorkspaceDisposalReceipt> {
     const sandboxId = `a0-${(await sha256(`${input.runId}:${input.workspaceKey}${input.freshSuffix ?? ''}`)).slice(0, 30)}`
-    const sandbox = getSandbox(this.env.Sandbox, sandboxId, {
+    const sandbox = getAgentSandbox(this.env.AGENT_SANDBOX, sandboxId, {
       // Terminal workspace ownership disables keep-alive before destroy. If
-      // teardown is delayed, sleepAfter remains a bounded fallback.
-      keepAlive: false, sleepAfter: '30m', enableDefaultSession: false, normalizeId: true, transport: 'rpc',
+      // teardown is delayed, the inactivity timeout remains a bounded fallback.
+      keepAlive: false, inactivityTimeoutMs: 30 * 60_000,
       labels: { run: input.runId, lane: input.workspaceKey },
     })
     lifecycleLog('dispose-requested', {
@@ -1064,7 +1065,7 @@ export class SandboxAgentProvider implements AgentProvider {
   }
 
   private async persistWorkspacePreparationFailure(
-    sandbox: ISandbox, request: AgentRequest, requestDigest: string,
+    sandbox: SandboxClient, request: AgentRequest, requestDigest: string,
   ): Promise<boolean> {
     const path = `/workspace/private/workspace-preparation-failure-${requestDigest}.json`
     const exists = await sandbox.exists(path)
@@ -1115,7 +1116,7 @@ export class SandboxAgentProvider implements AgentProvider {
     return true
   }
 
-  private async prepareSandbox(sandbox: ISandbox, request: AgentRequest, requestDigest?: string): Promise<void> {
+  private async prepareSandbox(sandbox: SandboxClient, request: AgentRequest, requestDigest?: string): Promise<void> {
     const release = await this.runs.getRelease(request.releaseDigest)
     await sandbox.mkdir('/workspace/private', { recursive: true })
     await sandbox.mkdir('/control', { recursive: true })
@@ -1224,7 +1225,7 @@ export class SandboxAgentProvider implements AgentProvider {
     }
   }
 
-  private async preflight(sandbox: ISandbox, request: AgentRequest): Promise<AgentResult> {
+  private async preflight(sandbox: SandboxClient, request: AgentRequest): Promise<AgentResult> {
     const release = await this.runs.getRelease(request.releaseDigest)
     await assertReleaseProviderCredentials(release.body.definition, this.env)
     const targetEnvironment = await this.runtimeEnvironment(request.releaseDigest)

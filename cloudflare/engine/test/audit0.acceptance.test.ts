@@ -8,6 +8,8 @@ import { audit0Definition, audit0PackageBody } from './support/audit0-config.js'
 import { DeterministicAuditProvider } from './support/deterministic-audit-provider.js'
 import { SUBMISSION_PATH } from '../src/submission.js'
 import { renderTaskPrompt } from '../src/prompts.js'
+import { validateAgentResultDetailed } from '../src/protocol-validation.js'
+import { OUTPUT_FILE_MAX_BYTES } from '../src/output-limits.js'
 import { sealFinalFinding } from '../src/protocol-transforms.js'
 import { MemoryArtifactStore, runExperiment } from './support/memory-runner.js'
 import { instruction } from './support/instructions.js'
@@ -49,6 +51,38 @@ describe('Cloudflare audit0 acceptance flow', () => {
     const coverageOnly = '# Review\n\n## Coverage and uncertainty\n\nNo report item is supported.\n'
     expect(sealFinalFinding(coverageOnly, final.protocol.finalCustody!))
       .toContain('No report item is supported.')
+  })
+
+  it('seals a near-limit UTF-8 draft without relaxing other file or custody checks', async () => {
+    const { outcome, store } = await execute('final-seal-size-boundary')
+    const reporter = outcome.state.artifacts.find(value => value.taskId === 'reporter')!
+    const final = outcome.state.artifacts.find(value => value.taskId === 'seal-final')!
+    const tasks = audit0Definition.stages.flatMap(stage => stage.waves.flatMap(wave => wave.tasks))
+    const task = tasks.find(value => value.id === 'seal-final')!
+    const reporterTask = tasks.find(value => value.id === 'reporter')!
+    const reportFiles = JSON.parse(store.contents.get(reporter.uri)!) as Record<string, string>
+    const prefix = reportFiles['finding-draft.md']! + '\né'
+    const draft = prefix + 'x'.repeat(OUTPUT_FILE_MAX_BYTES - 1 - Buffer.byteLength(prefix))
+    expect(Buffer.byteLength(draft)).toBe(3_999_999)
+    const base = (artifact: ArtifactRecord): AgentResult => ({
+      status: 'accepted', actorId: artifact.actorId, model: artifact.model, provider: artifact.provider,
+      inputTokens: 0, outputTokens: 0, costUsd: 0, assertions: [], files: {}, protocol: artifact.protocol,
+    })
+    const reportResult = { ...base(reporter), files: { ...reportFiles, 'finding-draft.md': draft } }
+    expect((await validateAgentResultDetailed(reporterTask, reportResult, outcome.state.artifacts)).issues).toEqual([])
+    const sealed = sealFinalFinding(draft, final.protocol.finalCustody!)
+    expect(Buffer.byteLength(sealed)).toBeGreaterThan(OUTPUT_FILE_MAX_BYTES)
+    const result = { ...base(final), files: { 'finding.md': sealed } }
+    expect((await validateAgentResultDetailed(task, result, outcome.state.artifacts)).issues).toEqual([])
+    const oversized = { ...result, files: { 'finding.md': sealFinalFinding(draft + 'xx', final.protocol.finalCustody!) } }
+    expect((await validateAgentResultDetailed(task, oversized, outcome.state.artifacts)).repairable)
+      .toContain('output file is too large: finding.md')
+    const extraFile = { ...result, files: { ...result.files, 'extra.md': 'x'.repeat(OUTPUT_FILE_MAX_BYTES + 1) } }
+    expect((await validateAgentResultDetailed(task, extraFile, outcome.state.artifacts)).repairable)
+      .toContain('output file is too large: extra.md')
+    const tampered = { ...result, files: { 'finding.md': sealed.replace('ACK3_FINAL_OBSERVATION_CUSTODY_V1', 'INVALID_CUSTODY') } }
+    expect((await validateAgentResultDetailed(task, tampered, outcome.state.artifacts)).integrity)
+      .toContain('finding.md lacks the exact deterministic final observation custody register')
   })
 
   it('preserves one causal defect while retaining its distinct impact paths', async () => {

@@ -196,6 +196,28 @@ describe('frozen research evidence delivery without model calls', () => {
     expect(sandbox.files.get(`/workspace/results/${SUBMISSION_PATH}`)).toBe('current repair baseline')
   })
 
+  it('finishes mounting each artifact before reading the next, including after a partial mount failure', async () => {
+    const peers = await Promise.all([artifact(task('luna', 0, 2), 'first'), artifact(task('west', 0, 2), 'second')])
+    const sandbox = workspace()
+    const input = { task: { ...task('west', 0, 1), promptKind: 'verification' as const }, visibleArtifacts: peers.map(peer => peer.record) }
+    let fail = true
+    const store = { async read(record: ArtifactRecord) {
+      if (record.id === peers[1]!.record.id) {
+        expect(sandbox.files.get(researchEvidencePaths(peers[0]!.record).observations)).toBe(peers[0]!.files[SUBMISSION_PATH])
+        if (fail) throw new Error('interrupted artifact read')
+      }
+      return peers.find(peer => peer.record.id === record.id)!.files
+    } }
+    await expect(writeAccepted(sandbox, input, store)).rejects.toThrow('interrupted artifact read')
+    expect(sandbox.files.has(researchIndexPath)).toBe(false)
+    sandbox.files.set('/workspace/accepted/stale-partial-file', 'partial')
+    fail = false
+    await writeAccepted(sandbox, input, store)
+    expect(sandbox.files.has('/workspace/accepted/stale-partial-file')).toBe(false)
+    for (const peer of peers) expect(sandbox.files.get(researchEvidencePaths(peer.record).observations)).toBe(peer.files[SUBMISSION_PATH])
+    expect(sandbox.files.has(researchIndexPath)).toBe(true)
+  })
+
   it('delivers the actual scheduler fallback for a rotating one-seat pool from its frozen admission', async () => {
     const body = compileExperimentConfig({ ...structuredClone(document), maxDiscoveryWaves: 4,
       limits: { ...document.limits, maxModelCalls: 1000 },

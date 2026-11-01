@@ -13,9 +13,9 @@ function bucket(): R2Bucket {
   const objects = new Map<string, { content: string, checksum: string,
     metadata: Record<string, string> }>()
   return {
-    async put(key: string, value: string, options: R2PutOptions = {}) {
+    async put(key: string, value: string | Uint8Array, options: R2PutOptions = {}) {
       if (options.onlyIf !== undefined && objects.has(key)) return null
-      const content = String(value)
+      const content = typeof value === 'string' ? value : new TextDecoder().decode(value)
       objects.set(key, { content,
         checksum: typeof options.sha256 === 'string' ? options.sha256 : await sha256(content),
         metadata: options.customMetadata ?? {} })
@@ -319,6 +319,15 @@ describe('runtime slot admission and rotation', () => {
     expect(await store.retiredUnmaterializedRoute(proof.runId)).toMatchObject({ proofDigest: digest })
   })
 
+  it('reserves a route and reads run state on a fresh database before any Workflow runs', async () => {
+    const { d1, sqlite } = index()
+    const artifacts = bucket()
+    const store = new CloudflareRunStore(artifacts, artifacts, d1)
+    await store.reserveRunRoute('first-run', 'audit-test', release('11111111-1111-4111-8111-111111111111'))
+    expect(await store.getStateIfPresent('first-run')).toBeNull()
+    expect(sqlite.prepare('SELECT run_id FROM run_runtime_routes').all()).toEqual([{ run_id: 'first-run' }])
+  })
+
   it('preserves a no-state route with an exact private native-absence proof', async () => {
     const { d1, sqlite } = index()
     const artifacts = bucket()
@@ -588,6 +597,37 @@ describe('runtime slot admission and rotation', () => {
       .get(state.runId)).toEqual({ state_key: row.state_key, state_generation: state.stateGeneration })
     expect(sqlite.prepare('SELECT released_at, terminal_workflow_status FROM runtime_slot_run_leases WHERE run_id = ?')
       .get(state.runId)).toMatchObject({ released_at: expect.any(String), terminal_workflow_status: 'terminated' })
+  })
+
+  it.each([false, true])('retires static-catalog stopped custody without a slot row (direct=%s)', async directStop => {
+    const f = await stoppedRunFixture({ staticAdmission: true, directStop })
+    const { store, sqlite, proof, state, workflow, liveRun, beforeArchiveInsert, beforeLeaseUpdate } = f
+    const archive = () => store.archiveStoppedRunAndReleaseLease(proof)
+    sqlite.prepare('UPDATE runtime_slot_control SET enabled = 1').run()
+    await expect(archive()).rejects.toThrow('route, lease, state, checkpoint, or slot changed')
+    sqlite.prepare('UPDATE runtime_slot_control SET enabled = 0').run()
+    sqlite.prepare('UPDATE runtime_slot_run_leases SET admission_pool_enabled = 1').run()
+    await expect(archive()).rejects.toThrow('route, lease, state, checkpoint, or slot changed')
+    sqlite.prepare('UPDATE runtime_slot_run_leases SET admission_pool_enabled = 0').run()
+    sqlite.prepare(`INSERT INTO runtime_slots (slot_id, runtime_release_json, generation, deployed_at)
+      VALUES (?, ?, 1, ?)`).run(proof.runtimeRelease.id, canonicalJson(release('33333333-3333-4333-8333-333333333333')), proof.observedAt)
+    await expect(archive()).rejects.toThrow('route, lease, state, checkpoint, or slot changed')
+    sqlite.prepare('DELETE FROM runtime_slots').run()
+    beforeArchiveInsert(() => { sqlite.prepare('UPDATE runtime_slot_control SET enabled = 1').run() })
+    await expect(archive()).rejects.toThrow('archive differs')
+    beforeArchiveInsert(null)
+    sqlite.prepare('UPDATE runtime_slot_control SET enabled = 0').run()
+    beforeLeaseUpdate(() => { sqlite.prepare('UPDATE runtime_slot_control SET enabled = 1').run() })
+    await expect(archive()).rejects.toThrow('lease was not released')
+    beforeLeaseUpdate(null)
+    expect(sqlite.prepare('SELECT released_at FROM runtime_slot_run_leases').get()).toMatchObject({ released_at: null })
+    sqlite.prepare('UPDATE runtime_slot_control SET enabled = 0').run()
+    await expect(retireStoppedRun({ runId: proof.runId, proof, now: Date.parse(proof.observedAt) + 600_000,
+      store, liveRun })).resolves.toMatchObject({ retired: true })
+    expect(sqlite.prepare('SELECT released_at, terminal_workflow_status FROM runtime_slot_run_leases').get())
+      .toMatchObject({ released_at: expect.any(String), terminal_workflow_status: workflow.status })
+    expect(await store.getState(state.runId)).toEqual(state)
+    expect(sqlite.prepare('SELECT COUNT(*) AS n FROM runtime_slots').get()).toEqual({ n: 0 })
   })
 
   it.each([false, true])('retires exact failed custody with zero work (static=%s)', async staticAdmission => {

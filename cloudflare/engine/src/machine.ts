@@ -1,3 +1,7 @@
+import { prepareSealedWaveRetry } from './sealed-wave-retry.js'
+import { assertQuarantinedOutputSource } from './quarantined-output-repair.js'
+import { validSubscriptionWaits } from '../container/subscription-limits.mjs'
+import { discoveryDeadline } from './discovery-clock.js'
 import { validNativeSearchEvidence } from './agent-execution-receipt.js'
 import type {
   AgentResult,
@@ -12,6 +16,7 @@ import type {
   InFlightAgentAttempt,
   JournalEvent,
   PromotedExecutionEvidence,
+  ProviderUsage,
   RejectedAttempt,
   RunCursor,
   RunPhase,
@@ -35,6 +40,8 @@ import { normalizeCursor, validateExperiment } from './validation.js'
 import { normalizedCostUsd, remainingRecordedCostUsd, sealedWaveRecordedCostUsd } from './discovery-cost.js'
 import { configuredResearchTaskPoolId } from './research-scheduler.js'
 import { RunFailure } from './run-errors.js'
+import { assertDiscoveryWaiverFrontier, prepareDiscoveryPoolWaiver, waivedAttempt, type DiscoveryPoolWaiver } from './discovery-pool-waiver.js'
+import type { StoppedRunRetirementProof } from './stopped-run-retirement.js'
 
 const zeroBudget = (): BudgetUsage => ({ modelCalls: 0, inputTokens: 0, outputTokens: 0, costUsd: 0 })
 
@@ -129,6 +136,51 @@ export function exhaustedFailedWaveTask(
     && exhausted.freshContext === true
 }
 
+/** Retry only the missing task; a mismatched receipt never becomes accepted work. */
+export function terminalReceiptMismatchTask(
+  source: RunState,
+  task: TaskDefinition,
+  rejections: readonly RejectedAttempt[],
+): boolean {
+  const diagnostic = 'agent result receipt does not match the exact request'
+  const rejection = rejections[0]
+  if (source.status !== 'failed' || source.parentRunId !== null || source.recoveryEpoch !== 0
+    || source.failedWaveRecovery !== undefined || (source.inFlightAgentAttempts ?? []).length !== 0
+    || task.providerClass !== 'core' || task.retryPolicy !== 'redirect-then-fresh-replacement'
+    || source.terminalReason !== `${task.id}: ${diagnostic}`
+    || rejections.length !== 1 || rejection === undefined || rejection.attempt !== 1
+    || rejection.taskId !== task.id || rejection.repairScopeRunId !== source.runId
+    || rejection.outputDigest !== null || rejection.quarantineUri !== null || rejection.sessionId !== null
+    || rejection.continuationMode !== 'new' || rejection.freshContext !== false
+    || rejection.includeDiagnosticsInRepair === true || rejection.formatRepairOrdinal !== undefined
+    || rejection.formatRepairSourceDigest !== undefined || rejection.operatorWaiver !== undefined
+    || rejection.nativeTransport !== undefined || rejection.nativeTerminalCustody !== undefined
+    || rejection.nativeSearchEvidence !== undefined
+    || canonicalJson(rejection.diagnostics) !== canonicalJson([diagnostic])
+    || canonicalJson(rejection.usage) !== canonicalJson(zeroBudget())) return false
+  const accepted = new Set(source.artifacts.map(record => record.taskId))
+  const missing = source.discoveryScheduler?.admissions.flatMap(admission => admission.taskIds
+    .filter(taskId => !accepted.has(taskId)).map(taskId => ({ admission, taskId }))) ?? []
+  if (missing.length !== 1 || missing[0]?.taskId !== task.id
+    || missing[0].admission.stageId !== rejection.stageId
+    || missing[0].admission.waveId !== rejection.waveId) return false
+  const failures = source.journal.filter(event => event.type === 'task.failed'
+    && (event.payload as { taskId?: unknown } | null)?.taskId === task.id)
+  const failure = failures[0]
+  const rejected = source.journal.filter(event => event.type === 'task.attempt-rejected'
+    && (event.payload as { taskId?: unknown } | null)?.taskId === task.id)
+  const recorded = rejected[0]
+  return failures.length === 1 && failure !== undefined
+    && canonicalJson(failure.payload) === canonicalJson({
+      taskId: task.id, error: source.terminalReason, category: 'integrity-failed', retryable: false,
+    })
+    && rejected.length === 1 && recorded !== undefined
+    && recorded.at === rejection.rejectedAt
+    && canonicalJson(recorded.payload) === canonicalJson(rejection)
+    && recorded.sequence < failure.sequence
+    && Date.parse(failure.at) >= Date.parse(recorded.at)
+}
+
 export function skippedResumeSlotFailureRecorded(source: RunState, taskId: string): boolean {
   return source.failedWaveRecovery === undefined && source.journal.some(event => (
     event.type === 'task.failed'
@@ -217,6 +269,31 @@ function addBudget(left: BudgetUsage, right: BudgetUsage): BudgetUsage {
   }
 }
 
+// RunState is JSON data. Copy its containers without re-allocating every
+// immutable string (structuredClone duplicates large protocol strings).
+function copyState<T>(value: T, copies = new Map<object, unknown>()): T {
+  if (value === null || typeof value !== 'object') return value
+  if (copies.has(value)) return copies.get(value) as T
+  if (!Array.isArray(value) && Object.getPrototypeOf(value) !== Object.prototype
+    && Object.getPrototypeOf(value) !== null) return deepClone(value)
+  const copy: Record<string, unknown> | unknown[] = Array.isArray(value) ? new Array(value.length) : {}
+  copies.set(value, copy)
+  for (const [key, entry] of Object.entries(value)) {
+    Object.defineProperty(copy, key, { value: copyState(entry, copies), enumerable: true, writable: true, configurable: true })
+  }
+  return copy as T
+}
+
+// Track only objects recursively frozen here: an externally shallow-frozen
+// object must not allow a mutable child to escape through a state view.
+const frozenStateObjects = new WeakSet<object>()
+function freezeState(value: unknown): void {
+  if (value === null || typeof value !== 'object' || frozenStateObjects.has(value)) return
+  frozenStateObjects.add(value)
+  for (const child of Object.values(value)) freezeState(child)
+  Object.freeze(value)
+}
+
 async function appendEvent(state: RunState, type: string, payload: unknown, at: string): Promise<RunState> {
   const previous = state.journal.at(-1)?.digest ?? null
   const eventWithoutDigest = {
@@ -290,17 +367,52 @@ function assertFailedWaveRecoveryEvidence(value: FailedWaveRecoveryEvidence): vo
     || !/^[0-9a-f]{64}$/.test(value.sourceStateDigest)
     || !/^[0-9a-f]{64}$/.test(value.checkpointDigest)
     || !Array.isArray(value.importedTaskIds)
-    || value.importedTaskIds.length === 0
+    || (value.importedTaskIds.length === 0 && value.quarantinedRepair === undefined && value.sealedWaveRetry === undefined)
     || value.importedTaskIds.some(taskId => typeof taskId !== 'string' || taskId.trim() === '')
     || new Set(value.importedTaskIds).size !== value.importedTaskIds.length
     || !Number.isSafeInteger(value.inheritedRejectedAttemptCount) || value.inheritedRejectedAttemptCount < 0
     || !Number.isSafeInteger(value.unknownUsageAttemptCount) || value.unknownUsageAttemptCount < 0
+    || (value.priorUnknownUsageAttemptCount !== undefined
+      && ((value.quarantinedRepair === undefined && value.sealedWaveRetry === undefined) || !Number.isSafeInteger(value.priorUnknownUsageAttemptCount)
+        || value.priorUnknownUsageAttemptCount < 0))
     || value.unknownUsageAttemptCount > value.inheritedRejectedAttemptCount
+      + (value.priorUnknownUsageAttemptCount ?? 0)
       + (value.unobservableNative === undefined ? 0 : 1)) {
     throw new Error('failed-wave recovery evidence is invalid')
   }
   assertRuntimeRelease(value.sourceRuntimeRelease, 'failed-wave source runtime release')
   assertRuntimeRelease(value.targetRuntimeRelease, 'failed-wave target runtime release')
+  const retry = value.sealedWaveRetry
+  if (retry !== undefined && (value.importedTaskIds.length !== 0 || value.quarantinedRepair !== undefined
+    || value.promotedExecution !== undefined || value.retainedNative !== undefined || value.unobservableNative !== undefined
+    || ![retry.stageId, retry.waveId, retry.taskId].every(part => typeof part === 'string' && part.trim() !== '')
+    || !/^[0-9a-f]{64}$/.test(retry.retirementProofDigest)
+    || value.priorUnknownUsageAttemptCount === undefined
+    || value.sourceRuntimeRelease.containerImageDigest !== value.targetRuntimeRelease.containerImageDigest
+    || (retry.imageAuthorization !== undefined && (
+      !/^sha256:[0-9a-f]{64}$/.test(retry.imageAuthorization.originalImageDigest)
+      || retry.imageAuthorization.originalImageDigest === retry.imageAuthorization.authorizedImageDigest
+      || retry.imageAuthorization.authorizedImageDigest !== value.sourceRuntimeRelease.containerImageDigest
+      || !/^[0-9a-f]{64}$/.test(retry.imageAuthorization.sourceRecoveryDigest))))) {
+    throw new Error('sealed terminal-wave retry evidence is invalid')
+  }
+  const repair = value.quarantinedRepair
+  if (repair !== undefined && (value.promotedExecution !== undefined || value.retainedNative !== undefined
+    || value.unobservableNative !== undefined
+    || (repair.kind !== undefined && repair.kind !== 'negative-review')
+    || (repair.kind === undefined
+      ? value.importedTaskIds.length !== 0 || value.inheritedRejectedAttemptCount !== 1
+        || value.unknownUsageAttemptCount !== value.priorUnknownUsageAttemptCount
+      : value.importedTaskIds.length !== 1 || value.inheritedRejectedAttemptCount < 3
+        || value.unknownUsageAttemptCount !== (value.priorUnknownUsageAttemptCount ?? 0) + 2)
+    || ![repair.stageId, repair.waveId, repair.taskId, repair.quarantineUri]
+      .every(item => typeof item === 'string' && item.trim() !== '')
+    || repair.sourceAttempt !== 1
+    || ![repair.requestDigest, repair.promptDigest, repair.outputDigest].every(item => /^[0-9a-f]{64}$/.test(item))
+    || !Array.isArray(repair.diagnostics) || repair.diagnostics.length === 0
+    || repair.diagnostics.some(item => typeof item !== 'string' || item.trim() === ''))) {
+    throw new Error('quarantined synthesis repair evidence is invalid')
+  }
   const promoted = value.promotedExecution
   if (promoted !== undefined) assertPromotedExecutionEvidence(promoted, value.sourceRunId)
   const retained = value.retainedNative
@@ -420,7 +532,8 @@ function assertRecoverableDiscoveryBudget(
   assertWithinBudget(definition, budgetBeforeFinalWave)
 }
 
-function assertBudgetShape(budget: BudgetUsage): void {
+function assertBudgetShape(budget: BudgetUsage & { subscriptionWaits?: ProviderUsage['subscriptionWaits'] }): void {
+  if (!validSubscriptionWaits(budget.subscriptionWaits)) throw new Error('checkpoint subscription waits are invalid')
   if (!Number.isSafeInteger(budget.modelCalls) || budget.modelCalls < 0
     || !Number.isSafeInteger(budget.inputTokens) || budget.inputTokens < 0
     || !Number.isSafeInteger(budget.outputTokens) || budget.outputTokens < 0
@@ -506,6 +619,7 @@ export function assertDiscoveryCohortRecordsComplete(
 
 async function assertCheckpointFrontier(definition: ExperimentDefinition, checkpoint: SealedCheckpoint): Promise<void> {
   const body = checkpoint.body
+  await assertDiscoveryWaiverFrontier(definition, body)
   if (body.runtimeRelease !== undefined) assertRuntimeRelease(body.runtimeRelease, 'checkpoint runtime release')
   await assertInheritedRuntimeTransition(body)
   assertPromotedExecutionProofs(body.promotedExecutionProofs)
@@ -954,7 +1068,7 @@ async function assertCheckpointFrontier(definition: ExperimentDefinition, checkp
   } else if (receipt?.reason === 'phase-deadline' || receipt?.reason === 'insufficient-time-for-full-wave') {
     if (body.discoveryScheduler !== undefined) {
       const evidence = receipt.evidence as { discoveryDeadline?: unknown, materialEpoch?: unknown }
-      const expectedDeadline = Date.parse(body.modelStartedAt!) + definition.limits.phaseMinutes.discovery * 60_000
+      const expectedDeadline = discoveryDeadline(definition, { ...body, artifacts: body.acceptedArtifacts })
       if (receipt.reason !== 'phase-deadline' || evidence.discoveryDeadline !== expectedDeadline
         || evidence.materialEpoch !== body.discoveryScheduler.materialEpoch
         || Date.parse(receipt.endedAt) < expectedDeadline) {
@@ -1131,6 +1245,8 @@ async function assertCheckpointFrontier(definition: ExperimentDefinition, checkp
       throw new Error('safety ceiling receipt does not bind the complete configured discovery frontier')
     }
     }
+  } else if (receipt?.reason === 'operator-discovery-pool-waiver') {
+    await assertDiscoveryWaiverFrontier(definition, body)
   } else if (receipt !== undefined && !['stage-complete', 'preflight-passed'].includes(receipt.reason)) {
     throw new Error('checkpoint stage-end receipt is invalid')
   }
@@ -1142,7 +1258,7 @@ export class RunMachine {
 
   private constructor(definition: ExperimentDefinition, state: RunState) {
     this.definition = deepClone(definition)
-    this.current = deepClone(state)
+    this.current = copyState(state)
   }
 
   static async create(
@@ -1198,6 +1314,7 @@ export class RunMachine {
 
   static async fromState(definition: ExperimentDefinition, state: RunState): Promise<RunMachine> {
     validateExperiment(definition)
+    await assertDiscoveryWaiverFrontier(definition, { ...state, acceptedArtifacts: state.artifacts })
     if (!Number.isSafeInteger(state.stateGeneration) || state.stateGeneration < 1) throw new Error('run state generation is invalid')
     if (state.definitionDigest !== await sha256(definition)) throw new Error('run definition mismatch')
     if (state.runtimeRelease !== undefined) assertRuntimeRelease(state.runtimeRelease, 'run runtime release')
@@ -1477,6 +1594,22 @@ export class RunMachine {
       throw new Error('failed-wave recovery source identity is invalid')
     }
     await assertCheckpointFrontier(definition, checkpoint)
+    if (evidence.sealedWaveRetry !== undefined) {
+      const expected = await prepareSealedWaveRetry({ definition, source, checkpoint,
+        targetRuntimeRelease: evidence.targetRuntimeRelease,
+        retirementProofDigest: evidence.sealedWaveRetry.retirementProofDigest })
+      const unknown = inheritedRejectedAttempts.filter(rejection => rejection.repairScopeRunId === source.runId
+        && rejection.outputDigest === null && rejection.usage.inputTokens === 0
+        && rejection.usage.outputTokens === 0 && rejection.usage.costUsd === 0).length
+      if (independentDiscovery || canonicalJson(expected) !== canonicalJson(evidence.sealedWaveRetry)
+        || evidence.priorUnknownUsageAttemptCount !== (source.failedWaveRecovery?.unknownUsageAttemptCount ?? 0)
+        || evidence.unknownUsageAttemptCount !== evidence.priorUnknownUsageAttemptCount + unknown) {
+        throw new Error('sealed terminal-wave retry differs from its source')
+      }
+    }
+    if (independentDiscovery && evidence.quarantinedRepair !== undefined) {
+      throw new Error('quarantined synthesis repair cannot recover discovery')
+    }
     if (independentDiscovery) {
       const scheduler = source.discoveryScheduler!
       const stage = definition.stages.find(candidate => candidate.id === scheduler.stageId)
@@ -1496,7 +1629,8 @@ export class RunMachine {
           task, rejections,
           evidence.promotedExecution?.taskId === taskId ? evidence.promotedExecution.sourceAttempt : undefined,
           skippedResumeSlotFailureRecorded(source, taskId),
-        ))
+        ) && !(evidence.promotedExecution === undefined && evidence.unobservableNative === undefined
+          && terminalReceiptMismatchTask(source, task, rejections)))
       })) {
         throw new Error('failed discovery recovery has an ineligible missing task')
       }
@@ -1505,7 +1639,7 @@ export class RunMachine {
       const checkpointRejections = new Set(checkpoint.body.rejectedAttempts.map(value => canonicalJson(value)))
       const sourceRejections = source.rejectedAttempts.filter(value => !checkpointRejections.has(canonicalJson(value)))
       const scopedRejections = sourceRejections.map(rejection => ({
-        ...deepClone(rejection), repairScopeRunId: rejection.repairScopeRunId ?? source.runId,
+        ...copyState(rejection), repairScopeRunId: rejection.repairScopeRunId ?? source.runId,
       }))
       if (canonicalJson(sourceImports) !== canonicalJson(importedArtifacts)
         || canonicalJson(evidence.importedTaskIds) !== canonicalJson(importedArtifacts.map(value => value.taskId).toSorted())
@@ -1540,21 +1674,21 @@ export class RunMachine {
         recoveryEpoch: source.recoveryEpoch + 1,
         parentRunId: source.runId,
         parentCheckpointDigest: checkpoint.digest,
-        failedWaveRecovery: deepClone(evidence),
+        failedWaveRecovery: copyState(evidence),
         ...(promotedExecutionProofs.length === 0 ? {} : { promotedExecutionProofs }),
         releaseDigest: source.releaseDigest,
-        runtimeRelease: deepClone(evidence.targetRuntimeRelease),
+        runtimeRelease: copyState(evidence.targetRuntimeRelease),
         definitionDigest: source.definitionDigest,
         status: 'created',
-        cursor: deepClone(source.cursor),
-        artifacts: deepClone(source.artifacts),
-        rejectedAttempts: [...deepClone(checkpoint.body.rejectedAttempts), ...deepClone(scopedRejections)],
-        stageEndReceipts: deepClone(source.stageEndReceipts),
-        waveReceipts: deepClone(source.waveReceipts),
-        discoveryScheduler: deepClone(source.discoveryScheduler!),
+        cursor: copyState(source.cursor),
+        artifacts: copyState(source.artifacts),
+        rejectedAttempts: [...copyState(checkpoint.body.rejectedAttempts), ...copyState(scopedRejections)],
+        stageEndReceipts: copyState(source.stageEndReceipts),
+        waveReceipts: copyState(source.waveReceipts),
+        discoveryScheduler: copyState(source.discoveryScheduler!),
         waveAdmission: null,
         inFlightAgentAttempts: [],
-        availabilityBoundaries: deepClone(source.availabilityBoundaries),
+        availabilityBoundaries: copyState(source.availabilityBoundaries),
         checkpoints: [],
         budget,
         journal: [],
@@ -1570,6 +1704,20 @@ export class RunMachine {
     if (stage === undefined || wave === undefined
       || source.waveAdmission!.stageId !== stage.id || source.waveAdmission!.waveId !== wave.id) {
       throw new Error('failed-wave recovery source cursor is invalid')
+    }
+    if (evidence.quarantinedRepair !== undefined) {
+      const repair = evidence.quarantinedRepair
+      const { rejection } = assertQuarantinedOutputSource(definition, source, repair)
+      if ((repair.kind === 'negative-review') !== (stage.kind === 'negative-review')
+        || (repair.kind === 'negative-review' && evidence.sourceRuntimeRelease.containerImageDigest
+          === evidence.targetRuntimeRelease.containerImageDigest)) {
+        throw new Error('quarantined repair kind or image transition differs')
+      }
+      if (evidence.priorUnknownUsageAttemptCount !== (source.failedWaveRecovery?.unknownUsageAttemptCount ?? 0)
+        || repair.stageId !== stage.id || repair.waveId !== wave.id
+        || repair.promptDigest !== rejection.promptDigest || repair.quarantineUri !== rejection.quarantineUri) {
+        throw new Error('quarantined synthesis repair differs from its source')
+      }
     }
     const retained = evidence.retainedNative
     if (retained !== undefined) {
@@ -1610,14 +1758,14 @@ export class RunMachine {
     }
     const sourceRejections = source.rejectedAttempts.filter(inCurrentWave)
     const scopedRejections = sourceRejections.map(rejection => ({
-      ...deepClone(rejection), repairScopeRunId: rejection.repairScopeRunId ?? source.runId,
+      ...copyState(rejection), repairScopeRunId: rejection.repairScopeRunId ?? source.runId,
     }))
     if (canonicalJson(scopedRejections) !== canonicalJson(inheritedRejectedAttempts)
       || inheritedRejectedAttempts.length !== evidence.inheritedRejectedAttemptCount) {
       throw new Error('failed-wave recovery rejected-attempt set is invalid')
     }
-    const artifacts = [...deepClone(checkpoint.body.acceptedArtifacts), ...deepClone(importedArtifacts)]
-    const rejectedAttempts = [...deepClone(checkpoint.body.rejectedAttempts), ...deepClone(inheritedRejectedAttempts)]
+    const artifacts = [...copyState(checkpoint.body.acceptedArtifacts), ...copyState(importedArtifacts)]
+    const rejectedAttempts = [...copyState(checkpoint.body.rejectedAttempts), ...copyState(inheritedRejectedAttempts)]
     const budget = [
       ...artifacts.map(artifact => artifact.usage),
       ...rejectedAttempts.map(rejection => rejection.usage),
@@ -1640,22 +1788,22 @@ export class RunMachine {
       recoveryEpoch: checkpoint.body.recoveryEpoch + 1,
       parentRunId: source.runId,
       parentCheckpointDigest: checkpoint.digest,
-      failedWaveRecovery: deepClone(evidence),
+      failedWaveRecovery: copyState(evidence),
       ...(promotedExecutionProofs.length === 0 ? {} : { promotedExecutionProofs }),
       releaseDigest: checkpoint.body.releaseDigest,
-      runtimeRelease: deepClone(evidence.targetRuntimeRelease),
+      runtimeRelease: copyState(evidence.targetRuntimeRelease),
       definitionDigest: checkpoint.body.definitionDigest,
       status: 'created',
-      cursor: deepClone(checkpoint.body.cursor),
+      cursor: copyState(checkpoint.body.cursor),
       artifacts,
       rejectedAttempts,
-      stageEndReceipts: deepClone(checkpoint.body.stageEndReceipts),
-      waveReceipts: deepClone(checkpoint.body.waveReceipts),
+      stageEndReceipts: copyState(checkpoint.body.stageEndReceipts),
+      waveReceipts: copyState(checkpoint.body.waveReceipts),
       ...(checkpoint.body.discoveryScheduler === undefined
-        ? {} : { discoveryScheduler: deepClone(checkpoint.body.discoveryScheduler) }),
+        ? {} : { discoveryScheduler: copyState(checkpoint.body.discoveryScheduler) }),
       waveAdmission: null,
       inFlightAgentAttempts: [],
-      availabilityBoundaries: deepClone(checkpoint.body.availabilityBoundaries),
+      availabilityBoundaries: copyState(checkpoint.body.availabilityBoundaries),
       checkpoints: [],
       budget,
       journal: [],
@@ -1732,8 +1880,44 @@ export class RunMachine {
     return new RunMachine(definition, state)
   }
 
+  /** Post-deadline operator waiver, after all other work drains and the source is fenced. */
+  static async recoverDiscoveryPoolWaiver(
+    definition: ExperimentDefinition, checkpoint: SealedCheckpoint, source: RunState,
+    evidence: DiscoveryPoolWaiver, fence: StoppedRunRetirementProof,
+  ): Promise<RunMachine> {
+    await RunMachine.fromState(definition, source)
+    await assertCheckpointFrontier(definition, checkpoint)
+    const prepared = await prepareDiscoveryPoolWaiver({ definition, source, checkpoint, fence,
+      childRunId: evidence.childRunId, sourceStateGeneration: evidence.sourceStateGeneration,
+      sourceStateDigest: evidence.sourceStateDigest, targetRuntimeRelease: evidence.targetRuntimeRelease,
+      poolId: evidence.poolId, requestDigest: evidence.requestDigest, logCustodyDigest: evidence.logCustodyDigest, quotaWait: evidence.quotaWait })
+    if (canonicalJson(prepared) !== canonicalJson(evidence)) throw new Error('discovery waiver evidence differs')
+    const now = evidence.decidedAt
+    let state: RunState = { ...deepClone(source), runId: evidence.childRunId,
+      runtimeRelease: deepClone(evidence.targetRuntimeRelease), parentRunId: source.runId,
+      parentCheckpointDigest: checkpoint.digest, recoveryEpoch: source.recoveryEpoch + 1,
+      status: 'running', phase: 'discovery', terminalReason: null,
+      checkpoints: [], journal: [], createdAt: now, updatedAt: now }
+    state = await appendEvent(state, 'run.discovery-pool-waived', evidence, now)
+    const machine = new RunMachine(definition, state)
+    await machine.recordRejectedAttempt(waivedAttempt(evidence), now)
+    machine.current = await appendEvent({ ...machine.current, inFlightAgentAttempts: [],
+      discoveryScheduler: { ...machine.current.discoveryScheduler!, admissions: [] } },
+    'discovery.admission-waived', { poolId: evidence.poolId, taskId: evidence.admission.taskId,
+      fenceProofDigest: evidence.fenceProofDigest }, now)
+    const sealed = await machine.endStage('operator-discovery-pool-waiver', evidence, source.cursor.stageIndex, now)
+    await assertCheckpointFrontier(definition, sealed)
+    return machine
+  }
+
+  /** Internal read-only view. State transitions replace branches; never mutate this view. */
+  view(): RunState {
+    freezeState(this.current)
+    return this.current
+  }
+
   snapshot(): RunState {
-    return deepClone(this.current)
+    return copyState(this.current)
   }
 
   async start(now = new Date().toISOString()): Promise<void> {
@@ -1873,6 +2057,7 @@ export class RunMachine {
     const usage = {
       modelCalls: input.result.modelCalls ?? (input.task.providerClass === 'deterministic' ? 0 : 1),
       inputTokens: input.result.inputTokens,
+      ...(input.result.subscriptionWaits === undefined ? {} : { subscriptionWaits: input.result.subscriptionWaits }),
       ...(input.result.rawInputTokens === undefined ? {} : { rawInputTokens: input.result.rawInputTokens }),
       ...(input.result.cachedInputTokens === undefined ? {} : { cachedInputTokens: input.result.cachedInputTokens }),
       ...(input.result.cacheAccountingComplete === undefined
@@ -2192,7 +2377,7 @@ export class RunMachine {
     if (this.current.cursor.stageIndex > next.stageIndex) throw new Error('cannot end an earlier stage after later work started')
     const permitted = ['preflight-passed', 'stage-complete', 'two-distinct-complete-saturation-cohorts',
       'phase-deadline', 'insufficient-time-for-full-wave', 'measured-budget-inability', 'safety-ceiling-reached',
-      'completion-contract-passed']
+      'completion-contract-passed', 'operator-discovery-pool-waiver']
     if (!permitted.includes(reason)) {
       throw new TypeError('stage end reason is invalid')
     }
@@ -2245,24 +2430,24 @@ export class RunMachine {
       recoveryEpoch: this.current.recoveryEpoch,
       parentCheckpointDigest: this.current.parentCheckpointDigest,
       ...(this.current.failedWaveRecovery === undefined
-        ? {} : { failedWaveRecovery: deepClone(this.current.failedWaveRecovery) }),
+        ? {} : { failedWaveRecovery: copyState(this.current.failedWaveRecovery) }),
       ...(this.current.promotedExecutionProofs === undefined
-        ? {} : { promotedExecutionProofs: deepClone(this.current.promotedExecutionProofs) }),
+        ? {} : { promotedExecutionProofs: copyState(this.current.promotedExecutionProofs) }),
       ...(this.current.terminalCompletionRecovery === undefined
-        ? {} : { terminalCompletionRecovery: deepClone(this.current.terminalCompletionRecovery) }),
+        ? {} : { terminalCompletionRecovery: copyState(this.current.terminalCompletionRecovery) }),
       releaseDigest: this.current.releaseDigest,
-      ...(this.current.runtimeRelease === undefined ? {} : { runtimeRelease: deepClone(this.current.runtimeRelease) }),
-      ...(this.current.runtimeTransition === undefined ? {} : { runtimeTransition: deepClone(this.current.runtimeTransition) }),
+      ...(this.current.runtimeRelease === undefined ? {} : { runtimeRelease: copyState(this.current.runtimeRelease) }),
+      ...(this.current.runtimeTransition === undefined ? {} : { runtimeTransition: copyState(this.current.runtimeTransition) }),
       definitionDigest: this.current.definitionDigest,
-      cursor: deepClone(this.current.cursor),
-      acceptedArtifacts: deepClone(this.current.artifacts),
-      rejectedAttempts: deepClone(this.current.rejectedAttempts),
-      stageEndReceipts: deepClone(this.current.stageEndReceipts),
-      waveReceipts: deepClone(this.current.waveReceipts),
+      cursor: copyState(this.current.cursor),
+      acceptedArtifacts: copyState(this.current.artifacts),
+      rejectedAttempts: copyState(this.current.rejectedAttempts),
+      stageEndReceipts: copyState(this.current.stageEndReceipts),
+      waveReceipts: copyState(this.current.waveReceipts),
       ...(this.current.discoveryScheduler === undefined
-        ? {} : { discoveryScheduler: deepClone(this.current.discoveryScheduler) }),
-      availabilityBoundaries: deepClone(this.current.availabilityBoundaries),
-      budget: deepClone(this.current.budget),
+        ? {} : { discoveryScheduler: copyState(this.current.discoveryScheduler) }),
+      availabilityBoundaries: copyState(this.current.availabilityBoundaries),
+      budget: copyState(this.current.budget),
       journalHead,
       sealedAt: now,
     }
@@ -2271,7 +2456,7 @@ export class RunMachine {
       ...this.current,
       checkpoints: [...this.current.checkpoints, checkpoint],
     }, 'checkpoint.sealed', { digest: checkpoint.digest, cursor: checkpoint.body.cursor }, now)
-    return deepClone(checkpoint)
+    return copyState(checkpoint)
   }
 
   async complete(now = new Date().toISOString()): Promise<void> {

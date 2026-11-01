@@ -1,8 +1,11 @@
+import { providerIdentity } from './provider-identity.js'
+import { prepareDiscoveryPoolWaiver, type DiscoveryPoolWaiver } from './discovery-pool-waiver.js'
 import type {
   ArtifactRecord, ArtifactStore, ReleasePackage, ReleasePackageBody, RetainedNativeRecoveryEvidence,
   RunState, RuntimeRelease, SealedCheckpoint, UnobservableNativeRecoveryEvidence,
 } from './contracts.js'
 import { canonicalJson, sha256 } from './canonical.js'
+import { canonicalJsonBytes } from './canonical-bytes.js'
 import { sealReleasePackage } from './release.js'
 import { validateNewSearchAdmission } from './validation.js'
 import { assertRuntimeRelease, sameRuntimeRelease } from './runtime-release.js'
@@ -161,8 +164,7 @@ export class CloudflareRunStore {
       await this.ensureRoutingSchema()
       await this.bindRunRoute(state.runId, state.experimentId, state.runtimeRelease)
     }
-    const content = canonicalJson(state)
-    const objectSha256 = await sha256(content)
+    const { bytes: content, digest: objectSha256 } = canonicalJsonBytes(state)
     // R2 can commit before the D1 pointer update. A Workflow retry may then
     // reconstruct a different valid branch at the same generation. Bind the
     // immutable object key to its bytes so that orphaned writes cannot block
@@ -218,6 +220,7 @@ export class CloudflareRunStore {
   }
 
   async getStateIfPresent(runId: string): Promise<RunState | null> {
+    await this.ensureRoutingSchema()
     const pointer = await this.index.prepare('SELECT state_key, state_generation FROM experiment_runs WHERE run_id = ?1')
       .bind(runId).first<{ state_key: string, state_generation: number }>()
     if (pointer === null) return null
@@ -290,8 +293,7 @@ export class CloudflareRunStore {
   }
 
   async putCheckpoint(checkpoint: SealedCheckpoint): Promise<void> {
-    const content = canonicalJson(checkpoint)
-    const objectSha256 = await sha256(content)
+    const { bytes: content, digest: objectSha256 } = canonicalJsonBytes(checkpoint)
     await this.artifacts.put(checkpointKey(checkpoint.digest), content, {
       httpMetadata: { contentType: 'application/json' },
       customMetadata: { bodySha256: checkpoint.digest, objectSha256, run: checkpoint.body.runId },
@@ -860,6 +862,70 @@ export class CloudflareRunStore {
     return { workflow, disposition: row.disposition as 'terminal' | 'retired-fenced',
       fenceProofDigest: row.fence_proof_digest, cleanupProofDigest: row.cleanup_proof_digest,
       retiredAt: row.retired_at }
+  }
+
+  /** Read only: require an archived native-zero source and rehash all accepted bytes. */
+  async prepareDiscoveryWaiver(input: {
+    sourceRunId: string, childRunId: string, sourceStateGeneration: number, sourceStateDigest: string,
+    checkpointDigest: string, targetRuntimeRelease: RuntimeRelease, poolId: string, requestDigest: string,
+  }): Promise<{ evidence: DiscoveryPoolWaiver, fence: StoppedRunRetirementProof }> {
+    const source = await this.getState(input.sourceRunId)
+    const retired = await this.retiredRunWorkflow(source.runId)
+    const digest = retired?.fenceProofDigest
+    if (retired?.disposition !== 'retired-fenced' || !digest
+      || (retired.workflow as { status?: string })?.status !== 'terminated') {
+      throw new Error('discovery waiver source is not natively fenced')
+    }
+    const object = await this.artifacts.get(`runtime-retirements/sha256/${digest}.json`)
+    const content = object === null ? null : await object.text()
+    if (content === null || await sha256(content) !== digest
+      || object!.checksums.toJSON().sha256 !== digest || object!.customMetadata?.run !== source.runId) {
+      throw new Error('discovery waiver fence checksum differs')
+    }
+    const fence: unknown = JSON.parse(content)
+    assertStoppedRunRetirementProof(fence)
+    if (canonicalJson(fence.workflow) !== canonicalJson(retired.workflow)) throw new Error('waiver native fence differs')
+    const release = await this.getRelease(source.releaseDigest)
+    const checkpoint = await this.getCheckpoint(input.checkpointDigest)
+    const logs = new R2AgentExecutionLogStore(this.artifacts)
+    const receipts = new R2AgentExecutionReceiptStore(this.artifacts)
+    const attempt = source.inFlightAgentAttempts?.[0]
+    if (attempt === undefined) throw new Error('waiver has no unfinished admission')
+    const request = await logs.getRequest(source.runId, attempt.taskId, input.requestDigest)
+    const start = await receipts.getStart(source.runId, input.requestDigest)
+    const task = release.body.definition.stages.flatMap(stage => stage.waves).flatMap(wave => wave.tasks)
+      .find(task => task.id === attempt.taskId)
+    if (request === null || start === null || task === undefined || request.model !== task.model
+      || request.provider !== providerIdentity(task) || request.runId !== source.runId
+      || request.stageId !== attempt.stageId || request.waveId !== attempt.waveId
+      || request.taskId !== attempt.taskId || request.attempt !== attempt.attempt
+      || request.promptDigest !== attempt.promptDigest || request.startedAt !== start.claimedAt
+      || await receipts.get(source.runId, input.requestDigest) !== null) {
+      throw new Error('waiver request/start identity differs or terminal receipt must be recovered instead')
+    }
+    const custody = await logs.custodySnapshot({ runId: source.runId, taskId: attempt.taskId, requestDigest: input.requestDigest })
+    if (custody.quotaWait === null) throw new Error('waiver lacks a native rejected subscription wait')
+    const artifacts = new R2ArtifactStore(this.artifacts)
+    for (const artifact of source.artifacts.filter(record => record.status === 'accepted')) await artifacts.read(artifact)
+    const evidence = await prepareDiscoveryPoolWaiver({ ...input,
+      definition: release.body.definition, source, checkpoint, fence, logCustodyDigest: await sha256(custody), quotaWait: custody.quotaWait })
+    if (await sha256(await this.getState(source.runId)) !== input.sourceStateDigest) throw new Error('waiver source changed')
+    return { evidence, fence }
+  }
+
+  /** A conditional immutable source claim prevents two children from spending on the same waiver. */
+  async claimDiscoveryWaiver(evidence: DiscoveryPoolWaiver, acquire = false): Promise<void> {
+    if (!/^[a-z0-9][a-z0-9._-]{0,99}$/.test(evidence.sourceRunId)) throw new Error('invalid waiver source')
+    const key = `operator-waivers/discovery/${evidence.sourceRunId}.json`
+    const content = canonicalJson(evidence)
+    const digest = await sha256(content)
+    if (acquire) await this.artifacts.put(key, content, {
+      httpMetadata: { contentType: 'application/json' }, customMetadata: { objectSha256: digest },
+      sha256: digest, onlyIf: { etagDoesNotMatch: '*' },
+    })
+    const prior = await this.artifacts.get(key)
+    if (prior === null || await prior.text() !== content || prior.customMetadata?.objectSha256 !== digest
+      || prior.checksums.toJSON().sha256 !== digest) throw new Error('discovery waiver source already claimed or claim missing')
   }
 
   /** Rebind a lost admitted task only through its immutable terminal fence. */
@@ -1455,26 +1521,29 @@ export class CloudflareRunStore {
       SELECT current.state_key, current.state_generation, current.status, current.checkpoint_digest,
         route.experiment_id, route.runtime_release_json,
         lease.experiment_id AS lease_experiment_id, lease.slot_id,
-        lease.runtime_release_json AS lease_release, lease.released_at,
-        slot.runtime_release_json AS slot_release, control.rotating_slot_id
+        lease.runtime_release_json AS lease_release, lease.released_at, lease.admission_pool_enabled,
+        slot.runtime_release_json AS slot_release, control.enabled AS pool_enabled, control.rotating_slot_id
       FROM experiment_runs current
       JOIN run_runtime_routes route ON route.run_id = current.run_id
       JOIN runtime_slot_run_leases lease ON lease.run_id = current.run_id
-      JOIN runtime_slots slot ON slot.slot_id = lease.slot_id
+      LEFT JOIN runtime_slots slot ON slot.slot_id = lease.slot_id
       JOIN runtime_slot_control control ON control.singleton = 1
       WHERE current.run_id = ?1
     `).bind(proof.runId).first<{
       state_key: string, state_generation: number, status: string, checkpoint_digest: string | null,
       experiment_id: string, runtime_release_json: string, lease_experiment_id: string,
       slot_id: string, lease_release: string, released_at: string | null,
-      slot_release: string, rotating_slot_id: string | null
+      slot_release: string | null, rotating_slot_id: string | null,
+      admission_pool_enabled: number, pool_enabled: number
     }>()
     if (row === null || row.state_key !== proof.stateKey || row.state_generation !== proof.stateGeneration
       || row.status !== 'stopped' || row.checkpoint_digest !== proof.checkpointDigest
       || row.experiment_id !== proof.experimentId || row.lease_experiment_id !== proof.experimentId
       || row.runtime_release_json !== serialized || row.lease_release !== serialized
       || row.slot_id !== proof.runtimeRelease.id
-      || (row.released_at === null && (row.slot_release !== serialized || row.rotating_slot_id !== null))) {
+      || (row.released_at === null && (row.rotating_slot_id !== null
+        || row.slot_release !== serialized && !(row.admission_pool_enabled === 0
+          && row.pool_enabled === 0 && row.slot_release === null)))) {
       throw new Error('stopped route, lease, state, checkpoint, or slot changed')
     }
     const key = `runtime-retirements/sha256/${proofDigest}.json`
@@ -1499,14 +1568,16 @@ export class CloudflareRunStore {
       FROM experiment_runs current
       JOIN run_runtime_routes route ON route.run_id = current.run_id
       JOIN runtime_slot_run_leases lease ON lease.run_id = current.run_id
-      JOIN runtime_slots slot ON slot.slot_id = lease.slot_id
+      LEFT JOIN runtime_slots slot ON slot.slot_id = lease.slot_id
       JOIN runtime_slot_control control ON control.singleton = 1
       WHERE current.run_id = ?1 AND current.status = 'stopped'
         AND current.state_key = ?5 AND current.state_generation = ?6
         AND current.checkpoint_digest IS ?7
         AND route.experiment_id = ?8 AND route.runtime_release_json = ?9
         AND lease.experiment_id = ?8 AND lease.slot_id = ?10
-        AND lease.runtime_release_json = ?9 AND slot.runtime_release_json = ?9
+        AND lease.runtime_release_json = ?9
+        AND (slot.runtime_release_json = ?9 OR (lease.admission_pool_enabled = 0
+          AND control.enabled = 0 AND slot.slot_id IS NULL))
         AND control.rotating_slot_id IS NULL
       ON CONFLICT(run_id) DO NOTHING
     `).bind(proof.runId, canonicalJson(proof.workflow), proofDigest, retiredAt,
@@ -1534,7 +1605,11 @@ export class CloudflareRunStore {
         AND (released_at IS NOT NULL OR EXISTS (SELECT 1 FROM runtime_slots slot
           JOIN runtime_slot_control control ON control.singleton = 1
           WHERE slot.slot_id = ?4 AND slot.runtime_release_json = ?5
-            AND control.rotating_slot_id IS NULL))
+            AND control.rotating_slot_id IS NULL)
+          OR (admission_pool_enabled = 0
+            AND NOT EXISTS (SELECT 1 FROM runtime_slots WHERE slot_id = ?4)
+            AND EXISTS (SELECT 1 FROM runtime_slot_control
+              WHERE singleton = 1 AND enabled = 0 AND rotating_slot_id IS NULL)))
     `).bind(proof.runId, retiredAt, proof.experimentId, proof.runtimeRelease.id,
       serialized, proof.stateKey, proof.stateGeneration, proof.checkpointDigest,
       proofDigest, proof.workflow.status).run()
@@ -1604,25 +1679,7 @@ export class CloudflareRunStore {
   }
 
   async ensureSchema(): Promise<void> {
-    await this.index.batch([
-      this.index.prepare(`
-        CREATE TABLE IF NOT EXISTS experiment_runs (
-          run_id TEXT PRIMARY KEY,
-          experiment_id TEXT NOT NULL,
-          status TEXT NOT NULL,
-          state_key TEXT NOT NULL,
-          state_generation INTEGER NOT NULL,
-          checkpoint_digest TEXT,
-          updated_at TEXT NOT NULL,
-          terminal_reason TEXT
-        )
-      `),
-      this.index.prepare(`
-        CREATE INDEX IF NOT EXISTS experiment_runs_by_experiment_updated
-          ON experiment_runs(experiment_id, updated_at DESC)
-      `),
-      ...this.routingSchemaStatements(),
-    ])
+    await this.index.batch(this.routingSchemaStatements())
   }
 
   private routingSchemaStatements(): D1PreparedStatement[] {

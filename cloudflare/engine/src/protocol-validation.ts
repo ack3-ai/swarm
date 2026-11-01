@@ -1,3 +1,4 @@
+import { validSubscriptionWaits } from '../container/subscription-limits.mjs'
 import type { AgentResult, ArtifactRecord, TaskDefinition } from './contracts.js'
 import { canonicalJson } from './canonical.js'
 import {
@@ -10,6 +11,7 @@ import {
 } from './protocol-transforms.js'
 import { readSubmission, requiresSubmission, SUBMISSION_PATH } from './submission.js'
 import { providerIdentity } from './provider-identity.js'
+import { OUTPUT_FILE_MAX_BYTES } from './output-limits.js'
 
 function same(left: unknown, right: unknown): boolean {
   return canonicalJson(left) === canonicalJson(right)
@@ -27,6 +29,15 @@ export async function validateAgentResultDetailed(
   const addIntegrity = (value: string) => { integrity.push(value); issues.push(value) }
   const finish = () => ({ issues, repairable, integrity })
   const expectedProvider = providerIdentity(task)
+  const expectedWaitProvider = task.backend === 'claude' ? 'claude'
+    : task.backend === 'dsh-chat-completions' && task.connection?.usageWindowWait === true
+      ? 'dsh' : null
+  if (!validSubscriptionWaits(result.subscriptionWaits)
+    || (result.subscriptionWaits !== undefined && (expectedWaitProvider === null
+      || result.subscriptionWaits.some(wait => wait.provider !== expectedWaitProvider
+        || wait.sessionId !== result.actorId)))) {
+    addIntegrity('provider subscription wait evidence is invalid')
+  }
   if (result.model !== task.model) addIntegrity(`served model ${result.model} differs from ${task.model}`)
   if (result.actorId.trim() === '' || result.provider !== expectedProvider) addIntegrity('provider identity is incomplete or unexpected')
   if (!Number.isSafeInteger(result.inputTokens) || result.inputTokens < 0
@@ -64,13 +75,21 @@ export async function validateAgentResultDetailed(
     }
     return finish()
   }
+  const finalCustody = task.promptKind === 'final-seal'
+    ? await createFinalObservationCustody(visibleArtifacts) : undefined
+  const finalSuffix = finalCustody === undefined ? undefined
+    : sealFinalFinding('x', finalCustody).slice(1)
   for (const path of task.output.requiredFiles) {
     const content = result.files[path]
     if (content === undefined || content.trim() === '') addRepairable(`missing required output file: ${path}`)
   }
   for (const [path, content] of Object.entries(result.files)) {
     if (!/^[A-Za-z0-9.][A-Za-z0-9._/-]{0,239}$/.test(path) || path.includes('..')) addIntegrity(`unsafe output path: ${path}`)
-    if (new TextEncoder().encode(content).byteLength > 1_000_000) addIntegrity(`output file is too large: ${path}`)
+    // Sealing appends exact supervisor-generated custody to a size-valid draft.
+    const maxBytes = OUTPUT_FILE_MAX_BYTES + (task.providerClass === 'deterministic'
+      && path === 'finding.md' && finalSuffix !== undefined
+      ? new TextEncoder().encode(finalSuffix).byteLength : 0)
+    if (new TextEncoder().encode(content).byteLength > maxBytes) addRepairable(`output file is too large: ${path}`)
   }
   const primaryPath = task.output.requiredFiles.find(path => path !== SUBMISSION_PATH)
   const primary = primaryPath === undefined ? '' : result.files[primaryPath] ?? ''
@@ -115,12 +134,12 @@ export async function validateAgentResultDetailed(
       addIntegrity('negative-review union dissent metadata is incomplete')
     }
   } else if (task.promptKind === 'final-seal') {
-    const expected = await createFinalObservationCustody(visibleArtifacts)
+    const expected = finalCustody!
     if (!same(expected, result.protocol.finalCustody)) {
       addIntegrity('final observation custody differs from the immutable review frontier')
     } else {
       const marker = '<!-- ACK3_FINAL_OBSERVATION_CUSTODY_V1 -->'
-      const expectedSuffix = sealFinalFinding('narrative', expected).slice('narrative'.length)
+      const expectedSuffix = finalSuffix!
       const markerIndex = primary.indexOf(marker)
       if (markerIndex <= 0 || primary.slice(markerIndex - 2) !== expectedSuffix) {
         addIntegrity('finding.md lacks the exact deterministic final observation custody register')

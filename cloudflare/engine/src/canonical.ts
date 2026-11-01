@@ -1,3 +1,5 @@
+import { canonicalJsonDigest } from './canonical-bytes.js'
+
 const encoder = new TextEncoder()
 
 function normalized(value: unknown): unknown {
@@ -20,8 +22,26 @@ export function canonicalJson(value: unknown): string {
   return JSON.stringify(normalized(value))
 }
 
+// Only take the bounded path for data objects. Preserve the historical
+// canonicalJson behavior for custom objects, getters and toJSON functions.
+function plainData(value: unknown, seen = new Set<object>()): boolean {
+  if (value === null || ['undefined', 'string', 'number', 'boolean'].includes(typeof value)) return true
+  if (typeof value !== 'object') return false
+  if (seen.has(value) || 'toJSON' in value) return false
+  const prototype = Object.getPrototypeOf(value)
+  if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) return false
+  seen.add(value)
+  for (const entry of Object.values(Object.getOwnPropertyDescriptors(value))) {
+    if (!entry.enumerable) continue
+    if (!('value' in entry) || !plainData(entry.value, seen)) return false
+  }
+  seen.delete(value)
+  return true
+}
+
 export async function sha256(value: unknown): Promise<string> {
-  const bytes = typeof value === 'string' ? encoder.encode(value) : encoder.encode(canonicalJson(value))
+  if (value !== undefined && typeof value !== 'string' && plainData(value)) return canonicalJsonDigest(value)
+  const bytes = encoder.encode(typeof value === 'string' ? value : canonicalJson(value))
   const digest = await crypto.subtle.digest('SHA-256', bytes)
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('')
 }

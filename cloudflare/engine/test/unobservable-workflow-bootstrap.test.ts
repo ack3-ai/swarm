@@ -45,6 +45,7 @@ it('rechecks the exact lost-task fence and passes it into Workflow bootstrap', a
     getStateIfPresent: async () => null,
     getState: async () => sourceState,
     fencedUnobservableNativeEvidence: fenced,
+    retiredRunWorkflow: async () => ({ fenceProofDigest: lost.fenceProofDigest }),
   }
   const payload = { mode: 'recover-failed-wave', runId: 'child', experimentId: 'audit',
     checkpointDigest: 'f'.repeat(64), runtimeRelease: runtime, failedWaveRecovery: evidence }

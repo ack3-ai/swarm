@@ -76,11 +76,11 @@ export function compileExperimentConfig(value: unknown, promptContents: unknown)
   for (const [index, pool] of value.modelPools.entries()) {
     object(pool)
     rejectUnknownKeys(pool, [
-      'id', 'backend', 'provider', 'connection', 'model', 'reasoningEffort', 'thinking', 'subagents', 'credentialSource', 'agents', 'required',
+      'id', 'backend', 'provider', 'connection', 'model', 'cyberAccessProgram', 'reasoningEffort', 'thinking', 'subagents', 'credentialSource', 'agents', 'required',
     ], `audit manifest modelPools[${index}]`)
     if (pool.connection !== undefined) {
       object(pool.connection)
-      rejectUnknownKeys(pool.connection, ['baseUrl', 'apiKeyEnv', 'contextWindow', 'maxTokens', 'costRates'], `audit manifest modelPools[${index}].connection`)
+      rejectUnknownKeys(pool.connection, ['baseUrl', 'apiKeyEnv', 'headersEnv', 'usageWindowWait', 'contextWindow', 'maxTokens', 'costRates'], `audit manifest modelPools[${index}].connection`)
       if (pool.connection.costRates !== undefined) {
         object(pool.connection.costRates)
         rejectUnknownKeys(pool.connection.costRates,

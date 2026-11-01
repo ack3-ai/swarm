@@ -35,7 +35,30 @@ export function dshReasoningConfig(input) {
   }
 }
 
+/** Resolve optional authentication headers through the existing API-key credential path. */
+// A Codex-only native access program, passed to `codex --cyber-access-program`.
+export function validCodexAccessProgram(backend, program) {
+  return program === undefined
+    || (backend === 'codex' && typeof program === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(program))
+}
+
+export function modelHeaderCredentialNames(connection) {
+  const headers = connection?.headersEnv
+  if (headers === undefined) return []
+  if (!headers || typeof headers !== 'object' || Array.isArray(headers)
+    || Object.entries(headers).some(([name, env]) =>
+      !/^[A-Za-z][A-Za-z0-9-]{0,63}$/.test(name)
+      || /^(authorization|proxy-authorization|host|cookie|content-type|content-length|transfer-encoding|connection)$/i.test(name)
+      || typeof env !== 'string' || !/^[A-Z][A-Z0-9_]{0,119}_API_KEY$/.test(env))
+    || new Set(Object.keys(headers).map(name => name.toLowerCase())).size !== Object.keys(headers).length
+    || new URL(connection.baseUrl).protocol !== 'https:') {
+    throw new Error('invalid model header credential references')
+  }
+  return [...new Set(Object.values(headers))]
+}
+
 export function renderDshReasoningPatch(input) {
+  const headerCredentials = modelHeaderCredentialNames(input.connection)
   const config = dshReasoningConfig(input)
   const subagents = input.subagents ?? { mode: 'disabled' }
   if (subagents.mode !== 'disabled' || Object.keys(subagents).length !== 1) {
@@ -89,6 +112,11 @@ export function renderDshReasoningPatch(input) {
     '        api: openai-completions',
     `        baseURL: ${JSON.stringify(endpoint.href.replace(/\/$/, ''))}`,
     `        apiKeyEnv: ${JSON.stringify(apiKeyEnv)}`,
+    ...(headerCredentials.length === 0 ? [] : [
+      '        headers:',
+      ...Object.entries(input.connection.headersEnv).map(([header, name]) =>
+        `          ${JSON.stringify(header)}: !!js process.env.${name}`),
+    ]),
     '        compat:',
     '          thinkingFormat: deepseek',
     '          supportsDeveloperRole: false',

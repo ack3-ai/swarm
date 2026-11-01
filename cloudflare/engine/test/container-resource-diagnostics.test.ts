@@ -22,14 +22,16 @@ const emptySnapshot = {
 }
 
 describe('container resource diagnostics', () => {
-  it('uses the measured headroom profile in the deployed container config', async () => {
+  it('starts agent containers with the measured headroom profile', async () => {
     expect(containerCapacity).toEqual({
       instanceType: 'custom', vcpu: 1, memoryMiB: 8_192, diskMB: 6_000,
     })
+    // Under the durable_object policy the size is chosen at start(), not in Wrangler.
     const wrangler = await readFile(new URL('../wrangler.jsonc', import.meta.url), 'utf8')
-    expect(JSON.parse(wrangler).containers[0].instance_type).toEqual({
-      vcpu: 1, memory_mib: 8_192, disk_mb: 6_000,
-    })
+    expect(JSON.parse(wrangler).containers[0].instance_type).toBeUndefined()
+    const sandbox = await readFile(new URL('../src/agent-sandbox.ts', import.meta.url), 'utf8')
+    expect(sandbox).toContain(
+      'instance: { vcpu: containerCapacity.vcpu, memoryMib: containerCapacity.memoryMiB, diskMb: containerCapacity.diskMB }')
   })
 
   it('parses cgroup and disk snapshots', async () => {

@@ -164,3 +164,16 @@ describe('configurable audit flow', () => {
     } finally { await rm(dir, { recursive: true, force: true }) }
   })
 })
+
+it('seals optional header references into every task and rejects inline secrets', () => {
+  const selected = config(['discovery'], 'dsh-chat-completions')
+  const headersEnv = { 'X-Api-Key': 'EXTRA_PROVIDER_API_KEY' }
+  const pool = { ...selected.modelPools[0]!, provider: 'local', model: 'local-model', connection: {
+    baseUrl: 'https://local-model.example.com/v1', apiKeyEnv: 'LOCAL_MODEL_API_KEY', headersEnv } }
+  const body = compileExperimentConfig({ ...selected, modelPools: [pool] }, prompts)
+  expect(body.definition.pools[0]!.connection?.headersEnv).toEqual(headersEnv)
+  expect(body.definition.stages.flatMap(stage => stage.waves.flatMap(wave => wave.tasks))
+    .filter(task => task.providerClass === 'additive').every(task => JSON.stringify(task.connection?.headersEnv) === JSON.stringify(headersEnv))).toBe(true)
+  expect(() => compileExperimentConfig({ ...selected, modelPools: [{ ...pool,
+    connection: { ...pool.connection, headersEnv: { ...headersEnv, 'X-Secret': 'inline-secret' } } }] }, prompts)).toThrow('header credential')
+})

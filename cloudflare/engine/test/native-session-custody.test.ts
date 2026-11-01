@@ -13,7 +13,7 @@ import { AgentAttemptFailure, TransientRunFailure } from '../src/run-errors.js'
 import { audit0Definition } from './support/audit0-config.js'
 import { DeterministicAuditProvider } from './support/deterministic-audit-provider.js'
 
-vi.mock('@cloudflare/sandbox', () => ({ getSandbox: vi.fn() }))
+vi.mock('../src/agent-sandbox-client.js', () => ({ getAgentSandbox: vi.fn() }))
 
 const sessionId = 'session-11111111-1111-4111-8111-111111111111'
 const task = audit0Definition.stages.find(s => s.kind === 'discovery')!.waves[0]!.tasks.find(t => t.providerClass === 'additive')!

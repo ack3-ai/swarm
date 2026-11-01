@@ -1,7 +1,15 @@
 # Copy to a private .tfvars file. Secret values go only in TF_VAR_service_credentials.
 cloudflare_account_id   = "00000000000000000000000000000000"
 service_hostname        = "swarm.example-subdomain.workers.dev"
+# Storage names start with this; it cannot change after the first apply.
+resource_prefix         = "swarm"
 dashboard_email_domains = ["example.com"]
+# Individual addresses can be allowed instead of, or as well as, domains.
+# dashboard_emails      = ["you@example.com"]
+
+# Cloudflare allows one Secrets Store per account. If yours already has one,
+# set its name here and import it (see README).
+# secrets_store_name = "default_secrets_store"
 
 # Optional deployment shape. Unset jurisdiction and location use Cloudflare's defaults.
 # runtime_slot_count = 3

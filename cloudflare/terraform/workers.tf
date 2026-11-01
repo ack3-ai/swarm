@@ -5,7 +5,7 @@ locals {
 resource "cloudflare_worker" "experiment_engine" {
   account_id = var.cloudflare_account_id
   name       = "swarm"
-  tags       = ["ack3", "experiments", "terraform-owned"]
+  tags       = [var.resource_prefix, "experiments", "terraform-owned"]
 
   # Export destinations are provider-computed; setting [] causes perpetual drift.
   observability = {
@@ -29,6 +29,9 @@ resource "cloudflare_worker" "experiment_engine" {
     previews_enabled = false
   }
 
+  # The front door binds every runtime, so it must be removed before them.
+  depends_on = [cloudflare_worker.runtime]
+
   lifecycle {
     prevent_destroy = true
   }
@@ -39,7 +42,7 @@ resource "cloudflare_worker" "runtime" {
 
   account_id = var.cloudflare_account_id
   name       = each.value
-  tags       = ["ack3", "experiments", "runtime-release", each.key, "terraform-owned"]
+  tags       = [var.resource_prefix, "experiments", "runtime-release", each.key, "terraform-owned"]
 
   # Export destinations are provider-computed.
   observability = {

@@ -1,6 +1,8 @@
+import { AgentExecutionPending } from '../src/run-errors.js'
+import { discoveryDeadline } from '../src/discovery-clock.js'
 import { compileExperimentConfig } from './support/compile-config.js'
 import document from './fixtures/audit0-hello-vault.json' with { type: 'json' }
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { AgentProvider, AgentRequest, AgentResult } from '../src/contracts.js'
 import {
   advanceExperimentOneWave, RunMachine, sealReleasePackage,
@@ -180,4 +182,51 @@ describe('independent discovery pool waves', () => {
     )).toSorted()).toEqual(['deepseek/wave-0', 'luna/wave-0'])
     expect(state.cursor.stageIndex).toBe(1)
   })
+})
+
+it('retains a quota-waiting admission across slices and excludes its six-hour wait from the five-hour clock', async () => {
+  vi.useFakeTimers({ toFake: ['Date'] })
+  try {
+    const start = Date.parse('2026-01-01T00:00:00Z')
+    vi.setSystemTime(start)
+    const config = manifest([{ ...luna, id: 'luna', backend: 'claude', model: 'claude-fable-5-1', credentialSource: 'CLAUDE_OAUTH_TOKEN', agents: 1 }], 4)
+    config.stageModelPools['negative-review'] = ['luna']
+    config.limits.maxDiscoveryRuntimeMs = 5 * 60 * 60_000
+    const { body, machine, store, base } = await preparedMachine(config, 'quota-clock')
+    let pending = true
+    const firstRequests: AgentRequest[] = []
+    let nextWave = false
+    const provider: AgentProvider = { async run(request) {
+      if (request.task.research?.wave === 0) {
+        firstRequests.push(request)
+        if (pending) throw new AgentExecutionPending('same-process', 'unfinished')
+        const result = await base.run(request)
+        return { ...result, subscriptionWaits: [{ provider: 'claude', sessionId: result.actorId,
+          startedAt: new Date(start).toISOString(), resetsAt: new Date(start + 6 * 60 * 60_000).toISOString(),
+          resumedAt: new Date(start + 6 * 60 * 60_000 + 1000).toISOString() }] }
+      }
+      nextWave = true
+      return base.run(request)
+    } }
+    const advance = () => advanceExperimentOneWave({ definition: body.definition, machine, provider, artifactStore: store })
+    await advance()
+    const admission = machine.snapshot().inFlightAgentAttempts
+    vi.setSystemTime(start + 31 * 60_000)
+    await advance()
+    expect(machine.snapshot().inFlightAgentAttempts).toEqual(admission)
+    expect(machine.snapshot().status).toBe('running')
+    vi.setSystemTime(start + 6 * 60 * 60_000 + 1000)
+    pending = false
+    await advance()
+    expect(nextWave).toBe(true)
+    expect(firstRequests).toHaveLength(3)
+    expect(new Set(firstRequests.map(request => request.promptDigest)).size).toBe(1)
+    expect(firstRequests.every(request => request.attempt === 1)).toBe(true)
+    const state = machine.snapshot()
+    expect(state.modelStartedAt).toBe(new Date(start).toISOString())
+    expect(discoveryDeadline(body.definition, state)).toBe(start + 11 * 60 * 60_000 + 1000)
+    const checkpoint = state.checkpoints.at(-1)!
+    const child = await RunMachine.resume(body.definition, checkpoint, 'quota-clock-child')
+    expect(discoveryDeadline(body.definition, child.snapshot())).toBe(discoveryDeadline(body.definition, state))
+  } finally { vi.useRealTimers() }
 })

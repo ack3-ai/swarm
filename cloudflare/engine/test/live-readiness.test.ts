@@ -98,7 +98,7 @@ describe('Cloudflare live-readiness boundaries', () => {
     expect(monitorAt).toBeGreaterThan(readyAt)
     expect(source).toContain('processId = agentProcessId(requestDigest)')
     expect(source).toContain('request.inputDigest === undefined')
-    expect(source).toContain('autoCleanup: false')
+    expect(source).toContain('process = await sandbox.startProcess(guardedLaunch, {\n          processId,')
     expect(source).toContain('waitForAgentProcess(process, agentProcessWaitSliceMs, 1_000, {')
     expect(source).toContain('agentLogReadMaxBytes = 256 * 1024')
     expect(source).not.toContain('sandbox.readFile(logPath)')

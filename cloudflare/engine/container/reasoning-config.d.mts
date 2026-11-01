@@ -17,3 +17,6 @@ export function renderDshReasoningPatch(input: ReasoningInput & {
   subagents?: SubagentPolicy
   searchAttribution?: { agent: string, stage: string, wave: string, task: string }
 }): string
+
+export function validCodexAccessProgram(backend: string | undefined, program: unknown): boolean
+export function modelHeaderCredentialNames(connection?: ModelConnection): string[]
