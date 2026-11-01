@@ -1,3 +1,4 @@
+import { discoveryDeadline as discoveryDeadlineMs } from './discovery-clock.js'
 import type {
   AgentProvider,
   AgentRequest,
@@ -158,8 +159,7 @@ export function taskPromptDeadline(
   stage: StageDefinition,
   wave: WaveDefinition,
 ): string {
-  const startedAt = new Date(state.modelStartedAt ?? state.rootCreatedAt).getTime()
-  const discoveryDeadline = startedAt + definition.limits.phaseMinutes.discovery * 60_000
+  const discoveryDeadline = discoveryDeadlineMs(definition, state)
   const stageIndex = definition.stages.indexOf(stage)
   const waveIndex = stage.waves.indexOf(wave)
   const previousBoundary = waveIndex > 0
@@ -246,6 +246,15 @@ async function runTask(input: {
         repairSource.quarantineUri, repairSource.outputDigest, repairSource.taskId,
       )
     }
+  }
+  const savedRepair = input.state.failedWaveRecovery?.quarantinedRepair
+  if (previousRejections.length === 0 && firstAttempt === 1
+    && savedRepair?.stageId === input.stage.id && savedRepair.waveId === input.wave.id
+    && savedRepair.taskId === task.id) {
+    diagnostics = savedRepair.diagnostics
+    repairFiles = await input.artifactStore.readRejected(
+      savedRepair.quarantineUri, savedRepair.outputDigest, savedRepair.taskId,
+    )
   }
   continuationSessionId = interruptedAttempt?.sessionId ?? lastConsumed?.sessionId ?? null
   if (retainedWorkspace !== undefined && previousRejections.length === 0 && firstAttempt === 1) {
@@ -419,6 +428,7 @@ async function runTask(input: {
         usage: {
           modelCalls: task.providerClass === 'deterministic' ? 0 : 1,
           inputTokens: rawResult.inputTokens,
+          ...(rawResult.subscriptionWaits === undefined ? {} : { subscriptionWaits: rawResult.subscriptionWaits }),
           ...(rawResult.rawInputTokens === undefined ? {} : { rawInputTokens: rawResult.rawInputTokens }),
           ...(rawResult.cachedInputTokens === undefined ? {} : { cachedInputTokens: rawResult.cachedInputTokens }),
           ...(rawResult.cacheAccountingComplete === undefined
@@ -839,12 +849,12 @@ export async function runIndependentDiscoveryTick(input: {
 }): Promise<SealedCheckpoint | null> {
   const { definition, machine, provider, artifactStore } = input
   await machine.start()
-  let state = machine.snapshot()
+  let state = machine.view()
   const stageIndex = state.cursor.stageIndex
   const stage = definition.stages[stageIndex]
   if (stage?.kind !== 'discovery') throw new Error('independent discovery tick requires the discovery cursor')
   await machine.initializeDiscoveryScheduler(stage.id)
-  if (state.discoveryScheduler === undefined) await input.onStatePersist?.(machine.snapshot())
+  if (state.discoveryScheduler === undefined) await input.onStatePersist?.(machine.view())
 
   let mutationQueue = Promise.resolve()
   const mutate = async <T>(operation: () => Promise<T>): Promise<T> => {
@@ -855,7 +865,7 @@ export async function runIndependentDiscoveryTick(input: {
   const admitProviderCall = async (task: TaskDefinition, request: AgentRequest): Promise<void> => {
     if (task.providerClass === 'deterministic') return
     await mutate(async () => {
-      const current = machine.snapshot()
+      const current = machine.view()
       const inFlight = current.inFlightAgentAttempts ?? []
       const spentReservation = (taskId: string) => current.rejectedAttempts.some(rejection => (
         rejection.taskId === taskId && (rejection.repairScopeRunId ?? current.runId) === current.runId
@@ -886,7 +896,7 @@ export async function runIndependentDiscoveryTick(input: {
         sessionId: request.sessionId,
       })
       try {
-        await input.onStatePersist?.(machine.snapshot())
+        await input.onStatePersist?.(machine.view())
       } catch (error) {
         throw new TransientRunFailure(`agent attempt admission persistence failed for ${task.id}`, { cause: error })
       }
@@ -898,8 +908,8 @@ export async function runIndependentDiscoveryTick(input: {
   const launch = (admission: DiscoveryCohortAdmission) => {
     const wave = stage.waves[admission.waveIndex]
     if (wave === undefined) throw new Error(`discovery admission wave is missing: ${admission.waveId}`)
-    const visibleArtifacts = frozenAdmissionArtifacts(machine.snapshot(), admission)
-    const snapshot = machine.snapshot()
+    const visibleArtifacts = frozenAdmissionArtifacts(machine.view(), admission)
+    const snapshot = machine.view()
     const terminalFailures = persistedTerminalTaskFailures(snapshot)
     const tasks = admission.taskIds.map(taskId => {
       const task = wave.tasks.find(candidate => candidate.id === taskId)
@@ -910,7 +920,7 @@ export async function runIndependentDiscoveryTick(input: {
     const taskIndexes = tasks.map(task => wave.tasks.findIndex(candidate => candidate.id === task.id))
     const execution = Promise.allSettled(tasks.map((task, index) => runTask({
       definition,
-      state: machine.snapshot(),
+      state: machine.view(),
       stage,
       wave,
       taskIndex: taskIndexes[index]!,
@@ -932,17 +942,17 @@ export async function runIndependentDiscoveryTick(input: {
   }
 
   const admitRunnablePools = async (): Promise<void> => {
-    if (admissionsClosed || persistedTerminalTaskFailures(machine.snapshot()).size > 0
+    if (admissionsClosed || persistedTerminalTaskFailures(machine.view()).size > 0
       || await input.stopRequested?.() === true) {
       admissionsClosed = true
       return
     }
-    state = machine.snapshot()
+    state = machine.view()
     const scheduler = state.discoveryScheduler!
-    const deadline = Date.parse(state.modelStartedAt!) + definition.limits.phaseMinutes.discovery * 60_000
+    const deadline = discoveryDeadlineMs(definition, state)
     if (Date.now() >= deadline) return
     for (const progress of scheduler.pools) {
-      const current = machine.snapshot()
+      const current = machine.view()
       const currentScheduler = current.discoveryScheduler!
       const currentProgress = currentScheduler.pools.find(candidate => candidate.poolId === progress.poolId)!
       if (currentProgress.parked || currentProgress.nextWaveIndex >= stage.waves.length
@@ -993,15 +1003,15 @@ export async function runIndependentDiscoveryTick(input: {
           inputArtifacts: frontier.map(artifact => ({ id: artifact.id, contentDigest: artifact.contentDigest })),
           peerPredecessors: peerPredecessors(stage, wave, progress.poolId, frontier),
         })
-        await input.onStatePersist?.(machine.snapshot())
+        await input.onStatePersist?.(machine.view())
         return value
       })
       launch(admission)
-      state = machine.snapshot()
+      state = machine.view()
     }
   }
 
-  for (const admission of machine.snapshot().discoveryScheduler!.admissions) launch(admission)
+  for (const admission of machine.view().discoveryScheduler!.admissions) launch(admission)
   await admitRunnablePools()
   let terminalFailure: unknown = null
   while (executions.size > 0) {
@@ -1020,12 +1030,12 @@ export async function runIndependentDiscoveryTick(input: {
           const value = await processDiscoveryCohortPoll({
             poll, machine, artifactStore, coalesceMaterialDelta: materialAdvanced,
           })
-          await input.onStatePersist?.(machine.snapshot())
+          await input.onStatePersist?.(machine.view())
           return value
         })
       } catch (error) {
         terminalFailure ??= error
-        await input.onStatePersist?.(machine.snapshot())
+        await input.onStatePersist?.(machine.view())
         continue
       }
       cohortCompleted ||= outcome.status === 'completed'
@@ -1036,15 +1046,15 @@ export async function runIndependentDiscoveryTick(input: {
 
   if (terminalFailure !== null) {
     if (terminalFailure instanceof RunFailure && !terminalFailure.retryable
-      && hasHealthyUnresolvedDiscoveryWork(machine.snapshot())) return null
+      && hasHealthyUnresolvedDiscoveryWork(machine.view())) return null
     throw terminalFailure
   }
 
-  state = machine.snapshot()
+  state = machine.view()
   const scheduler = state.discoveryScheduler!
   if (scheduler.admissions.length > 0) return null
   if (admissionsClosed || await input.stopRequested?.() === true) return null
-  const deadline = Date.parse(state.modelStartedAt!) + definition.limits.phaseMinutes.discovery * 60_000
+  const deadline = discoveryDeadlineMs(definition, state)
   const runnable = scheduler.pools.filter(progress => (
     !state.availabilityBoundaries.some(boundary => boundary.poolId === progress.poolId)
       && progress.nextWaveIndex < stage.waves.length
@@ -1121,7 +1131,7 @@ export async function runNextWave(input: {
 }): Promise<SealedCheckpoint | null> {
   const { definition, machine, provider, artifactStore } = input
   await machine.start()
-  let state = machine.snapshot()
+  let state = machine.view()
   if (state.cursor.stageIndex >= definition.stages.length) return null
   const stageIndex = state.cursor.stageIndex
   const waveIndex = state.cursor.waveIndex
@@ -1200,15 +1210,15 @@ export async function runNextWave(input: {
   }
   await machine.admitWave(stage.id, wave.id)
   if (state.waveAdmission === undefined || state.waveAdmission === null) {
-    await input.onWaveAdmission?.(machine.snapshot())
+    await input.onWaveAdmission?.(machine.view())
   }
-  state = machine.snapshot()
+  state = machine.view()
 
   let admissionQueue = Promise.resolve()
   const admitProviderCall = async (task: WaveDefinition['tasks'][number], request: AgentRequest): Promise<void> => {
     if (task.providerClass === 'deterministic') return
     const operation = admissionQueue.then(async () => {
-      const current = machine.snapshot()
+      const current = machine.view()
       const existing = (current.inFlightAgentAttempts ?? []).some(admission => (
         admission.stageId === stage.id && admission.waveId === wave.id && admission.taskId === task.id
       ))
@@ -1251,7 +1261,7 @@ export async function runNextWave(input: {
         )
       }
       try {
-        await input.onWaveAdmission?.(machine.snapshot())
+        await input.onWaveAdmission?.(machine.view())
       } catch (error) {
         throw new TransientRunFailure(`agent attempt admission persistence failed for ${task.id}`, { cause: error })
       }
@@ -1342,7 +1352,7 @@ export async function runNextWave(input: {
     : { stageIndex: stageIndex + 1, waveIndex: 0 }
   if (waveIndex + 1 === stage.waves.length && stage.kind !== 'discovery') {
     if (stage.kind === 'reporting') {
-      const issues = audit0RunPolicy.assessCompletion({ definition, state: machine.snapshot() })
+      const issues = audit0RunPolicy.assessCompletion({ definition, state: machine.view() })
       if (issues.length > 0) {
         throw new PermanentRunFailure(`completion contract failed: ${issues.join('; ')}`, 'completion-contract-failed')
       }
@@ -1350,7 +1360,7 @@ export async function runNextWave(input: {
     return machine.endStage(stage.kind === 'preflight' ? 'preflight-passed'
       : stage.kind === 'reporting' ? 'completion-contract-passed' : 'stage-complete', {
       finalWave: wave.id,
-      artifacts: sealedArtifacts(machine.snapshot()).filter(artifact => artifact.stageId === stage.id)
+      artifacts: sealedArtifacts(machine.view()).filter(artifact => artifact.stageId === stage.id)
         .map(artifact => artifact.contentDigest).toSorted(),
     }, stageIndex)
   }
@@ -1368,7 +1378,7 @@ export async function advanceExperimentOneWave(input: {
   onWaveAdmission?: (state: RunState) => Promise<void>
   stopRequested?: () => Promise<boolean>
 }): Promise<boolean> {
-  const before = input.machine.snapshot()
+  const before = input.machine.view()
   if (before.cursor.stageIndex >= input.definition.stages.length) return false
   const stage = input.definition.stages[before.cursor.stageIndex]
   const wave = stage?.waves[before.cursor.waveIndex]
@@ -1383,9 +1393,8 @@ export async function advanceExperimentOneWave(input: {
   if (drainsLegacyPromotedWave) {
     const recovered = await runNextWave(input)
     if (recovered === null) return false
-    const current = input.machine.snapshot()
-    const discoveryDeadline = Date.parse(current.modelStartedAt!)
-      + input.definition.limits.phaseMinutes.discovery * 60_000
+    const current = input.machine.view()
+    const discoveryDeadline = discoveryDeadlineMs(input.definition, current)
     if (Date.now() >= discoveryDeadline) {
       const disposal = await disposeDiscoveryLanes(input.provider, current, stage)
       const timing = current.waveReceipts.find(receipt => (

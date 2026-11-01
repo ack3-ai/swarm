@@ -7,6 +7,7 @@ import type {
   SubagentPolicy, SubagentStage, TaskDefinition, WaveDefinition,
 } from '../contracts.js'
 import { deepClone } from '../canonical.js'
+import { validCodexAccessProgram } from '../../container/reasoning-config.mjs'
 import { researchPoolNamespace, scheduleResearchPoolLanes } from '../research-scheduler.js'
 import { validateReleasePackage } from '../validation.js'
 import { requiresSubmission, SUBMISSION_PATH } from '../submission.js'
@@ -14,7 +15,7 @@ import { requiresSubmission, SUBMISSION_PATH } from '../submission.js'
 interface ScheduledResearchRole { role: string; buildsOn: 'none' | `previous-wave/research-${number}` }
 interface ResolvedProfile {
   credentialSource?: string; providerClass: ProviderClass; backend?: ModelBackend; provider?: string; connection?: ModelConnection
-  pool?: string; model: string; reasoning: ReasoningEffort; thinking?: ModelPool['thinking']; subagents?: SubagentPolicy
+  pool?: string; model: string; cyberAccessProgram?: ModelPool['cyberAccessProgram']; reasoning: ReasoningEffort; thinking?: ModelPool['thinking']; subagents?: SubagentPolicy
   optional: boolean; workspaceMode: TaskDefinition['workspaceMode']
 }
 interface ResolvedResearchPool { id: string; taskIdPrefix: string; workspaceKeyPrefix: string; agents: number; profile: ResolvedProfile }
@@ -241,6 +242,7 @@ function researchTask(input: {
     ...(profile.connection === undefined ? {} : { connection: profile.connection }),
     ...(profile.pool === undefined ? {} : { modelPool: profile.pool }),
     model: profile.model,
+    ...(profile.cyberAccessProgram === undefined ? {} : { cyberAccessProgram: profile.cyberAccessProgram }),
     reasoning: profile.reasoning,
     ...(profile.thinking === undefined ? {} : { thinking: profile.thinking }),
     ...(profile.subagents === undefined ? {} : { subagents: profile.subagents }),
@@ -344,6 +346,9 @@ function manifestResearchPools(manifest: AuditManifestV2): readonly ManifestMode
     if (pool.backend === 'claude' && !/^CLAUDE_[A-Z0-9_]*OAUTH_TOKEN$/.test(pool.credentialSource ?? '')) {
       throw new TypeError(`model pool ${pool.id} requires a Claude OAuth token binding`)
     }
+    if (!validCodexAccessProgram(pool.backend, pool.cyberAccessProgram)) {
+      throw new TypeError(`model pool ${pool.id} has invalid cyberAccessProgram`)
+    }
     if (!['none', 'low', 'medium', 'high', 'max'].includes(pool.reasoningEffort)) {
       throw new TypeError(`model pool ${pool.id} has invalid reasoningEffort`)
     }
@@ -415,6 +420,7 @@ function resolvedResearchPools(pools: readonly ManifestModelPool[]): readonly Re
         optional: !pool.required,
         workspaceMode: 'fresh-pristine',
         model: pool.model,
+        ...(pool.cyberAccessProgram === undefined ? {} : { cyberAccessProgram: pool.cyberAccessProgram }),
       },
     }
   })
@@ -468,6 +474,7 @@ export function compileSecurityAuditV1(value: unknown, promptContents: unknown):
       objective: stage === undefined ? 'Preserve source and evidence integrity.' : stagePrompts[stage]!,
       providerClass, model: pool?.model ?? 'deterministic', reasoning: pool?.reasoningEffort ?? 'max',
       ...(pool === undefined ? {} : { backend: pool.backend, modelPool: pool.id,
+        ...(pool.cyberAccessProgram === undefined ? {} : { cyberAccessProgram: pool.cyberAccessProgram }),
         ...(pool.backend === 'claude' || /^[A-Z][A-Z0-9_]{0,119}_AUTH_JSON$/.test(pool.credentialSource ?? '')
           ? { credentialSource: pool.credentialSource } : {}), subagents: subagentPolicy(pool, stage!),
         ...(pool.provider === undefined ? {} : { provider: pool.provider }),

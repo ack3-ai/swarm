@@ -1,5 +1,7 @@
 # Agent instructions
 
+When `private/AGENTS.md` exists, read it before working in this repository.
+
 Follow [CONTRIBUTING.md](CONTRIBUTING.md). Preserve unrelated work, active audits
 and saved evidence. Keep credentials, private targets, benchmark answers and raw
 audit artifacts out of Git and public issues. Store reusable service credentials

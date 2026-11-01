@@ -1,7 +1,7 @@
 import { canonicalJson, sha256 } from './canonical.js'
 import type { AgentRequest } from './contracts.js'
 import { receiptMonitoringMetadata } from './dashboard-receipts.js'
-import { validSubscriptionLimits, type SubscriptionLimits } from '../container/subscription-limits.mjs'
+import { validSubscriptionLimits, validSubscriptionWaits, type SubscriptionLimits, type SubscriptionWait } from '../container/subscription-limits.mjs'
 
 export interface AgentExecutionReceipt {
   requestDigest: string
@@ -22,6 +22,7 @@ export interface AgentExecutionReceipt {
   /** Captured by the trusted installed runner from paired native tool events. */
   nativeSearchEvidence?: NativeSearchEvidence
   subscriptionLimits?: SubscriptionLimits
+  subscriptionWaits?: readonly SubscriptionWait[]
 }
 
 export interface NativeSearchEvidence {
@@ -277,6 +278,7 @@ export function classifyAgentExecutionReceipt(
       || typeof value.stderr !== 'string'
       || !validNativeSearchEvidence(value.nativeSearchEvidence)
       || !validSubscriptionLimits(value.subscriptionLimits)
+      || !validSubscriptionWaits(value.subscriptionWaits)
       || (value.providerRequests !== undefined
         && (!Array.isArray(value.providerRequests)
           || value.providerRequests.length > 2_000

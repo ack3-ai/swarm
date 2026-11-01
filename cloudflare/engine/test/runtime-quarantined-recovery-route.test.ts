@@ -18,6 +18,7 @@ it('passes quarantine custody to the destination runtime before recovering a rej
   const lost = { stageId: 'discovery', waveId: 'wave-3', taskId: 'core-wave-3-research-1',
     attempt: 1, promptDigest: 'e'.repeat(64), requestDigest: 'f'.repeat(64), fenceProofDigest: 'a'.repeat(64) }
   let inFlight = false
+  let retired = true
   const handler = new Function(
     'assertLocalRuntime', 'sameRuntimeRelease', 'CloudflareRunStore', 'assertReleaseEnvironmentMatchesRuntime',
     'assertIndependentDiscoveryFrontier', 'resolveTargetEnvironment', 'assertReleaseProviderCredentials',
@@ -29,6 +30,7 @@ it('passes quarantine custody to the destination runtime before recovering a rej
     () => runtimeRelease, (left: unknown, right: unknown) => left === right,
     class {
       async retiredUnmaterializedRoute() { return null }
+      async retiredRunWorkflow() { return retired ? { status: 'errored' } : null }
       async runRuntime() { return runtimeRelease }
       async getState() { return { experimentId: 'audit-test',
         ...(inFlight ? { inFlightAgentAttempts: [{}] } : {}) } }
@@ -74,4 +76,18 @@ it('passes quarantine custody to the destination runtime before recovering a rej
   await expect(handler({ json: async () => ({ ...body, promoteExecution: undefined }) },
     { ARTIFACTS: artifactBucket })).rejects.toThrow('recovery input inspected')
   expect(calls[1]).toMatchObject({ unobservableNative: lost })
+  inFlight = false
+  const repairQuarantined = { taskId: 'synthesizer', requestDigest: 'a'.repeat(64), outputDigest: 'b'.repeat(64) }
+  const repairBody = { ...body, promoteExecution: undefined, repairQuarantined }
+  retired = false
+  await expect(handler({ json: async () => repairBody }, { ARTIFACTS: artifactBucket }))
+    .resolves.toMatchObject({ status: 409 })
+  retired = true
+  await expect(handler({ json: async () => repairBody }, { ARTIFACTS: artifactBucket }))
+    .rejects.toThrow('recovery input inspected')
+  expect(calls[2]).toMatchObject({ repairQuarantined })
+  const repairInput = calls[2] as Record<string, unknown>
+  expect(repairInput.quarantined).toBeInstanceOf(ArtifactStore)
+  expect(repairInput.executionReceipts).toBeInstanceOf(ReceiptStore)
+  expect(repairInput.executionRequests).toBeInstanceOf(RequestStore)
 })

@@ -69,8 +69,11 @@ Preflight checks are separate and do not install dependencies in agent workspace
 See [workspace preparation](running-audit.md#workspace-preparation).
 
 Agents write reports and `.swarm/submission.json`. Accepted artifacts are immutable;
-observation IDs and references preserve their origin across stages. Conversation
-IDs do not guarantee that workspace files survive a container failure.
+observation IDs and references preserve their origin across stages. R2 lock rules
+keep Swarm from deleting releases, source packages, checkpoints and accepted
+artifacts, but a Cloudflare token that can change bucket settings can remove the
+rules, so keep such tokens to account administrators. Conversation IDs do not
+guarantee that workspace files survive a container failure.
 
 ## Limits and recovery
 

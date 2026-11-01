@@ -1,6 +1,6 @@
 resource "cloudflare_secrets_store" "swarm" {
   account_id = var.cloudflare_account_id
-  name       = "swarm"
+  name       = var.secrets_store_name
   lifecycle {
     prevent_destroy = true
   }

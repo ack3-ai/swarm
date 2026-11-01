@@ -12,7 +12,7 @@ export async function boundedWorkspaceDisposal(
   let expired = false
   const destruction = destroy(() => expired).then(() => 'destroyed' as const)
   // Keep a rejection handler attached after the bounded caller returns. The
-  // Sandbox SDK permits destroy() to remain pending when its control plane is unavailable.
+  // destroy() can remain pending when the container control plane is unavailable.
   destruction.catch(() => {})
   const status = await Promise.race([
     destruction,

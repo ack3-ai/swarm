@@ -9,7 +9,7 @@ import { DeterministicAuditProvider } from './support/deterministic-audit-provid
 import { MemoryArtifactStore } from './support/memory-runner.js'
 
 function checkpoint(stageIndex: number, modelStartedAt: string): SealedCheckpoint {
-  return { body: { cursor: { stageIndex, waveIndex: 0 }, modelStartedAt, waveReceipts: [] } } as unknown as SealedCheckpoint
+  return { body: { cursor: { stageIndex, waveIndex: 0 }, modelStartedAt, rootCreatedAt: modelStartedAt, acceptedArtifacts: [], rejectedAttempts: [], waveReceipts: [] } } as unknown as SealedCheckpoint
 }
 
 describe('checkpoint recovery clock', () => {

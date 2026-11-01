@@ -144,3 +144,16 @@ test('uses the official authenticated Exa MCP with scoped attribution in both na
   assert.ok(args.includes(`mcp_servers.exa.http_headers={"x-exa-source"=${JSON.stringify(exaSourceLabel(attribution))}}`))
   assert.throws(() => codexExaConfig({ provider: 'exa', apiKeyEnv: 'bad;key' }, attribution))
 })
+
+test('optional headers use existing credential references and reject unsafe headers or inline values', () => {
+  const connection = { baseUrl: 'https://provider.example.com/v1', apiKeyEnv: 'PROVIDER_API_KEY',
+    headersEnv: { 'X-Service-Key': 'SERVICE_API_KEY' } }
+  const input = { thinking: 'enabled', reasoningEffort: 'high', model: 'test-model', connection }
+  assert.match(renderDshReasoningPatch(input), /"X-Service-Key": !!js process.env.SERVICE_API_KEY/)
+  for (const headersEnv of [null, [], { 'X-Service-Key': ['SERVICE_API_KEY'] }, { 'X-Service-Key': 'CONTROL_API_TOKEN' },
+    { 'X-Service-Key': 'inline-secret' }, { Host: 'SERVICE_API_KEY' },
+    { Authorization: 'SERVICE_API_KEY' }, { 'X-Service-Key': 'SERVICE_API_KEY', 'x-service-key': 'OTHER_API_KEY' }]) {
+    assert.throws(() => renderDshReasoningPatch({ ...input, connection: { ...connection, headersEnv } }))
+  }
+  assert.throws(() => renderDshReasoningPatch({ ...input, connection: { ...connection, baseUrl: 'http://localhost/v1' } }))
+})

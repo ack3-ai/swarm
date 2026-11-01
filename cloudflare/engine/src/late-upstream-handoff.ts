@@ -11,6 +11,7 @@ import { readSubmission } from './submission.js'
 function attemptUsage(result: AgentExecutionReceipt): ProviderUsage {
   return {
     modelCalls: 1,
+    ...(result.subscriptionWaits === undefined ? {} : { subscriptionWaits: result.subscriptionWaits }),
     inputTokens: result.inputTokens,
     ...(result.rawInputTokens === undefined ? {} : { rawInputTokens: result.rawInputTokens }),
     ...(result.cachedInputTokens === undefined ? {} : { cachedInputTokens: result.cachedInputTokens }),
@@ -110,6 +111,7 @@ async function acceptedAgentResult(request: AgentRequest, result: AgentExecution
     })
   })
   return {
+    ...(result.subscriptionWaits === undefined ? {} : { subscriptionWaits: result.subscriptionWaits }),
     status: 'accepted', actorId: result.actorId, model: request.task.model,
     provider: providerIdentity(request.task),
     files: result.files, assertions: [], protocol: submission.protocol,

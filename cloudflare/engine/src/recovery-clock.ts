@@ -1,3 +1,4 @@
+import { discoveryDeadline } from './discovery-clock.js'
 import type { ExperimentDefinition, SealedCheckpoint, StageKind } from './contracts.js'
 
 export interface ModelClockAmendment {
@@ -22,7 +23,7 @@ export function expiredResumeClockAmendment(
   // Only discovery has an operator-owned elapsed-time budget. Completion
   // stages continue durably and therefore have no clock to expire or amend.
   if (stage?.kind !== 'discovery') return null
-  const deadlineMs = previousMs + definition.limits.phaseMinutes.discovery * 60_000
+  const deadlineMs = discoveryDeadline(definition, { ...checkpoint.body, artifacts: checkpoint.body.acceptedArtifacts })
   const previousWave = checkpoint.body.waveReceipts.findLast(receipt => receipt.stageId === stage.id)
   const insufficientForCompleteDiscoveryWave = stage.kind === 'discovery'
     && previousWave !== undefined

@@ -77,15 +77,17 @@ const env = {
   npm_config_cache: resolve(root, 'home', '.npm'),
   SWARM_SOURCE_DIR: source, SWARM_VERIFIER_DIR: source, DEEPSEEK_SWARM_RUN_DIR: resolve(root, 'results'),
 }
+// Durable Object containers keep root capabilities across a user change unless they are dropped.
+const agentUser = ['--reuid=10001', '--regid=10001', '--init-groups', '--inh-caps=-all', '--ambient-caps=-all']
 const execute = (program, args, timeout) => spawnSync(
   process.getuid?.() === 0 ? 'setpriv' : program,
-  process.getuid?.() === 0 ? ['--reuid=10001', '--regid=10001', '--init-groups', program, ...args] : args,
+  process.getuid?.() === 0 ? [...agentUser, program, ...args] : args,
   { cwd: workspaceDirectory, env, encoding: 'utf8', stdio: 'pipe', timeout, maxBuffer: 1024 * 1024 },
 )
 const executePreparation = (command) => new Promise(resolveResult => {
   const program = process.getuid?.() === 0 ? 'setpriv' : '/bin/bash'
   const args = process.getuid?.() === 0
-    ? ['--reuid=10001', '--regid=10001', '--init-groups', '/bin/bash', '-c', command]
+    ? [...agentUser, '/bin/bash', '-c', command]
     : ['-c', command]
   const child = spawn(program, args, {
     cwd: workspaceDirectory, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'],

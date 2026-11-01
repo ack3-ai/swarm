@@ -42,8 +42,8 @@ models, provider, commit and all-zero image digest are placeholders.
 | `environment.workspacePreparation` | Setup commands for each source workspace |
 | `modelPools` | Models, providers, researcher counts and required participation |
 | `stageModelPools` | One pool per selected later stage; `negative-review` also accepts a list of independent reviewers |
-| `limits` | `maxDiscoveryRuntimeMs`, `maxModelCalls`, `maxCostUsd`, and optional `maxInputTokens` and `maxOutputTokens` |
-| `maxDiscoveryWaves` | Discovery wave ceiling per pool (1–64) |
+| `limits` | `maxDiscoveryRuntimeMs`, `maxModelCalls`, `maxCostUsd`, and optional `maxInputTokens` and `maxOutputTokens` ([Budget](#budget)) |
+| `maxDiscoveryWaves` | Discovery wave ceiling per pool (1–64); when every pool has run its waves, discovery ends with reason `safety-ceiling-reached` |
 | `stopOnSaturation` | Default `true`; set `false` to run all configured discovery waves unless time/spend runs out |
 | `researchPlan` | Optional lane labels and peer evidence per discovery wave. [Research plan](#research-plan) |
 
@@ -80,6 +80,21 @@ with a Codex login ([setup](../cloudflare/engine/README.md#worker-and-runtime-pu
 ID that pool's account or provider serves; `release:export` does not check it. Try a
 Codex model with the same login first: `codex exec -m MODEL "Reply with OK."`.
 `reasoningEffort` is `none`, `low`, `medium`, `high` or `max`.
+Optional `cyberAccessProgram` (Codex pools only; lowercase letters, digits and
+underscores) is passed to Codex as `--cyber-access-program`; the runtime image must
+include a Codex CLI that supports that program.
+
+OpenAI-compatible endpoints, including self-hosted models, use the existing
+`dsh-chat-completions` backend with `connection.baseUrl` and `connection.apiKeyEnv`.
+Optional `connection.headersEnv` maps additional authentication header names to
+existing `*_API_KEY` credential bindings, for example
+`{"X-Service-Key": "SERVICE_API_KEY"}`. Values are loaded from Secrets Store into
+the selected agent process. Custom headers require HTTPS; transport headers and
+Authorization cannot be overridden. Keep endpoint-specific configuration local.
+Set `connection.usageWindowWait: true` for a provider whose 429 responses with
+`Retry-After` mark a usage window that resets: the agent waits for the window instead
+of failing, and the wait extends the discovery deadline. Spend caps and exhausted
+credits send no `Retry-After` and still fail.
 
 Assign pool IDs to later stages:
 
@@ -182,6 +197,9 @@ Subscription quota appears in agent diagnostics when the native runner exposes i
 Unknown quota is not zero usage. Exhaustion fails with saved evidence, without an
 agent repair or automatic account switch. Zero recorded cost is not a verified bill.
 
+`maxCostUsd` counts only priced DSH calls. Claude and Codex calls are recorded at $0,
+so it does not limit them; bound those runs with `maxModelCalls` and the time limits.
+
 ## Search
 
 All runners use official Exa MCP search and page retrieval; DSH's direct web
@@ -272,7 +290,8 @@ pnpm audit0 start my-audit-001
 pnpm audit0 status my-audit-001
 ```
 
-`ACK3_EXPERIMENT_ID` is the config's `id`.
+`ACK3_EXPERIMENT_ID` is the config's `id`. Status reads `starting` until the run
+saves its first state, and `recentRejections` shows why the latest attempts were rejected.
 
 Use a unique run ID. After an interrupted request, inspect that ID before retrying.
 Open `/dashboard` on your service URL and check fresh activity and accepted

@@ -130,16 +130,16 @@ export async function writeAccepted(
     return
   }
   const artifacts = mode === 'research-frontier' ? acceptedResearch(request.visibleArtifacts) : request.visibleArtifacts
-  const contents = await Promise.all(artifacts.map(async record => ({ record, files: await store.read(record) })))
-  if (mode === 'research-frontier') {
-    for (const { record, files } of contents) {
+  // Keep only one hash-verified artifact's file bodies resident while mounting
+  // the frontier. Verification and reporting can consume many large artifacts.
+  for (const record of artifacts) {
+    const files = await store.read(record)
+    if (mode === 'research-frontier') {
       researchEvidencePaths(record)
       if (record.files.some(path => typeof files[path] !== 'string')) {
         throw new PermanentRunFailure(`accepted research file is missing: ${record.taskId}`, 'integrity-failed')
       }
     }
-  }
-  for (const { record, files } of contents) {
     for (const [path, content] of Object.entries(files)) {
       const destination = acceptedEvidencePath(record, path)
       await sandbox.mkdir(destination.slice(0, destination.lastIndexOf('/')), { recursive: true })

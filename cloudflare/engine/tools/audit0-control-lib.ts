@@ -80,9 +80,11 @@ export function operationLatency(field: string, providerMs: unknown, endToEndMs:
 export function summarizeStatus(payload: unknown): unknown {
   if (typeof payload !== 'object' || payload === null || !('state' in payload)) return payload
   const record = payload as { state?: unknown, workflow?: unknown }
-  if (typeof record.state !== 'object' || record.state === null) return payload
+  if (record.state === null) return { status: 'starting', workflow: record.workflow }
+  if (typeof record.state !== 'object') return payload
   const state = record.state as Record<string, unknown>
   const checkpoints = Array.isArray(state.checkpoints) ? state.checkpoints : []
+  const rejected = Array.isArray(state.rejectedAttempts) ? state.rejectedAttempts : []
   return {
     runId: state.runId,
     status: state.status,
@@ -102,6 +104,11 @@ export function summarizeStatus(payload: unknown): unknown {
     budget: state.budget,
     artifactCount: Array.isArray(state.artifacts) ? state.artifacts.length : null,
     rejectedAttemptCount: Array.isArray(state.rejectedAttempts) ? state.rejectedAttempts.length : null,
+    recentRejections: rejected.slice(-5).map(attempt => {
+      const item = attempt as Record<string, unknown>
+      return { taskId: item.taskId, attempt: item.attempt, formatRepairOrdinal: item.formatRepairOrdinal,
+        rejectedAt: item.rejectedAt, diagnostics: item.diagnostics }
+    }),
     terminalReason: state.terminalReason,
     updatedAt: state.updatedAt,
     workflow: record.workflow,

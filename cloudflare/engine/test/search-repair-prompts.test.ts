@@ -22,6 +22,12 @@ describe('complete rendered search correction prompts', () => {
     expect(prompt).toContain(handoff)
   })
 
+  it('shows researchQueries as a non-empty list, because an empty one is rejected', () => {
+    const prompt = renderTaskPrompt(input)
+    expect(prompt).toContain('"researchQueries":["..."]')
+    expect(prompt).not.toContain('"researchQueries":[]')
+  })
+
   it.each([
     [missing],
     ['leadChecks[0].researchQueries must contain at least one string'],

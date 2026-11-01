@@ -1,6 +1,19 @@
 // Created on demand by the store and emitted by tools/runtime-slot-seed.ts, which
 // bootstraps the slot pool before the front door has served a routed request.
+// Routing checks the run index, so a fresh database gets it here too.
 export const ROUTING_SCHEMA_SQL: readonly string[] = [
+  `CREATE TABLE IF NOT EXISTS experiment_runs (
+    run_id TEXT PRIMARY KEY,
+    experiment_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    state_key TEXT NOT NULL,
+    state_generation INTEGER NOT NULL,
+    checkpoint_digest TEXT,
+    updated_at TEXT NOT NULL,
+    terminal_reason TEXT
+  )`,
+  `CREATE INDEX IF NOT EXISTS experiment_runs_by_experiment_updated
+    ON experiment_runs(experiment_id, updated_at DESC)`,
   `CREATE TABLE IF NOT EXISTS run_runtime_routes (
     run_id TEXT PRIMARY KEY,
     experiment_id TEXT NOT NULL,

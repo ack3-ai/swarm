@@ -1,4 +1,5 @@
-import type { Sandbox } from '@cloudflare/sandbox'
+import type { DiscoveryPoolWaiver } from './discovery-pool-waiver.js'
+import type { AgentSandbox } from './agent-sandbox.js'
 import type { ModelClockAmendment } from './recovery-clock.js'
 import type {
   FailedWaveRecoveryEvidence, ProviderUsage, RuntimeRelease, RuntimeTransitionEvidence, TerminalCompletionRecoveryEvidence,
@@ -16,7 +17,7 @@ export interface QuarantinedRevalidation {
 }
 
 export interface AuditWorkflowPayload {
-  mode: 'start' | 'resume' | 'recover-failed-wave' | 'recover-terminal-completion'
+  mode: 'start' | 'resume' | 'recover-failed-wave' | 'recover-terminal-completion' | 'recover-discovery-waiver'
   experimentId: string
   runId: string
   releaseDigest?: string
@@ -27,6 +28,7 @@ export interface AuditWorkflowPayload {
   failedWaveRecovery?: FailedWaveRecoveryEvidence
   terminalCompletionRecovery?: TerminalCompletionRecoveryEvidence
   runtimeTransition?: RuntimeTransitionEvidence
+  discoveryPoolWaiver?: DiscoveryPoolWaiver
 }
 
 export interface RuntimeIsolationWorkflowPayload {
@@ -34,7 +36,7 @@ export interface RuntimeIsolationWorkflowPayload {
   runtimeRelease: RuntimeRelease
   holdSeconds: number
   parentCheckpointDigest?: string
-  /** Zero-model proof that keepAlive survives a period longer than sleepAfter without observer traffic. */
+  /** Zero-model proof that keep-alive survives a period longer than the inactivity timeout without observer traffic. */
   idleSurvival?: true
 }
 
@@ -65,9 +67,15 @@ export interface RuntimeFailedWaveRecoveryRequest {
     quarantineOutputDigest?: string
   }
   retainNative?: { taskId: string, requestDigest: string, snapshotDigest: string, sandboxObjectId: string }
+  repairQuarantined?: { taskId: string, requestDigest: string, outputDigest: string }
 }
 
 export interface RuntimeTerminalCompletionRecoveryRequest extends RuntimeFailedWaveRecoveryRequest {}
+
+export interface RuntimeDiscoveryWaiverRequest extends RuntimeFailedWaveRecoveryRequest {
+  poolId: string
+  requestDigest: string
+}
 
 export interface Env {
   DASHBOARD_ACCESS_ISSUER?: string
@@ -79,7 +87,7 @@ export interface Env {
   ARTIFACTS: R2Bucket
   INDEX: D1Database
   COORDINATORS: DurableObjectNamespace
-  Sandbox: DurableObjectNamespace<Sandbox>
+  AGENT_SANDBOX: DurableObjectNamespace<AgentSandbox>
   AUDIT_WORKFLOW: Workflow<AuditWorkflowPayload>
   RUNTIME_ISOLATION_WORKFLOW?: Workflow<RuntimeIsolationWorkflowPayload>
   ENGINE_ROLE?: 'front-door' | 'runtime'

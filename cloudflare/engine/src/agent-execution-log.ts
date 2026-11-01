@@ -1,3 +1,4 @@
+import { nativeQuotaWait, type NativeQuotaWait } from './native-quota-wait.js'
 import { canonicalJson, sha256 } from './canonical.js'
 
 export const agentLogChunkMaxBytes = 64 * 1024
@@ -356,6 +357,41 @@ export class R2AgentExecutionLogStore {
     }
     await this.putIndex(base, input.runId, input.requestDigest, next)
     return next
+  }
+
+  /** Freeze available logs for a fenced execution; does not claim native completion. */
+  async custodySnapshot(input: { runId: string, taskId: string, requestDigest: string }): Promise<{
+    requestDigest: string, index: AgentLogIndex, chunkDigests: string[], quotaWait: NativeQuotaWait | null
+  }> {
+    const base = prefix(input.runId, input.taskId, input.requestDigest)
+    const request = await this.getRequest(input.runId, input.taskId, input.requestDigest)
+    const index = await this.getIndex(base, input.runId, input.requestDigest)
+    if (request === null || index === null || index.chunkCount === 0) throw new Error('native log custody is missing')
+    const chunkDigests: string[] = []
+    const stdout: string[] = []
+    let eventCount = 0
+    let storedBytes = 0
+    for (let chunk = 0; chunk < index.chunkCount; chunk++) {
+      const key = `${base}chunk-${String(chunk).padStart(6, '0')}.json`
+      const checked = await this.readChunk(key, input.runId, input.requestDigest)
+      const object = await this.bucket.get(key)
+      if (object === null) throw new Error('native log custody changed')
+      const content = await object.text()
+      const digest = await sha256(content)
+      if (object.customMetadata?.objectSha256 !== digest || object.checksums.toJSON().sha256 !== digest) {
+        throw new Error('native log custody checksum differs')
+      }
+      stdout.push(...(JSON.parse(content).events as AgentLogEvent[]).filter(event => event.stream === 'stdout').map(event => event.text))
+      chunkDigests.push(digest)
+      eventCount += checked.sourceEventsConsumed
+      storedBytes += checked.storedBytes
+    }
+    if (await this.bucket.head(`${base}chunk-${String(index.chunkCount).padStart(6, '0')}.json`) !== null
+      || eventCount !== index.eventCount || storedBytes !== index.storedBytes
+      || canonicalJson(index) !== canonicalJson(await this.getIndex(base, input.runId, input.requestDigest))) {
+      throw new Error('native log custody index changed')
+    }
+    return { requestDigest: await sha256(request), index, chunkDigests, quotaWait: await nativeQuotaWait(stdout.join('')) }
   }
 
   async cursor(input: { runId: string, taskId: string, requestDigest: string }): Promise<{

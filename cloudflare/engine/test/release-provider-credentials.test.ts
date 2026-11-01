@@ -85,3 +85,16 @@ describe('sealed release credential preflight', () => {
     })).rejects.toThrow('temporarily unavailable')
   })
 })
+
+it('requires optional header bindings before admission and supports Secrets Store', async () => {
+  const selected = definition()
+  const connection = { baseUrl: 'https://model.example.com/v1', apiKeyEnv: 'PROVIDER_B_API_KEY',
+    headersEnv: { 'CF-Access-Client-Id': 'LOCAL_MODEL_HEADER_ID_API_KEY', 'CF-Access-Client-Secret': 'LOCAL_MODEL_HEADER_SECRET_API_KEY' } }
+  for (const task of selected.stages[0]!.waves[0]!.tasks) if (task.providerClass === 'additive') task.connection = connection
+  await expect(assertReleaseProviderCredentials(selected, env)).rejects.toThrow('LOCAL_MODEL_HEADER_ID_API_KEY is missing')
+  const bound = { ...env, LOCAL_MODEL_HEADER_ID_API_KEY: { get: async () => 'selected-client-id' },
+    LOCAL_MODEL_HEADER_SECRET_API_KEY: { get: async () => 'selected-client-secret' } }
+  await expect(assertReleaseProviderCredentials(selected, bound)).resolves.toBeUndefined()
+  await expect(assertReleaseProviderCredentials(selected, { ...bound, LOCAL_MODEL_HEADER_SECRET_API_KEY: '' }))
+    .rejects.toThrow('LOCAL_MODEL_HEADER_SECRET_API_KEY is missing')
+})

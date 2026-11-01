@@ -16,13 +16,13 @@ const settings = {
     { name: 'CLOUDFLARE_OBSERVABILITY_TOKEN', type: 'secrets_store_secret' },
     { name: 'ACK3_CLOUDFLARE_ACCOUNT_ID', type: 'plain_text', text: 'a'.repeat(32) },
     { name: 'VERSION_METADATA', type: 'version_metadata' },
-    { name: 'Sandbox', type: 'durable_object_namespace', class_name: 'Sandbox', namespace_id: 'native-namespace' },
+    { name: 'AGENT_SANDBOX', type: 'durable_object_namespace', class_name: 'AgentSandbox', namespace_id: 'native-namespace' },
     { name: 'AUDIT_WORKFLOW', type: 'workflow' },
     { name: 'RUNTIME_ISOLATION_WORKFLOW', type: 'workflow' },
   ],
 }
 
-const containers = [{ class_name: 'Sandbox', name: 'native-runtime-sandbox', image: 'retained-native-image' }]
+const containers = [{ class_name: 'AgentSandbox', name: 'native-runtime-sandbox', image: 'retained-native-image' }]
 
 async function multipart() {
   const form = new FormData()
@@ -30,7 +30,7 @@ async function multipart() {
     compatibility_date: settings.compatibility_date,
     compatibility_flags: settings.compatibility_flags,
     bindings: [{ name: 'RUNTIME_RELEASE_JSON', type: 'plain_text', text: 'stale' }],
-    containers: [{ class_name: 'Sandbox', name: 'stale-build-container' }] }))
+    containers: [{ class_name: 'AgentSandbox', name: 'stale-build-container' }] }))
   form.set('worker.js', new Blob(['export default { fetch() { return new Response("ok") } }'],
     { type: 'application/javascript' }), 'worker.js')
   const request = new Request('https://example.invalid', { method: 'POST', body: form })
@@ -45,7 +45,7 @@ test('runtime script upload retains module and strips stale dry-run bindings', a
     ...uploadSettings, main_module: 'worker.js', containers,
     bindings: settings.bindings.map(({ namespace_id, ...binding }) => binding),
   })
-  assert.equal(settings.bindings.find(binding => binding.name === 'Sandbox').namespace_id, 'native-namespace')
+  assert.equal(settings.bindings.find(binding => binding.name === 'AGENT_SANDBOX').namespace_id, 'native-namespace')
 })
 
 test('runtime script upload refuses missing engine secret custody', async () => {
@@ -83,9 +83,9 @@ test('preserves all supplied native container metadata instead of stale local me
   assert.deepEqual(JSON.parse(output.get('metadata')).containers, native)
 })
 
-test('missing or ambiguous native Sandbox metadata prevents publication', async () => {
+test('missing or ambiguous native agent sandbox metadata prevents publication', async () => {
   for (const missing of [undefined, null, [], [{ class_name: 'OtherContainer' }], [...containers, ...containers]]) {
-    await assert.rejects(runtimeCodeUploadForm(await multipart(), settings, missing), /native Sandbox container metadata/)
+    await assert.rejects(runtimeCodeUploadForm(await multipart(), settings, missing), /native agent sandbox container metadata/)
   }
 })
 
@@ -99,6 +99,6 @@ test('normalizes only Durable Object namespace IDs and omits absent optional set
   const output = await runtimeCodeUploadForm(await multipart(), minimal, containers)
   const metadata = JSON.parse(output.get('metadata'))
   assert.equal('observability' in metadata, false)
-  assert.equal('namespace_id' in metadata.bindings.find(binding => binding.name === 'Sandbox'), false)
+  assert.equal('namespace_id' in metadata.bindings.find(binding => binding.name === 'AGENT_SANDBOX'), false)
   assert.equal(metadata.bindings.find(binding => binding.name === 'OTHER').namespace_id, 'retained')
 })

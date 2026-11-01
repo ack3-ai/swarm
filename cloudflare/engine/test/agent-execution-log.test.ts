@@ -200,3 +200,21 @@ describe('private agent execution logs', () => {
     expect(parseLocalAgentLog(completeLine + partial, true)).toMatchObject({ truncated: true })
   })
 })
+
+
+describe('fenced native log snapshots', () => {
+  it('hashes all captured chunks without promoting incomplete logs to a terminal receipt', async () => {
+    const bucket = new FakeR2(), store = new R2AgentExecutionLogStore(bucket as unknown as R2Bucket)
+    await store.putRequest(await request())
+    await store.sync({ runId, taskId, requestDigest,
+      source: line('2026-09-26T12:00:01Z', 'stdout', 'subscription wait'), sourceOffset: 0, complete: false })
+    const before = JSON.stringify([...bucket.objects])
+    const custody = await store.custodySnapshot({ runId, taskId, requestDigest })
+    expect(custody.index.complete).toBe(false)
+    expect(custody.chunkDigests).toHaveLength(1)
+    expect(custody.requestDigest).toBe(await sha256(await request()))
+    expect(JSON.stringify([...bucket.objects])).toBe(before)
+    bucket.objects.get(`${base}chunk-000000.json`)!.content += 'corruption'
+    await expect(store.custodySnapshot({ runId, taskId, requestDigest })).rejects.toThrow()
+  })
+})

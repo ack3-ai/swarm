@@ -420,7 +420,14 @@ describe('structured model submissions', () => {
         rationale: 'A focused negative control rules out this distinct hypothesis.',
       }] }),
     }, [])
-    expect(missing.issues).toContain('submission.observations[0] must contain exactly: disposition, id, rationale, reference, referenceEvidence')
+    expect(missing.issues).toContain('submission.observations[0] must contain exactly: disposition, id, rationale, reference, referenceEvidence; missing: reference, referenceEvidence')
+    const renamed = await readSubmission(definition, {
+      [SUBMISSION_PATH]: JSON.stringify({ complete: true, observations: [{
+        id: 'ARCH-OBS-2', disposition: 'refuted', reference: 'none', referenceEvidence: null,
+        reason: 'A focused negative control rules out this distinct hypothesis.',
+      }] }),
+    }, [])
+    expect(renamed.issues).toContain('submission.observations[0] must contain exactly: disposition, id, rationale, reference, referenceEvidence; missing: rationale; unexpected: reason')
     const prompt = renderTaskPrompt({ definition: audit0Definition, task: definition,
       visibleArtifacts: [], deadline: '2026-10-02T00:00:00.000Z' })
     expect(prompt).toContain(instruction(audit0Definition, 'coverageReferences', { OBSERVATION_PREFIX: definition.observationPrefix! }))
@@ -506,6 +513,16 @@ describe('structured model submissions', () => {
     expect(parsed.protocol.reviewInputDigest).toBe(packet.inputSha256)
     expect(parsed.protocol.reviewDecisions).toHaveLength(2)
     expect(parsed.protocol.dispositionReferences).toEqual(['C-1'])
+
+    // Reviewers that cite no searches may send an empty list; a blank citation is still invalid.
+    const cited = (researchQueries: string[]) => readSubmission(definition, {
+      [SUBMISSION_PATH]: JSON.stringify({ complete: true, decisions: decisions.map(decision => ({ ...decision, researchQueries })) }),
+    }, frontier)
+    const none = await cited([])
+    expect(none.issues).toEqual([])
+    expect(none.protocol).toEqual(parsed.protocol)
+    expect((await cited([' '])).issues)
+      .toContain('submission.decisions[0].researchQueries must be a non-empty array of non-empty strings')
   })
 
   it('requires one verification outcome per frozen identifier without parsing narrative layouts', async () => {

@@ -6,9 +6,13 @@ import harnessLock from '../container/harness/package-lock.json'
 import harnessPackage from '../container/harness/package.json'
 
 describe('container image', () => {
-  it('builds from the pinned Sandbox image alone', () => {
-    expect(dockerfile.match(/^ARG SANDBOX_VERSION=.+$/gm)).toHaveLength(1)
-    expect(dockerfile.match(/^FROM .+$/gm)).toEqual(['FROM docker.io/cloudflare/sandbox:${SANDBOX_VERSION}'])
+  it('builds on Ubuntu and Node without a Cloudflare base image', () => {
+    expect(dockerfile.match(/^FROM .+$/gm)).toEqual([
+      'FROM docker.io/library/node:${NODE_VERSION}-slim AS node-runtime',
+      'FROM docker.io/library/ubuntu:22.04',
+    ])
+    expect(dockerfile).not.toContain('cloudflare/sandbox')
+    expect(dockerfile).toMatch(/^CMD \["sleep", "infinity"\]$/m)
     expect(dockerfile).not.toMatch(/wake/i)
   })
 
@@ -21,7 +25,7 @@ describe('container image', () => {
       '@deepseek-ai/dsh-headless': '0.2.1-rc.2',
       '@deepseek-ai/dsh-web-search-exa': '0.2.1-rc.2',
       '@deepseek-ai/dsh-llm-pi-ai': '0.2.1-rc.2',
-      '@openai/codex': '0.152.1',
+      '@openai/codex': '0.165.0',
     }
     expect(harnessPackage.dependencies).toEqual(exact)
     const lockedPackages = harnessLock.packages as Record<string, { version?: string }>

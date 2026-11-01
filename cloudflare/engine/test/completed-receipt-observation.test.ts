@@ -1,7 +1,7 @@
 import { expect, it, vi } from 'vitest'
 import { SandboxAgentProvider } from '../src/sandbox-provider.js'
 
-vi.mock('@cloudflare/sandbox', () => ({ getSandbox: vi.fn() }))
+vi.mock('../src/agent-sandbox-client.js', () => ({ getAgentSandbox: vi.fn() }))
 vi.mock('../src/agent-process.js', () => ({
   agentProcessId: (digest: string) => `agent-${digest.slice(0, 40)}`,
   waitForAgentProcess: async () => 0,

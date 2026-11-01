@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+import { stripTypeScriptTypes } from 'node:module'
 import { describe, expect, it } from 'vitest'
 import { audit0Request, operationLatency, summarizeStatus } from '../tools/audit0-control-lib.js'
 
@@ -51,5 +53,36 @@ describe('audit0 operator control', () => {
       },
       workflow: { status: 'complete' },
     })).toMatchObject({ runId: 'parent', artifactCount: 1, rejectedAttemptCount: 0, checkpoints: [{ digest: 'a'.repeat(64) }] })
+  })
+
+  it('prints why the latest attempts were rejected', () => {
+    const rejectedAttempts = Array.from({ length: 7 }, (_, index) => ({
+      stageId: 'negative-review', waveId: 'w', taskId: `review-${index}`, attempt: 1, formatRepairOrdinal: 1,
+      promptDigest: 'p', diagnostics: [`diagnostic ${index}`], rejectedAt: 'now', usage: { large: 'omitted' },
+    }))
+    const summary = summarizeStatus({ state: { runId: 'run', rejectedAttempts }, workflow: null }) as {
+      rejectedAttemptCount: number, recentRejections: unknown[]
+    }
+    expect(summary.rejectedAttemptCount).toBe(7)
+    expect(summary.recentRejections).toEqual([2, 3, 4, 5, 6].map(index => ({ taskId: `review-${index}`,
+      attempt: 1, formatRepairOrdinal: 1, rejectedAt: 'now', diagnostics: [`diagnostic ${index}`] })))
+  })
+
+  it('reports a run as starting until its Workflow saves the first state', async () => {
+    const source = readFileSync(new URL('../src/runtime-service.ts', import.meta.url), 'utf8')
+    const start = source.indexOf('async function auditRunStatus(')
+    const end = source.indexOf('async function auditWorkflowStatus(', start)
+    expect(start).toBeGreaterThan(-1)
+    expect(end).toBeGreaterThan(start)
+    const auditRunStatus = new Function('assertStoredRunOwner', 'CloudflareRunStore', 'response',
+      `${stripTypeScriptTypes(source.slice(start, end))}; return auditRunStatus;`,
+    )(
+      async () => undefined,
+      class { async getStateIfPresent() { return null } },
+      (_env: unknown, value: unknown) => value,
+    ) as (runId: string, env: unknown) => Promise<unknown>
+    const body = await auditRunStatus('fresh-run', { AUDIT_WORKFLOW: { get: async () => ({ status: async () => ({ status: 'running' }) }) } })
+    expect(body).toEqual({ state: null, workflow: { status: 'running' } })
+    expect(summarizeStatus(body)).toEqual({ status: 'starting', workflow: { status: 'running' } })
   })
 })

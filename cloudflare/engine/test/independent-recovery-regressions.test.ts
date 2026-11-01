@@ -1,10 +1,11 @@
 import { compileExperimentConfig } from './support/compile-config.js'
-import { AgentAttemptFailure, AgentExecutionPending } from '../src/run-errors.js'
+import { AgentAttemptFailure, AgentExecutionPending, PermanentRunFailure } from '../src/run-errors.js'
 import { prepareFailedWaveRecovery } from '../src/failed-wave-recovery.js'
+import { terminalReceiptMismatchTask } from '../src/machine.js'
 import { sha256 } from '../src/canonical.js'
 import document from './fixtures/audit0-hello-vault.json' with { type: 'json' }
-import { expect, it } from 'vitest'
-import type { AgentRequest, AgentResult } from '../src/contracts.js'
+import { expect, it, vi } from 'vitest'
+import type { AgentRequest, AgentResult, RunState } from '../src/contracts.js'
 import {
   advanceExperimentOneWave, RunMachine, sealReleasePackage,
 } from '../src/index.js'
@@ -86,8 +87,10 @@ const runtime = {
 const targetRuntime = { ...runtime, id: 'runtime-review-target', frameworkCommit: 'b'.repeat(40),
   workerService: 'swarm-runtime-review-target', workerVersionId: '22222222-2222-4222-8222-222222222222',
   workflowName: 'audit-runtime-review-target' }
-async function recoveryFixture(id: string) {
-  const body = compileExperimentConfig(manifest([{ ...luna, agents: 1 }, deepseek], 5))
+async function recoveryFixture(id: string, maxWaves = 5, discoveryMinutes?: number) {
+  const config = manifest([{ ...luna, agents: 1 }, deepseek], maxWaves)
+  if (discoveryMinutes !== undefined) config.limits.maxDiscoveryRuntimeMs = discoveryMinutes * 60_000
+  const body = compileExperimentConfig(config)
   const release = await sealReleasePackage(body)
   const machine = await RunMachine.create(body.definition, release.digest, id, new Date().toISOString(), runtime)
   const store = new MemoryArtifactStore(), base = new DeterministicAuditProvider()
@@ -189,4 +192,123 @@ it.each([
   invalid.body.waveReceipts.find(receipt => receipt.poolId === 'deepseek')!.budgetAtAdmission![metric] = cap
   invalid.digest = await sha256(invalid.body)
   await expect(RunMachine.resume(body.definition, invalid, 'review-budget-invalid')).rejects.toThrow('admitted after a measured budget limit')
+})
+
+
+async function receiptMismatchFixture(maxWaves = 1, discoveryMinutes?: number) {
+  const fixture = await recoveryFixture('terminal-receipt-source', maxWaves, discoveryMinutes)
+  const { body, machine, store, base } = fixture
+  let failure: unknown
+  for (let tick = 0; tick < 5 && failure === undefined; tick++) {
+    try {
+      await advanceExperimentOneWave({ definition: body.definition, machine, artifactStore: store, provider: {
+        async run(request) {
+          if (configuredResearchTaskPoolId(request.task) === 'luna') {
+            throw new PermanentRunFailure('agent result receipt does not match the exact request', 'integrity-failed')
+          }
+          return base.run(request)
+        },
+      } })
+    } catch (error) { failure = error }
+  }
+  expect(failure).toBeInstanceOf(Error)
+  await machine.fail((failure as Error).message)
+  return fixture
+}
+
+it('recovers only the missing receipt-mismatch task and retains accepted work and unknown usage', async () => {
+  const { body, machine, store, base } = await receiptMismatchFixture()
+  const { prepared, source, checkpoint } = await preparedRecovery(body, machine, store)
+  expect(source.rejectedAttempts).toHaveLength(1)
+  expect(prepared.evidence.unknownUsageAttemptCount).toBe(1)
+  const child = await RunMachine.recoverFailedWave(body.definition, checkpoint, source, 'terminal-receipt-child',
+    prepared.importedArtifacts, prepared.inheritedRejectedAttempts, prepared.evidence)
+  expect(child.snapshot().artifacts).toEqual(source.artifacts)
+  expect(child.snapshot().budget).toEqual(source.budget)
+  expect(child.snapshot().modelStartedAt).toEqual(source.modelStartedAt)
+  expect(child.snapshot().rejectedAttempts).toEqual(source.rejectedAttempts)
+  const called: string[] = []
+  await advanceExperimentOneWave({ definition: body.definition, machine: child, artifactStore: store, provider: {
+    async run(request) { called.push(request.task.id); return base.run(request) },
+  } })
+  expect(called).toEqual([source.rejectedAttempts[0]!.taskId])
+  for (const artifact of source.artifacts) {
+    expect(child.snapshot().artifacts.find(value => value.id === artifact.id)).toEqual(artifact)
+  }
+  expect(machine.snapshot()).toEqual(source)
+})
+
+it('revalidates accepted bytes and exact source/checkpoint binding for receipt-mismatch recovery', async () => {
+  const { body, machine, store } = await receiptMismatchFixture()
+  const { prepared, source, checkpoint } = await preparedRecovery(body, machine, store)
+  const input = { definition: body.definition, source, checkpoint,
+    sourceStateGeneration: source.stateGeneration, sourceStateDigest: await sha256(source),
+    targetRuntimeRelease: targetRuntime, artifacts: { async read(record: any) {
+      return JSON.parse(store.contents.get(record.uri)!)
+    } } }
+  await expect(prepareFailedWaveRecovery({ ...input, sourceStateDigest: '0'.repeat(64) })).rejects.toThrow()
+  await expect(prepareFailedWaveRecovery({ ...input, checkpoint: { ...checkpoint, digest: '0'.repeat(64) } })).rejects.toThrow()
+  await expect(prepareFailedWaveRecovery({ ...input, artifacts: { async read() { return {} } } })).rejects.toThrow()
+  await expect(RunMachine.recoverFailedWave(body.definition, checkpoint, source, 'bad-receipt-child',
+    prepared.importedArtifacts, prepared.inheritedRejectedAttempts,
+    { ...prepared.evidence, unknownUsageAttemptCount: 0 })).rejects.toThrow('evidence differs')
+})
+
+const receiptMismatchMutations: [string, (state: RunState) => void][] = [
+  ['other integrity error', state => { state.terminalReason = 'different integrity failure' }],
+  ['wrong failure category', state => { (state.journal.find(event => event.type === 'task.failed')!.payload as any).category = 'transport' }],
+  ['retryable failure', state => { (state.journal.find(event => event.type === 'task.failed')!.payload as any).retryable = true }],
+  ['missing rejection journal', state => { state.journal = state.journal.filter(event => event.type !== 'task.attempt-rejected') }],
+  ['changed rejection journal', state => { const event = state.journal.find(event => event.type === 'task.attempt-rejected')!; event.payload = { ...(event.payload as any), promptDigest: '0'.repeat(64) } }],
+  ['accepted output', state => { state.rejectedAttempts[0]!.outputDigest = 'a'.repeat(64) }],
+  ['quarantined output', state => { state.rejectedAttempts[0]!.quarantineUri = 'memory://quarantine' }],
+  ['retained session', state => { state.rejectedAttempts[0]!.sessionId = 'retained-session' }],
+  ['recorded usage', state => { state.rejectedAttempts[0]!.usage.modelCalls = 1 }],
+  ['multiple attempts', state => { state.rejectedAttempts = [...state.rejectedAttempts, { ...state.rejectedAttempts[0]!, attempt: 2 }] }],
+  ['recovery child', state => { state.parentRunId = 'earlier-source'; state.recoveryEpoch = 1 }],
+  ['in-flight work', state => { state.inFlightAgentAttempts = [{ taskId: 'still-running' } as any] }],
+]
+
+it.each(receiptMismatchMutations)('rejects %s in both preparation and reconstruction', async (_label, mutate) => {
+  const { body, machine, store } = await receiptMismatchFixture()
+  const { prepared, source, checkpoint } = await preparedRecovery(body, machine, store)
+  const invalid = structuredClone(source)
+  mutate(invalid)
+  const task = body.definition.stages.flatMap(stage => stage.waves.flatMap(wave => wave.tasks))
+    .find(task => task.id === source.rejectedAttempts[0]!.taskId)!
+  expect(terminalReceiptMismatchTask(invalid, task, invalid.rejectedAttempts)).toBe(false)
+  const digest = await sha256(invalid)
+  await expect(prepareFailedWaveRecovery({ definition: body.definition, checkpoint, source: invalid,
+    sourceStateGeneration: invalid.stateGeneration, sourceStateDigest: digest, targetRuntimeRelease: targetRuntime,
+    artifacts: { async read(record) { return JSON.parse(store.contents.get(record.uri)!) } },
+  })).rejects.toThrow()
+  await expect(RunMachine.recoverFailedWave(body.definition, checkpoint, invalid, 'invalid-receipt-child',
+    prepared.importedArtifacts, prepared.inheritedRejectedAttempts,
+    { ...prepared.evidence, sourceStateDigest: digest })).rejects.toThrow()
+})
+
+
+it('drains the sole recovered task after the original discovery deadline then advances to synthesis', async () => {
+  vi.useFakeTimers({ toFake: ['Date'] })
+  try {
+    vi.setSystemTime(new Date('2030-01-01T09:00:00Z'))
+    const { body, machine, store, base } = await receiptMismatchFixture(50, 300)
+    vi.setSystemTime(new Date('2030-01-01T15:00:00Z'))
+    const { prepared, source, checkpoint } = await preparedRecovery(body, machine, store)
+    const child = await RunMachine.recoverFailedWave(body.definition, checkpoint, source, 'expired-receipt-child',
+      prepared.importedArtifacts, prepared.inheritedRejectedAttempts, prepared.evidence)
+    expect(child.snapshot().modelStartedAt).toBe(source.modelStartedAt)
+    expect(prepared.evidence.unknownUsageAttemptCount).toBe(1)
+    const called: string[] = []
+    await advanceExperimentOneWave({ definition: body.definition, machine: child, artifactStore: store, provider: {
+      async run(request) { called.push(request.task.id); return base.run(request) },
+    } })
+    expect(called).toEqual([source.rejectedAttempts[0]!.taskId])
+    expect(body.definition.stages[child.snapshot().cursor.stageIndex]!.kind).toBe('synthesis')
+    expect(child.snapshot().stageEndReceipts.at(-1)!.reason).toBe('phase-deadline')
+    expect(child.snapshot().modelStartedAt).toBe(source.modelStartedAt)
+    for (const artifact of source.artifacts) {
+      expect(child.snapshot().artifacts.find(value => value.id === artifact.id)).toEqual(artifact)
+    }
+  } finally { vi.useRealTimers() }
 })

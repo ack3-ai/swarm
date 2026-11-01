@@ -19,6 +19,7 @@ afterEach(() => {
 function environment(runtimeWorkersFile: string, extra: Record<string, string> = {}) {
   return {
     ...process.env,
+    ACK3_RESOURCE_PREFIX: 'swarm',
     ACK3_D1_DATABASE_ID: '11111111-1111-4111-8111-111111111111',
     ACK3_CLOUDFLARE_ACCOUNT_ID: 'e'.repeat(32),
     ACK3_BUILD_COMMIT_SHA: 'a'.repeat(40),
@@ -33,7 +34,7 @@ function environment(runtimeWorkersFile: string, extra: Record<string, string> =
 }
 
 describe('runtime release deployment config', () => {
-  it('renders one private runtime with its own Workflow and Sandbox namespace', () => {
+  it('renders one private runtime with its own Workflow and agent sandbox namespace', () => {
     const root = mkdtempSync(join(tmpdir(), 'ack3-runtime-config-'))
     roots.push(root)
     const declaration = {
@@ -66,25 +67,29 @@ describe('runtime release deployment config', () => {
       preview_urls: false,
       vars: { ENGINE_ROLE: 'runtime', ACK3_CLOUDFLARE_ACCOUNT_ID: 'e'.repeat(32) },
       version_metadata: { binding: 'VERSION_METADATA' },
-      durable_objects: { bindings: [{ name: 'Sandbox', class_name: 'Sandbox' }] },
+      durable_objects: { bindings: [{ name: 'AGENT_SANDBOX', class_name: 'AgentSandbox' }] },
     })
+    expect(config.migrations).toEqual([
+      { tag: 'v1', new_sqlite_classes: ['Sandbox'] },
+      { tag: 'v2', new_sqlite_classes: ['AgentSandbox'] },
+    ])
     expect(config.durable_objects.bindings).toHaveLength(1)
     expect(config.secrets.required).toEqual([])
     expect(config.r2_buckets).toEqual([
-      { binding: 'PACKAGES', bucket_name: 'ack3-experiment-packages' },
-      { binding: 'ARTIFACTS', bucket_name: 'ack3-experiment-artifacts' },
+      { binding: 'PACKAGES', bucket_name: 'swarm-experiment-packages' },
+      { binding: 'ARTIFACTS', bucket_name: 'swarm-experiment-artifacts' },
     ])
+    expect(config.d1_databases[0]).toMatchObject({ binding: 'INDEX', database_name: 'swarm-experiment-index' })
     expect(config.secrets_store_secrets).toContainEqual({ binding: 'CODEX_TEAM_AUTH_JSON', store_id: 'c'.repeat(32), secret_name: 'swarm-codex-team' })
     expect(config.secrets_store_secrets).toContainEqual({ binding: 'PROVIDER_API_KEY', store_id: 'c'.repeat(32), secret_name: 'swarm-provider-api-key' })
     expect(config.routes).toBeUndefined()
-    expect(config.containers).toHaveLength(1)
-    expect(config.containers[0].instance_type.memory_mib).toBe(8_192)
-    expect(config.containers[0].max_instances).toBe(4)
-    expect(config.containers[0].constraints).toBeUndefined()
     expect(config.vars.LOCATION_HINT).toBeUndefined()
-    expect(config.containers[0].image).toBe(
-      `registry.cloudflare.com/${'e'.repeat(32)}/swarm-sandbox@sha256:${'b'.repeat(64)}`,
-    )
+    expect(config.containers).toEqual([{
+      name: 'swarm-runtime-a-agent-sandbox',
+      class_name: 'AgentSandbox',
+      scheduling_policy: 'durable_object',
+      images: { sandbox: { image: `registry.cloudflare.com/${'e'.repeat(32)}/swarm-sandbox@sha256:${'b'.repeat(64)}` } },
+    }])
     expect(config.workflows).toEqual([
       { binding: 'AUDIT_WORKFLOW', name: 'ack3-audit-workflow-a', class_name: 'AuditWorkflow' },
       {
@@ -119,7 +124,7 @@ describe('runtime release deployment config', () => {
     expect(configB.workflows).not.toEqual(config.workflows)
   })
 
-  it('applies optional data jurisdiction, placement and container capacity', () => {
+  it('applies the storage name prefix, optional data jurisdiction and placement, and refuses container capacity and regions', () => {
     const root = mkdtempSync(join(tmpdir(), 'ack3-runtime-options-'))
     roots.push(root)
     const declarationPath = join(root, 'runtime.json')
@@ -130,17 +135,21 @@ describe('runtime release deployment config', () => {
       containerImageDigest: `sha256:${'b'.repeat(64)}`,
     }))
     writeFileSync(workersPath, JSON.stringify({ 'runtime-a': 'swarm-runtime-a' }))
-    const options = { ACK3_DATA_JURISDICTION: 'fedramp', ACK3_LOCATION_HINT: 'enam',
-      ACK3_CONTAINER_REGIONS: 'ENAM,WNAM', ACK3_CONTAINER_MAX_INSTANCES: '12' }
+    const options = { ACK3_RESOURCE_PREFIX: 'ack3', ACK3_DATA_JURISDICTION: 'fedramp', ACK3_LOCATION_HINT: 'enam' }
     execFileSync('node', ['tools/render-runtime-config.mjs', declarationPath], {
       cwd: engine, env: environment(workersPath, options), stdio: 'pipe',
     })
     const config = JSON.parse(readFileSync(runtimeOutput, 'utf8'))
-    expect(config.r2_buckets.map((bucket: { jurisdiction?: string }) => bucket.jurisdiction)).toEqual(['fedramp', 'fedramp'])
-    expect(config.containers[0]).toMatchObject({ max_instances: 12, constraints: { regions: ['ENAM', 'WNAM'], jurisdiction: 'fedramp' } })
+    expect(config.r2_buckets).toEqual([
+      { binding: 'PACKAGES', bucket_name: 'ack3-experiment-packages', jurisdiction: 'fedramp' },
+      { binding: 'ARTIFACTS', bucket_name: 'ack3-experiment-artifacts', jurisdiction: 'fedramp' },
+    ])
+    expect(config.d1_databases[0].database_name).toBe('ack3-experiment-index')
+    expect(config.containers[0].constraints).toBeUndefined()
     expect(config.vars.LOCATION_HINT).toBe('enam')
-    for (const invalid of [{ ACK3_DATA_JURISDICTION: 'us' }, { ACK3_LOCATION_HINT: 'mars' },
-      { ACK3_CONTAINER_REGIONS: 'enam' }, { ACK3_CONTAINER_REGIONS: 'MARS' }, { ACK3_CONTAINER_MAX_INSTANCES: '0' }]) {
+    for (const invalid of [{ ACK3_RESOURCE_PREFIX: '' }, { ACK3_RESOURCE_PREFIX: 'ACK3' },
+      { ACK3_DATA_JURISDICTION: 'us' }, { ACK3_LOCATION_HINT: 'mars' },
+      { ACK3_CONTAINER_REGIONS: 'ENAM' }, { ACK3_CONTAINER_MAX_INSTANCES: '4' }]) {
       expect(() => execFileSync('node', ['tools/render-runtime-config.mjs', declarationPath], {
         cwd: engine, env: environment(workersPath, invalid), stdio: 'pipe',
       })).toThrow()

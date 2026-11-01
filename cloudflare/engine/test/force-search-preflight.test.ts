@@ -2,7 +2,7 @@ import { expect, it, vi } from 'vitest'
 import { SandboxAgentProvider } from '../src/sandbox-provider.js'
 import { PermanentRunFailure } from '../src/run-errors.js'
 
-vi.mock('@cloudflare/sandbox', () => ({ getSandbox: vi.fn() }))
+vi.mock('../src/agent-sandbox-client.js', () => ({ getAgentSandbox: vi.fn() }))
 
 const request = { releaseDigest: 'synthetic-release', runId: 'synthetic-run' } as any
 const definition = (searchConnection?: unknown) => ({

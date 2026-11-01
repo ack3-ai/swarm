@@ -18,6 +18,22 @@ variable "service_hostname" {
   }
 }
 
+variable "resource_prefix" {
+  description = "Prefix of the storage bucket and database names, such as swarm. It cannot change after the first apply."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9-]{0,29}$", var.resource_prefix))
+    error_message = "Use 1 to 30 lowercase letters, digits or hyphens."
+  }
+}
+
+variable "secrets_store_name" {
+  description = "Name of the account's Secrets Store. Cloudflare allows one per account; to adopt an existing store, use its name and import it."
+  type        = string
+  default     = "swarm"
+}
+
 variable "dashboard_email_domains" {
   description = "Email domains allowed to sign in to the dashboard."
   type        = list(string)

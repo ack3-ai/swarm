@@ -1,4 +1,4 @@
-import type { ISandbox } from '@cloudflare/sandbox'
+import type { SandboxProcess } from './agent-sandbox-client.js'
 
 export function agentProcessId(requestDigest: string): string {
   if (!/^[0-9a-f]{64}$/.test(requestDigest)) throw new TypeError('agent request digest is invalid')
@@ -12,7 +12,7 @@ function retryableStatusProbe(error: unknown, processId: string): boolean {
 }
 
 export async function waitForAgentProcess(
-  process: Pick<Awaited<ReturnType<ISandbox['startProcess']>>, 'id' | 'getStatus'>,
+  process: SandboxProcess,
   timeoutMs: number,
   pollIntervalMs = 1_000,
   observation?: { intervalMs: number, observe: () => Promise<void>, immediate?: boolean,
@@ -39,7 +39,7 @@ export async function waitForAgentProcess(
       observation?.onStatusProbe?.('success')
       const status = statusProbe.value
       if (status === 'completed') return 0
-      if (status === 'failed' || status === 'killed' || status === 'error') return 1
+      if (status === 'failed' || status === 'error') return 1
       observedRunning = true
     } catch (error) {
       // waitForExit() holds an RPC log stream open for the full model call and

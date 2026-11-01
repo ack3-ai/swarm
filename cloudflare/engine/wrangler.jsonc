@@ -33,17 +33,17 @@
   "r2_buckets": [
     {
       "binding": "PACKAGES",
-      "bucket_name": "ack3-experiment-packages"
+      "bucket_name": "swarm-experiment-packages"
     },
     {
       "binding": "ARTIFACTS",
-      "bucket_name": "ack3-experiment-artifacts"
+      "bucket_name": "swarm-experiment-artifacts"
     }
   ],
   "d1_databases": [
     {
       "binding": "INDEX",
-      "database_name": "ack3-experiment-index",
+      "database_name": "swarm-experiment-index",
       "database_id": "set-by-terraform-output"
     }
   ],
@@ -54,33 +54,35 @@
         "class_name": "ExperimentCoordinator"
       },
       {
-        "name": "Sandbox",
-        "class_name": "Sandbox"
+        "name": "AGENT_SANDBOX",
+        "class_name": "AgentSandbox"
       }
     ]
   },
   "containers": [
     {
-      "class_name": "Sandbox",
-      "image": "./Dockerfile",
-      "instance_type": {
-        "vcpu": 1,
-        "memory_mib": 8192,
-        "disk_mb": 6000
-      },
-      "max_instances": 4
+      "name": "swarm-agent-sandbox",
+      "class_name": "AgentSandbox",
+      "scheduling_policy": "durable_object",
+      "images": {
+        "sandbox": { "dockerfile": "./Dockerfile" }
+      }
     }
   ],
   "migrations": [
     {
       "tag": "v1",
       "new_sqlite_classes": ["ExperimentCoordinator", "Sandbox"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["AgentSandbox"]
     }
   ],
   "workflows": [
     {
       "binding": "AUDIT_WORKFLOW",
-      "name": "ack3-audit-workflow",
+      "name": "swarm-audit-workflow",
       "class_name": "AuditWorkflow"
     }
   ]

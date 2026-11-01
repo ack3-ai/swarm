@@ -68,14 +68,25 @@ config.secrets_store_secrets = [...engineBindings, ...Object.entries(runtimeBind
 config.secrets.required = []
 config.version_metadata = { binding: 'VERSION_METADATA' }
 config.durable_objects = {
-  bindings: [{ name: 'Sandbox', class_name: 'Sandbox' }],
+  bindings: [{ name: 'AGENT_SANDBOX', class_name: 'AgentSandbox' }],
 }
-config.migrations = [{ tag: 'v1', new_sqlite_classes: ['Sandbox'] }]
+// v1 declared Sandbox SDK 0.12's class, which stays exported as an empty class.
+config.migrations = [
+  { tag: 'v1', new_sqlite_classes: ['Sandbox'] },
+  { tag: 'v2', new_sqlite_classes: ['AgentSandbox'] },
+]
 if (!Array.isArray(config.containers) || config.containers.length !== 1
-  || config.containers[0]?.class_name !== 'Sandbox') {
-  throw new Error('base Sandbox container configuration is invalid')
+  || config.containers[0]?.class_name !== 'AgentSandbox'
+  || config.containers[0]?.scheduling_policy !== 'durable_object') {
+  throw new Error('base agent sandbox container configuration is invalid')
 }
-config.containers[0].image = `registry.cloudflare.com/${accountId}/swarm-sandbox@${declaration.containerImageDigest}`
+// A new container application name: one created under Sandbox SDK 0.12 cannot
+// change its scheduling policy.
+config.containers[0] = {
+  ...config.containers[0],
+  name: `${declaration.workerService}-agent-sandbox`,
+  images: { sandbox: { image: `registry.cloudflare.com/${accountId}/swarm-sandbox@${declaration.containerImageDigest}` } },
+}
 config.workflows = [
   { binding: 'AUDIT_WORKFLOW', name: declaration.workflowName, class_name: 'AuditWorkflow' },
   {

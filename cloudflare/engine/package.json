@@ -24,7 +24,6 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@cloudflare/sandbox": "0.12.9",
     "jose": "6.2.12",
     "markdown-it": "15.0.2"
   },

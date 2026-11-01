@@ -1,4 +1,4 @@
-import type { ISandbox } from '@cloudflare/sandbox'
+import type { SandboxClient } from './agent-sandbox-client.js'
 import type { AgentRequest } from './contracts.js'
 import { canonicalJson } from './canonical.js'
 import { resolveCredentialBinding } from './release-provider-credentials.js'
@@ -108,7 +108,7 @@ export async function captureContainerResourceSnapshot(sandbox: DiagnosticSandbo
 }
 
 export async function annotateContainerResourceFailure(
-  sandbox: ISandbox,
+  sandbox: SandboxClient,
   request: AgentRequest,
   error: unknown,
 ): Promise<unknown> {

@@ -76,6 +76,8 @@ export interface TaskDefinition {
   /** Secrets Store binding selected for a native subscription account. */
   credentialSource?: string
   model: string
+  /** Native Codex program selected by the originating pool. */
+  cyberAccessProgram?: string
   reasoning: ReasoningEffort
   thinking?: ThinkingMode
   /** Optional only so releases sealed before subagent controls remain replayable. */
@@ -200,6 +202,8 @@ export interface ModelPool {
   /** Native DSH Chat Completions connection; absent in historical packages. */
   connection?: ModelConnection
   model: string
+  /** Native Codex program; absent for ordinary model execution. */
+  cyberAccessProgram?: string
   /** Optional only so immutable releases sealed before per-pool controls remain replayable. */
   reasoningEffort?: ReasoningEffort
   /** Optional only so immutable releases sealed before per-pool controls remain replayable. */
@@ -218,6 +222,10 @@ export interface ModelPool {
 export interface ModelConnection {
   baseUrl: string
   apiKeyEnv: string
+  /** Optional HTTP header values resolved from API-key environment bindings. */
+  headersEnv?: Record<string, string>
+  /** Treat a 429 with Retry-After as a resetting usage window: DSH waits for it instead of failing. */
+  usageWindowWait?: boolean
   contextWindow?: number
   maxTokens?: number
   /** Optional operator-supplied estimate for this sealed connection and pool model. */
@@ -301,6 +309,7 @@ export interface BudgetUsage {
 }
 
 export interface ProviderUsage extends BudgetUsage {
+  subscriptionWaits?: readonly import('../container/subscription-limits.mjs').SubscriptionWait[]
   rawInputTokens?: number
   cachedInputTokens?: number
   cacheAccountingComplete?: boolean
@@ -483,6 +492,7 @@ export interface ProtocolMetadata {
 }
 
 export interface AgentResult {
+  subscriptionWaits?: readonly import('../container/subscription-limits.mjs').SubscriptionWait[]
   status: 'accepted' | 'additive-unavailable'
   actorId: string
   model: string
@@ -584,7 +594,7 @@ export interface StageEndReceipt {
   stageIndex: number
   from: RunPhase
   to: RunPhase
-  reason: 'preflight-passed' | 'stage-complete' | 'two-distinct-complete-saturation-cohorts' | 'phase-deadline' | 'insufficient-time-for-full-wave' | 'measured-budget-inability' | 'safety-ceiling-reached' | 'completion-contract-passed'
+  reason: 'preflight-passed' | 'stage-complete' | 'two-distinct-complete-saturation-cohorts' | 'phase-deadline' | 'insufficient-time-for-full-wave' | 'measured-budget-inability' | 'safety-ceiling-reached' | 'completion-contract-passed' | 'operator-discovery-pool-waiver'
   evidence: unknown
   evidenceDigest: string
   endedAt: string
@@ -663,6 +673,8 @@ export interface AvailabilityBoundary {
 }
 
 export interface RejectedAttempt {
+  /** Explicit operator waiver; must retain its matching stage exception receipt. */
+  operatorWaiver?: { sourceRunId: string, poolId: string, fenceProofDigest: string }
   /** Successful native research retained for correction in the same session. */
   nativeSearchEvidence?: import('./agent-execution-receipt.js').NativeSearchEvidence
   stageId: string
@@ -699,6 +711,8 @@ export interface FailedWaveRecoveryEvidence {
   importedTaskIds: readonly string[]
   inheritedRejectedAttemptCount: number
   unknownUsageAttemptCount: number
+  /** Earlier recovery uncertainty included in unknownUsageAttemptCount. */
+  priorUnknownUsageAttemptCount?: number
   sourceRuntimeRelease: RuntimeRelease
   targetRuntimeRelease: RuntimeRelease
   /** Exact durable execution reused without another provider call. */
@@ -707,6 +721,37 @@ export interface FailedWaveRecoveryEvidence {
   retainedNative?: RetainedNativeRecoveryEvidence
   /** One terminally lost native execution, fenced before a fresh task attempt. */
   unobservableNative?: UnobservableNativeRecoveryEvidence
+  /** Custody-verified rejected files seed a new repair session; never accepted by import. */
+  quarantinedRepair?: QuarantinedOutputRepairEvidence
+  /** Fenced sole-agent terminal wave with no output and an unchanged sealed frontier. */
+  sealedWaveRetry?: SealedWaveRetryEvidence
+}
+
+export interface SealedWaveRetryEvidence {
+  stageId: string
+  waveId: string
+  taskId: string
+  retirementProofDigest: string
+  /** Inherit an already verified image transition; never authorize another image change. */
+  imageAuthorization?: {
+    originalImageDigest: string
+    authorizedImageDigest: string
+    sourceRecoveryDigest: string
+  }
+}
+
+export interface QuarantinedOutputRepairEvidence {
+  /** Absent on historical synthesis repairs. */
+  kind?: 'negative-review'
+  stageId: string
+  waveId: string
+  taskId: string
+  sourceAttempt: number
+  requestDigest: string
+  promptDigest: string
+  outputDigest: string
+  quarantineUri: string
+  diagnostics: readonly string[]
 }
 
 export interface UnobservableNativeRecoveryEvidence {

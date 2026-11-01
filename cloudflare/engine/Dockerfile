@@ -1,8 +1,13 @@
-ARG SANDBOX_VERSION=0.12.9
+# Agent sandboxes run under Cloudflare's durable_object scheduling policy, which
+# needs no base image from Cloudflare: the Worker starts the container and runs
+# commands in it directly. Ubuntu and Node match the earlier Sandbox SDK 0.12 base.
+ARG NODE_VERSION=24
 
-FROM docker.io/cloudflare/sandbox:${SANDBOX_VERSION}
+FROM docker.io/library/node:${NODE_VERSION}-slim AS node-runtime
+
+FROM docker.io/library/ubuntu:22.04
 ARG DSH_VERSION=0.2.1-rc.2
-ARG CODEX_VERSION=0.152.1
+ARG CODEX_VERSION=0.165.0
 ARG FOUNDRY_VERSION=1.8.1
 ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -11,15 +16,26 @@ ENV DEBIAN_FRONTEND=noninteractive \
     XDG_DATA_HOME=/workspace/home/.local/share
 
 USER root
-RUN sed -i \
+# The Ubuntu base has no CA certificates, so install them from the default
+# sources (apt verifies package signatures) before switching apt to HTTPS.
+RUN apt-get -o Acquire::Retries=3 update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && sed -i \
       -e 's|http://archive.ubuntu.com|https://archive.ubuntu.com|g' \
       -e 's|http://security.ubuntu.com|https://security.ubuntu.com|g' \
       /etc/apt/sources.list \
     && apt-get -o Acquire::Retries=3 update \
     && apt-get install -y --no-install-recommends \
-      bash build-essential ca-certificates curl git jq libudev-dev libusb-1.0-0-dev \
-      pkg-config python3 python3-pip python3-venv ripgrep sudo util-linux vim-common zstd \
+      bash build-essential ca-certificates curl file git jq libudev-dev libusb-1.0-0-dev \
+      pkg-config procps python3 python3-pip python3-venv ripgrep sudo unzip util-linux vim-common \
+      wget zip zstd \
     && rm -rf /var/lib/apt/lists/*
+
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+    && node --version && npm --version
 
 RUN case "${TARGETARCH}" in \
       amd64|arm64) foundry_arch="${TARGETARCH}" ;; \
@@ -118,3 +134,5 @@ RUN mkdir -p /opt/ack3 \
     && grep -Eq '^[0-9a-f]{64}$' /opt/ack3/BUILD_FINGERPRINT
 
 WORKDIR /workspace
+# The Worker starts the container with this command and runs each task through exec.
+CMD ["sleep", "infinity"]

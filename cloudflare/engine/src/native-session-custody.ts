@@ -1,4 +1,4 @@
-import type { ISandbox } from '@cloudflare/sandbox'
+import type { SandboxClient } from './agent-sandbox-client.js'
 import type { AgentRequest, NativeTerminalCustodyEvidence, NativeTransportEvidence, TaskDefinition } from './contracts.js'
 import type { AgentExecutionReceipt } from './agent-execution-receipt.js'
 import { canonicalJson, sha256 } from './canonical.js'
@@ -161,7 +161,7 @@ function key(runId: string, requestDigest: string): string {
   return `quarantine/native-sessions/${runId}/${requestDigest}.json`
 }
 
-async function inspection(sandbox: ISandbox, sessionId: string, cwd: string): Promise<JournalInspection | null> {
+async function inspection(sandbox: SandboxClient, sessionId: string, cwd: string): Promise<JournalInspection | null> {
   if (!sessionPattern.test(sessionId) || !['/workspace/source', '/workspace/results'].includes(cwd)) return null
   await sandbox.writeFile(inspectorPath, nativeSessionInspectionScript)
   const result = await sandbox.exec(`python3 ${inspectorPath} ${sessionId} ${cwd}`, { timeout: 10_000 })
@@ -226,11 +226,11 @@ export class NativeSessionCustody {
   }
 
   /** Archive before terminal disposal; an archive alone never permits resume. */
-  async capture(sandbox: ISandbox, request: AgentRequest, receipt: AgentExecutionReceipt): Promise<NativeTransportEvidence | null> {
+  async capture(sandbox: SandboxClient, request: AgentRequest, receipt: AgentExecutionReceipt): Promise<NativeTransportEvidence | null> {
     return custodyOperation(() => this.captureClosed(sandbox, request, receipt))
   }
 
-  private async captureClosed(sandbox: ISandbox, request: AgentRequest, receipt: AgentExecutionReceipt): Promise<NativeTransportEvidence | null> {
+  private async captureClosed(sandbox: SandboxClient, request: AgentRequest, receipt: AgentExecutionReceipt): Promise<NativeTransportEvidence | null> {
     const code = nativeTransportCode(request, receipt)
     if (code === null) return null
     const saved = await this.captureSnapshot(sandbox, request, receipt)
@@ -241,7 +241,7 @@ export class NativeSessionCustody {
   }
 
   /** Preserve a terminal AUTH journal and possible scratch without making AUTH retryable. */
-  async captureTerminal(sandbox: ISandbox, request: AgentRequest, receipt: AgentExecutionReceipt): Promise<NativeTerminalCustodyEvidence | null> {
+  async captureTerminal(sandbox: SandboxClient, request: AgentRequest, receipt: AgentExecutionReceipt): Promise<NativeTerminalCustodyEvidence | null> {
     if (nativeTerminalCustodyCode(request, receipt) === null) return null
     const { snapshot, digest } = await custodyOperation(() => this.captureSnapshot(sandbox, request, receipt))
     return { code: 'AUTH', sourceRunId: snapshot.runId, requestDigest: snapshot.requestDigest,
@@ -249,7 +249,7 @@ export class NativeSessionCustody {
       workState: snapshot.status === 'available' ? snapshot.workState : 'unknown' }
   }
 
-  private async captureSnapshot(sandbox: ISandbox, request: AgentRequest, receipt: AgentExecutionReceipt): Promise<{ snapshot: NativeSnapshot, digest: string }> {
+  private async captureSnapshot(sandbox: SandboxClient, request: AgentRequest, receipt: AgentExecutionReceipt): Promise<{ snapshot: NativeSnapshot, digest: string }> {
     let saved = await this.read(request.runId, receipt.requestDigest)
     if (saved === null) {
       const scope: SnapshotScope = { runId: request.runId, releaseDigest: request.releaseDigest, taskId: request.task.id,
@@ -282,12 +282,12 @@ export class NativeSessionCustody {
     return { snapshot, digest }
   }
 
-  async assertRetryCustody(sandbox: ISandbox, request: AgentRequest): Promise<void> {
+  async assertRetryCustody(sandbox: SandboxClient, request: AgentRequest): Promise<void> {
     return custodyOperation(() => this.assertRetained(sandbox, request))
   }
 
   /** Output correction must reuse the completed native journal and exact quarantined files. */
-  async assertFormatRepairCustody(sandbox: ISandbox, request: AgentRequest): Promise<void> {
+  async assertFormatRepairCustody(sandbox: SandboxClient, request: AgentRequest): Promise<void> {
     return custodyOperation(async () => {
       if (request.formatRepairOrdinal === undefined || !digestPattern.test(request.formatRepairSourceDigest ?? '')
         || request.continuationMode !== 'resume' || request.freshContext || !sessionPattern.test(request.sessionId ?? '')
@@ -303,7 +303,7 @@ export class NativeSessionCustody {
     })
   }
 
-  private async assertRetained(sandbox: ISandbox, request: AgentRequest): Promise<void> {
+  private async assertRetained(sandbox: SandboxClient, request: AgentRequest): Promise<void> {
     const ref = request.nativeTransport
     if (!validNativeTransport(ref)
       || (ref.workState === 'none' ? request.continuationMode !== 'new' || !request.freshContext || request.sessionId !== null

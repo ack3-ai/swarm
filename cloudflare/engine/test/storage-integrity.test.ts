@@ -11,9 +11,9 @@ interface StoredObject {
 class FakeR2Bucket {
   readonly objects = new Map<string, StoredObject>()
 
-  async put(key: string, value: string, options: R2PutOptions = {}): Promise<unknown> {
+  async put(key: string, value: string | Uint8Array, options: R2PutOptions = {}): Promise<unknown> {
     if (options.onlyIf !== undefined && this.objects.has(key)) return null
-    const content = String(value)
+    const content = typeof value === 'string' ? value : new TextDecoder().decode(value)
     const checksum = typeof options.sha256 === 'string' ? options.sha256 : await sha256(content)
     this.objects.set(key, { content, customMetadata: options.customMetadata ?? {}, checksum })
     return {}
@@ -146,7 +146,7 @@ describe('Cloudflare content-addressed checkpoint storage', () => {
 
     expect(prepared).toHaveLength(11)
     expect(prepared[0]).toContain('CREATE TABLE IF NOT EXISTS experiment_runs')
-    expect(prepared[0]).toContain('terminal_reason TEXT\n        )')
+    expect(prepared[0]).toContain('terminal_reason TEXT\n  )')
     expect(prepared[1]).toContain('CREATE INDEX IF NOT EXISTS experiment_runs_by_experiment_updated')
     expect(prepared[2]).toContain('CREATE TABLE IF NOT EXISTS run_runtime_routes')
     expect(prepared[3]).toContain('CREATE TABLE IF NOT EXISTS checkpoint_runtime_routes')
@@ -253,7 +253,7 @@ describe('Cloudflare content-addressed checkpoint storage', () => {
   it('reuses an identical persisted state when another body upload would fail', async () => {
     let uploads = 0
     const bucket = new class extends FakeR2Bucket {
-      override async put(key: string, value: string, options: R2PutOptions = {}) {
+      override async put(key: string, value: string | Uint8Array, options: R2PutOptions = {}) {
         uploads += 1
         if (this.objects.has(key)) throw new Error('Network connection lost.')
         return super.put(key, value, options)
@@ -319,7 +319,7 @@ describe('Cloudflare content-addressed checkpoint storage', () => {
   it('recovers an R2 commit whose acknowledgement was lost without repeating the upload', async () => {
     let uploads = 0
     const bucket = new class extends FakeR2Bucket {
-      override async put(key: string, value: string, options: R2PutOptions = {}) {
+      override async put(key: string, value: string | Uint8Array, options: R2PutOptions = {}) {
         uploads += 1
         await super.put(key, value, options)
         throw new Error('Network connection lost.')
@@ -343,7 +343,7 @@ describe('Cloudflare content-addressed checkpoint storage', () => {
 
   it.each([true, false])('verifies a raced conditional-write collision before D1 publication (valid checksum: %s)', async valid => {
     const bucket = new class extends FakeR2Bucket {
-      override async put(key: string, value: string, options: R2PutOptions = {}) {
+      override async put(key: string, value: string | Uint8Array, options: R2PutOptions = {}) {
         await super.put(key, value, options)
         if (!valid) this.objects.get(key)!.checksum = 'f'.repeat(64)
         return null

@@ -1,9 +1,9 @@
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloudflare:workers'
 import { NonRetryableError } from 'cloudflare:workflows'
-import { getSandbox } from '@cloudflare/sandbox'
+import { getAgentSandbox } from './agent-sandbox-client.js'
 import type { RunCursor, RunState, RuntimeRelease } from './contracts.js'
 import type {
-  AuditWorkflowPayload, Env, QuarantinedRevalidation, RuntimeFailedWaveRecoveryRequest,
+  AuditWorkflowPayload, Env, QuarantinedRevalidation, RuntimeFailedWaveRecoveryRequest, RuntimeDiscoveryWaiverRequest,
   RuntimeIsolationWorkflowPayload, RuntimeResumeRequest, RuntimeTerminalCompletionRecoveryRequest,
 } from './env.js'
 import { canonicalJson, sha256 } from './canonical.js'
@@ -204,14 +204,14 @@ export class RuntimeIsolationWorkflow extends WorkflowEntrypoint<Env, RuntimeIso
         if (payload.holdSeconds < 35) throw new NonRetryableError('idle-survival fixture requires at least 35 seconds')
         const sandboxId = `ri-${(await sha256(payload.fixtureId)).slice(0, 32)}`
         const processId = `idle-${(await sha256(`${payload.fixtureId}:idle`)).slice(0, 32)}`
-        const sandbox = getSandbox(this.env.Sandbox, sandboxId, {
-          keepAlive: true, sleepAfter: '10s', enableDefaultSession: false, normalizeId: true, transport: 'rpc',
+        const sandbox = getAgentSandbox(this.env.AGENT_SANDBOX, sandboxId, {
+          keepAlive: true, inactivityTimeoutMs: 10_000,
           labels: { purpose: 'runtime-isolation-idle', fixture: payload.fixtureId },
         })
         await sandbox.mkdir('/workspace/private', { recursive: true })
         await sandbox.startProcess(
           `sh -c 'sleep 20; cat /opt/ack3/BUILD_FINGERPRINT > /workspace/private/idle-survival-fingerprint'`,
-          { processId, autoCleanup: false },
+          { processId },
         )
         return { sandboxId, processId }
       })
@@ -219,8 +219,8 @@ export class RuntimeIsolationWorkflow extends WorkflowEntrypoint<Env, RuntimeIso
       container = await step.do<{ containerBuildFingerprint: string }>('reobserve-unobserved-container-process', {
         retries: { limit: 0, delay: '1 second' }, timeout: '2 minutes',
       }, async () => {
-        const sandbox = getSandbox(this.env.Sandbox, launched.sandboxId, {
-          keepAlive: true, sleepAfter: '10s', enableDefaultSession: false, normalizeId: true, transport: 'rpc',
+        const sandbox = getAgentSandbox(this.env.AGENT_SANDBOX, launched.sandboxId, {
+          keepAlive: true, inactivityTimeoutMs: 10_000,
           labels: { purpose: 'runtime-isolation-idle', fixture: payload.fixtureId },
         })
         try {
@@ -240,9 +240,8 @@ export class RuntimeIsolationWorkflow extends WorkflowEntrypoint<Env, RuntimeIso
         retries: { limit: 0, delay: '1 second' }, timeout: '2 hours',
       }, async () => {
         const sandboxId = `ri-${(await sha256(payload.fixtureId)).slice(0, 32)}`
-        const sandbox = getSandbox(this.env.Sandbox, sandboxId, {
-          sleepAfter: '2h', enableDefaultSession: false, normalizeId: true, transport: 'rpc',
-          labels: { purpose: 'runtime-isolation', fixture: payload.fixtureId },
+        const sandbox = getAgentSandbox(this.env.AGENT_SANDBOX, sandboxId, {
+          inactivityTimeoutMs: 2 * 60 * 60_000, labels: { purpose: 'runtime-isolation', fixture: payload.fixtureId },
         })
         try {
           const result = await sandbox.exec(
@@ -433,6 +432,12 @@ async function createAuditFailedWaveRecovery(request: Request, env: Env): Promis
     && (body.promoteExecution.quarantineOutputDigest === undefined
       || /^[0-9a-f]{64}$/.test(body.promoteExecution.quarantineOutputDigest))
   )
+  const repairIsValid = body.repairQuarantined === undefined || (
+    typeof body.repairQuarantined.taskId === 'string' && body.repairQuarantined.taskId.trim() !== ''
+    && /^[0-9a-f]{64}$/.test(body.repairQuarantined.requestDigest)
+    && /^[0-9a-f]{64}$/.test(body.repairQuarantined.outputDigest)
+    && body.promoteExecution === undefined && body.retainNative === undefined
+  )
   const retentionIsValid = body.retainNative === undefined || (
     typeof body.retainNative.taskId === 'string' && body.retainNative.taskId.trim() !== ''
     && /^[0-9a-f]{64}$/.test(body.retainNative.requestDigest)
@@ -445,7 +450,7 @@ async function createAuditFailedWaveRecovery(request: Request, env: Env): Promis
     || !Number.isSafeInteger(body.sourceStateGeneration) || body.sourceStateGeneration < 1
     || !/^[0-9a-f]{64}$/.test(body.sourceStateDigest ?? '')
     || !/^[0-9a-f]{64}$/.test(body.checkpointDigest ?? '')
-    || body.runtimeRelease === undefined || !promotionIsValid || !retentionIsValid) {
+    || body.runtimeRelease === undefined || !promotionIsValid || !retentionIsValid || !repairIsValid) {
     return response(env, { error: 'valid failed-wave recovery identity and runtimeRelease are required' }, 400)
   }
   const runtimeRelease = assertLocalRuntime(env, body.runtimeRelease)
@@ -458,6 +463,9 @@ async function createAuditFailedWaveRecovery(request: Request, env: Env): Promis
     return response(env, { error: 'recovery child reservation belongs to a different runtime release' }, 409)
   }
   const source = await store.getState(body.sourceRunId)
+  if (body.repairQuarantined !== undefined && await store.retiredRunWorkflow(body.sourceRunId) === null) {
+    return response(env, { error: 'quarantined synthesis source must be retired before repair' }, 409)
+  }
   const unobservableNative = (source.inFlightAgentAttempts ?? []).length === 0
     ? undefined : await store.fencedUnobservableNativeEvidence(source)
   const checkpoint = await store.getCheckpoint(body.checkpointDigest)
@@ -466,7 +474,11 @@ async function createAuditFailedWaveRecovery(request: Request, env: Env): Promis
     || release.body.definition.id !== body.experimentId) {
     return response(env, { error: 'failed-wave recovery experiment mismatch' }, 409)
   }
-  assertReleaseEnvironmentMatchesRuntime(release.body, runtimeRelease)
+  if (body.repairQuarantined === undefined
+    && source.failedWaveRecovery?.quarantinedRepair?.kind !== 'negative-review'
+    && source.failedWaveRecovery?.sealedWaveRetry?.imageAuthorization === undefined) {
+    assertReleaseEnvironmentMatchesRuntime(release.body, runtimeRelease)
+  }
   // Compatibility belongs to the destination runtime. The front door must
   // still be able to route old checkpoints to a retained global scheduler.
   assertIndependentDiscoveryFrontier(release.body.definition, source)
@@ -480,6 +492,7 @@ async function createAuditFailedWaveRecovery(request: Request, env: Env): Promis
     sourceStateDigest: body.sourceStateDigest,
     targetRuntimeRelease: runtimeRelease,
     artifacts: new R2ArtifactStore(env.ARTIFACTS),
+    retirementProofDigest: (await store.retiredRunWorkflow(source.runId))?.fenceProofDigest ?? undefined,
     ...(unobservableNative === undefined ? {} : { unobservableNative }),
     ...(body.promoteExecution === undefined ? {} : {
       promoteExecution: body.promoteExecution,
@@ -488,8 +501,15 @@ async function createAuditFailedWaveRecovery(request: Request, env: Env): Promis
       ...(body.promoteExecution.quarantineOutputDigest === undefined ? {}
         : { quarantined: new R2ArtifactStore(env.ARTIFACTS) }),
     }),
+    ...(body.repairQuarantined === undefined ? {} : {
+      repairQuarantined: body.repairQuarantined,
+      executionReceipts: new R2AgentExecutionReceiptStore(env.ARTIFACTS),
+      executionRequests: new R2AgentExecutionLogStore(env.ARTIFACTS),
+      quarantined: new R2ArtifactStore(env.ARTIFACTS),
+    }),
     ...(body.retainNative === undefined ? {} : { retainNative: body.retainNative }),
   })
+  assertReleaseEnvironmentMatchesRuntime(release.body, runtimeRelease, prepared.evidence)
   if (prepared.evidence.retainedNative !== undefined) {
     const retained = prepared.evidence.retainedNative
     const claim = await store.retainedNativeWorkspaceClaim(body.sourceRunId, retained.workspaceKey)
@@ -501,7 +521,7 @@ async function createAuditFailedWaveRecovery(request: Request, env: Env): Promis
       return response(env, { error: 'retained native workspace is not exclusively fenced' }, 409)
     }
     const sandboxId = `a0-${(await sha256(`${retained.workspaceAllocationRunId}:${retained.workspaceKey}`)).slice(0, 30)}`
-    if (env.Sandbox.idFromName(sandboxId).toString() !== retained.sandboxObjectId) {
+    if (env.AGENT_SANDBOX.idFromName(sandboxId).toString() !== retained.sandboxObjectId) {
       return response(env, { error: 'retained Sandbox namespace or actor identity changed' }, 409)
     }
   }
@@ -574,10 +594,43 @@ async function createAuditTerminalCompletionRecovery(request: Request, env: Env)
     runtimeRelease, terminalCompletionRecovery: evidence, reusedWorkflow: instance.reused }, 202)
 }
 
+async function createAuditDiscoveryWaiver(request: Request, env: Env): Promise<Response> {
+  const body = await request.json<RuntimeDiscoveryWaiverRequest>()
+  if (!runIdPattern.test(body.experimentId ?? '') || !runIdPattern.test(body.childRunId ?? '')
+    || !runIdPattern.test(body.sourceRunId ?? '') || !runIdPattern.test(body.poolId ?? '')
+    || !Number.isSafeInteger(body.sourceStateGeneration) || body.sourceStateGeneration < 1
+    || !/^[a-f0-9]{64}$/.test(body.sourceStateDigest ?? '') || !/^[a-f0-9]{64}$/.test(body.checkpointDigest ?? '')
+    || !/^[a-f0-9]{64}$/.test(body.requestDigest ?? '') || body.runtimeRelease === undefined) {
+    return response(env, { error: 'exact discovery waiver source, pool, request and runtime are required' }, 400)
+  }
+  const runtimeRelease = assertLocalRuntime(env, body.runtimeRelease)
+  const store = new CloudflareRunStore(env.PACKAGES, env.ARTIFACTS, env.INDEX)
+  const reserved = await store.runRuntime(body.childRunId)
+  if (reserved === null || !sameRuntimeRelease(reserved, runtimeRelease)) {
+    return response(env, { error: 'discovery waiver child reservation differs' }, 409)
+  }
+  const { evidence, fence } = await store.prepareDiscoveryWaiver({ ...body, targetRuntimeRelease: runtimeRelease })
+  await store.claimDiscoveryWaiver(evidence)
+  const source = await store.getState(body.sourceRunId)
+  const checkpoint = await store.getCheckpoint(body.checkpointDigest)
+  const release = await store.getRelease(source.releaseDigest)
+  if (body.experimentId !== source.experimentId) return response(env, { error: 'waiver experiment differs' }, 409)
+  assertReleaseEnvironmentMatchesRuntime(release.body, runtimeRelease)
+  resolveTargetEnvironment(release.body.definition.target.runtime.environmentBindings, env)
+  await assertReleaseProviderCredentials(release.body.definition, env)
+  await RunMachine.recoverDiscoveryPoolWaiver(release.body.definition, checkpoint, source, evidence, fence)
+  const payload: AuditWorkflowPayload = { mode: 'recover-discovery-waiver', experimentId: body.experimentId,
+    runId: body.childRunId, checkpointDigest: checkpoint.digest, runtimeRelease, discoveryPoolWaiver: evidence }
+  const instance = await ensureAuditWorkflow(env.AUDIT_WORKFLOW, payload, placement(env))
+  return response(env, { workflowInstanceId: instance.id, runtimeRelease,
+    discoveryPoolWaiver: evidence, reusedWorkflow: instance.reused }, 202)
+}
+
 async function auditRunStatus(runId: string, env: Env): Promise<Response> {
   await assertStoredRunOwner(runId, env)
   const workflow = await env.AUDIT_WORKFLOW.get(runId)
-  const state = await new CloudflareRunStore(env.PACKAGES, env.ARTIFACTS, env.INDEX).getState(runId)
+  // The Workflow saves the first state shortly after start; until then there is none.
+  const state = await new CloudflareRunStore(env.PACKAGES, env.ARTIFACTS, env.INDEX).getStateIfPresent(runId)
   return response(env, { state, workflow: await workflow.status() })
 }
 
@@ -689,9 +742,8 @@ async function laneResult(runId: string, workspaceKey: string, env: Env): Promis
 
 async function readiness(env: Env): Promise<Response> {
   const probeId = `readiness-${crypto.randomUUID().replaceAll('-', '')}`
-  const sandbox = getSandbox(env.Sandbox, probeId, {
-    sleepAfter: '1m', enableDefaultSession: false, normalizeId: true, transport: 'rpc',
-    labels: { purpose: 'readiness', probe: probeId },
+  const sandbox = getAgentSandbox(env.AGENT_SANDBOX, probeId, {
+    inactivityTimeoutMs: 60_000, labels: { purpose: 'readiness', probe: probeId },
   })
   let disposed = false
   try {
@@ -793,6 +845,9 @@ export async function runtimeServiceRoute(request: Request, env: Env, ctx?: Exec
     }
     if (request.method === 'POST' && url.pathname === '/internal/runtime/audit-recoveries') {
       return createAuditFailedWaveRecovery(request, env)
+    }
+    if (request.method === 'POST' && url.pathname === '/internal/runtime/audit-discovery-waivers') {
+      return createAuditDiscoveryWaiver(request, env)
     }
     if (request.method === 'POST' && url.pathname === '/internal/runtime/audit-terminal-recoveries') {
       return createAuditTerminalCompletionRecovery(request, env)

@@ -1,3 +1,4 @@
+import { modelHeaderCredentialNames, validCodexAccessProgram } from '../container/reasoning-config.mjs'
 import { INSTRUCTION_KEYS, validateStagePrompts, validateStages } from './methods/system-prompts.js'
 import {
   STAGE_KINDS,
@@ -125,10 +126,10 @@ function validateDefinitionShape(definition: ExperimentDefinition): void {
   }
   for (const [index, pool] of definition.pools.entries()) {
     rejectUnknownKeys(pool, [
-      'id', 'backend', 'provider', 'connection', 'model', 'reasoningEffort', 'thinking', 'subagents', 'credentialSource', 'agents', 'required',
+      'id', 'backend', 'provider', 'connection', 'model', 'cyberAccessProgram', 'reasoningEffort', 'thinking', 'subagents', 'credentialSource', 'agents', 'required',
     ], `experiment.pools[${index}]`)
     if (pool.connection !== undefined) {
-      rejectUnknownKeys(pool.connection, ['baseUrl', 'apiKeyEnv', 'contextWindow', 'maxTokens', 'costRates'], `experiment.pools[${index}].connection`)
+      rejectUnknownKeys(pool.connection, ['baseUrl', 'apiKeyEnv', 'headersEnv', 'usageWindowWait', 'contextWindow', 'maxTokens', 'costRates'], `experiment.pools[${index}].connection`)
       if (pool.connection.costRates !== undefined) {
         rejectUnknownKeys(pool.connection.costRates,
           ['uncachedInputUsdPerMillion', 'cachedInputUsdPerMillion', 'outputUsdPerMillion'],
@@ -161,7 +162,7 @@ function validateDefinitionShape(definition: ExperimentDefinition): void {
       for (const [taskIndex, task] of wave.tasks.entries()) {
         const taskPath = `${wavePath}.tasks[${taskIndex}]`
         rejectUnknownKeys(task, [
-          'id', 'logicalRole', 'objective', 'providerClass', 'modelPool', 'model', 'reasoning', 'thinking', 'subagents', 'promptKind',
+          'id', 'logicalRole', 'objective', 'providerClass', 'modelPool', 'model', 'cyberAccessProgram', 'reasoning', 'thinking', 'subagents', 'promptKind',
           'backend', 'provider', 'connection', 'credentialSource',
           'visibility', 'workspaceMode', 'workspaceKey', 'output', 'research', 'perspective',
           'observationPrefix', 'requiredTable', 'optional', 'retryPolicy',
@@ -280,6 +281,8 @@ export function validateExperiment(definition: ExperimentDefinition): void {
     requireValue(pool.backend === 'codex' || pool.backend === 'claude' || pool.backend === 'dsh-chat-completions',
       `model pool ${pool.id} has an unsupported backend`)
     requireValue(typeof pool.model === 'string' && pool.model.trim().length > 0, `model pool ${pool.id} has no model`)
+    requireValue(validCodexAccessProgram(pool.backend, pool.cyberAccessProgram),
+    `model pool ${pool.id} has invalid cyberAccessProgram`)
     requireValue(['none', 'low', 'medium', 'high', 'max'].includes(pool.reasoningEffort ?? ''),
       `model pool ${pool.id} has invalid reasoningEffort`)
     requireValue(['codex', 'claude'].includes(pool.backend) || pool.reasoningEffort !== 'medium',
@@ -318,6 +321,9 @@ export function validateExperiment(definition: ExperimentDefinition): void {
       requireValue(typeof pool.connection?.apiKeyEnv === 'string'
         && /^[A-Z][A-Z0-9_]{0,119}_API_KEY$/.test(pool.connection.apiKeyEnv),
         `model pool ${pool.id} has invalid apiKeyEnv`)
+      modelHeaderCredentialNames(pool.connection)
+      requireValue(pool.connection.usageWindowWait === undefined || typeof pool.connection.usageWindowWait === 'boolean',
+        `model pool ${pool.id} has invalid usageWindowWait`)
       for (const key of ['contextWindow', 'maxTokens'] as const) {
         const value = pool.connection[key]
         requireValue(value === undefined || (Number.isSafeInteger(value) && value > 0 && value <= 2_000_000),
@@ -411,6 +417,8 @@ export function validateExperiment(definition: ExperimentDefinition): void {
               || task.promptKind === 'reporting'))
         requireValue(permittedRetry, `task ${task.id} has an invalid retry policy`)
         const backend = taskBackend(task)
+        requireValue(validCodexAccessProgram(backend, task.cyberAccessProgram),
+        `task ${task.id} has invalid cyberAccessProgram`)
         requireValue((task.providerClass === 'core' && ['codex', 'claude'].includes(backend))
           || (task.providerClass === 'additive' && !['codex', 'claude', 'deterministic'].includes(backend))
           || (task.providerClass === 'deterministic' && backend === 'deterministic'),
@@ -420,6 +428,7 @@ export function validateExperiment(definition: ExperimentDefinition): void {
           if ((backend === 'claude' || task.credentialSource !== undefined)
             && task.credentialSource !== pool.credentialSource) return false
           if (pool.model !== task.model || pool.backend !== backend) return false
+          if (pool.cyberAccessProgram !== task.cyberAccessProgram) return false
           if (pool.provider !== task.provider || canonicalJson(pool.connection) !== canonicalJson(task.connection)) return false
           if (pool.reasoningEffort !== task.reasoning || pool.thinking !== task.thinking) return false
           if (pool.subagents === undefined) return false

@@ -9,7 +9,7 @@ import { compileExperimentConfig } from './support/compile-config.js'
 import { SandboxAgentProvider } from '../src/sandbox-provider.js'
 import manifest from './fixtures/audit0-hello-vault.json' with { type: 'json' }
 
-vi.mock('@cloudflare/sandbox', () => ({ getSandbox: vi.fn() }))
+vi.mock('../src/agent-sandbox-client.js', () => ({ getAgentSandbox: vi.fn() }))
 
 const script = new URL('../container/prepare-workspace.mjs', import.meta.url)
 const roots: string[] = []

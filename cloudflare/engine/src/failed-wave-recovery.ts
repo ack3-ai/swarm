@@ -1,3 +1,6 @@
+import { prepareSealedWaveRetry } from './sealed-wave-retry.js'
+import { prepareQuarantinedOutputRepair, type QuarantinedOutputRepairSelection } from './quarantined-output-repair.js'
+import { discoveryDeadline as discoveryDeadlineMs } from './discovery-clock.js'
 import type {
   AgentRequest,
   AgentResult,
@@ -13,7 +16,7 @@ import type {
   WaveDefinition,
 } from './contracts.js'
 import { canonicalJson, sha256 } from './canonical.js'
-import { exhaustedFailedWaveTask, rejectionConsumesRepairAttempt, skippedResumeSlotFailureRecorded } from './machine.js'
+import { exhaustedFailedWaveTask, rejectionConsumesRepairAttempt, skippedResumeSlotFailureRecorded, terminalReceiptMismatchTask } from './machine.js'
 import { exactUnobservableAttempt } from './unobservable-native-recovery.js'
 import { composePrompt, selectVisibleArtifacts } from './prompts.js'
 import { validateAgentResult } from './protocol-validation.js'
@@ -44,6 +47,8 @@ export async function recoveryPromptMatches(
   if (source.failedWaveRecovery?.importedTaskIds.includes(record.taskId) === true) return true
   const diagnostics = [
     [] as readonly string[],
+    ...(source.failedWaveRecovery?.quarantinedRepair?.taskId === record.taskId
+      ? [source.failedWaveRecovery.quarantinedRepair.diagnostics] : []),
     ...source.rejectedAttempts.filter(rejection => (
       rejection.stageId === record.stageId && rejection.waveId === record.waveId && rejection.taskId === record.taskId
         && (rejection.outputDigest !== null || rejection.includeDiagnosticsInRepair === true)
@@ -149,6 +154,7 @@ export async function historicalAcceptedExecutionMatches(input: {
     catch { continue }
     const usage = {
       modelCalls: 1, inputTokens: result.inputTokens, outputTokens: result.outputTokens, costUsd: result.costUsd,
+      ...(result.subscriptionWaits === undefined ? {} : { subscriptionWaits: result.subscriptionWaits }),
       ...(result.rawInputTokens === undefined ? {} : { rawInputTokens: result.rawInputTokens }),
       ...(result.cachedInputTokens === undefined ? {} : { cachedInputTokens: result.cachedInputTokens }),
       ...(result.cacheAccountingComplete === undefined ? {} : { cacheAccountingComplete: result.cacheAccountingComplete }),
@@ -212,14 +218,16 @@ async function prepareIndependentDiscoveryRecovery(input: {
   if (missing.length === 0 || missing.some(({ admission, taskId }) => {
     const task = stage.waves[admission.waveIndex]?.tasks.find(candidate => candidate.id === taskId)
     const rejections = source.rejectedAttempts.filter(rejection => rejection.taskId === taskId
+      && rejection.stageId === stage.id && rejection.waveId === admission.waveId
       && (rejection.repairScopeRunId ?? source.runId) === source.runId)
     return task === undefined || (lost?.taskId !== taskId && !exhaustedFailedWaveTask(
       task, rejections,
       promotedExecution?.taskId === taskId ? promotedExecution.sourceAttempt : undefined,
       skippedResumeSlotFailureRecorded(source, taskId),
-    ))
+    ) && !(input.promoteExecution === undefined && lost === undefined
+      && terminalReceiptMismatchTask(source, task, rejections)))
   })) {
-    throw new Error('failed-wave recovery is limited to missing tasks with exhausted attempts')
+    throw new Error('failed-wave recovery requires exhausted attempts or an exact terminal receipt mismatch')
   }
   for (const record of importedArtifacts) {
     if (record.status !== 'accepted') continue
@@ -319,6 +327,7 @@ function resultFromArtifact(record: ArtifactRecord, files: Readonly<Record<strin
     outputTokens: record.usage.outputTokens,
     costUsd: record.usage.costUsd,
     modelCalls: record.usage.modelCalls,
+    ...(record.usage.subscriptionWaits === undefined ? {} : { subscriptionWaits: record.usage.subscriptionWaits }),
     ...(record.usage.rawInputTokens === undefined ? {} : { rawInputTokens: record.usage.rawInputTokens }),
     ...(record.usage.cachedInputTokens === undefined ? {} : { cachedInputTokens: record.usage.cachedInputTokens }),
     ...(record.usage.cacheAccountingComplete === undefined
@@ -347,6 +356,8 @@ export async function prepareFailedWaveRecovery(input: {
   unobservableNative?: FailedWaveRecoveryEvidence['unobservableNative']
   promoteExecution?: PromotedExecutionSelection
   retainNative?: { taskId: string, requestDigest: string, snapshotDigest: string, sandboxObjectId: string }
+  repairQuarantined?: QuarantinedOutputRepairSelection
+  retirementProofDigest?: string | undefined
   executionReceipts?: Pick<R2AgentExecutionReceiptStore, 'get'>
   executionRequests?: Pick<R2AgentExecutionLogStore, 'getRequest'> & Partial<Pick<R2AgentExecutionLogStore, 'listRequests'>>
   quarantined?: Pick<R2ArtifactStore, 'readRejected'>
@@ -355,6 +366,9 @@ export async function prepareFailedWaveRecovery(input: {
   const independentDiscovery = source.discoveryScheduler !== undefined
     && source.discoveryScheduler.admissions.length > 0
   if (source.status !== 'failed' || source.stateGeneration !== input.sourceStateGeneration
+    || await sha256(checkpoint.body) !== checkpoint.digest
+    || (!source.checkpoints.some(candidate => candidate.digest === checkpoint.digest)
+      && source.parentCheckpointDigest !== checkpoint.digest)
     || await sha256(source) !== input.sourceStateDigest || source.runtimeRelease === undefined
     || sameRuntimeRelease(source.runtimeRelease, input.targetRuntimeRelease)
     || source.cursor.stageIndex !== checkpoint.body.cursor.stageIndex
@@ -371,6 +385,39 @@ export async function prepareFailedWaveRecovery(input: {
   if (input.unobservableNative !== undefined && !independentDiscovery) {
     throw new Error('unobservable native recovery requires an independent discovery cohort')
   }
+  let reviewRepair: FailedWaveRecoveryEvidence['quarantinedRepair']
+  if (input.repairQuarantined !== undefined) {
+    const isReview = definition.stages[source.cursor.stageIndex]?.kind === 'negative-review'
+    if (independentDiscovery || input.promoteExecution !== undefined || input.retainNative !== undefined
+      || input.unobservableNative !== undefined || input.executionRequests === undefined
+      || input.executionReceipts === undefined || input.quarantined === undefined
+      || (!isReview && canonicalJson(source.artifacts) !== canonicalJson(checkpoint.body.acceptedArtifacts))
+      || (isReview && source.runtimeRelease.containerImageDigest === input.targetRuntimeRelease.containerImageDigest)) {
+      throw new Error('quarantined synthesis repair requires an unchanged sealed accepted frontier')
+    }
+    const quarantinedRepair = await prepareQuarantinedOutputRepair({
+      definition, source, selection: input.repairQuarantined, artifacts: input.artifacts,
+      requests: input.executionRequests, receipts: input.executionReceipts, quarantined: input.quarantined,
+    })
+    if (isReview) reviewRepair = quarantinedRepair
+    else {
+      const inheritedRejectedAttempts = source.rejectedAttempts.filter(value => (
+        value.stageId === quarantinedRepair.stageId && value.waveId === quarantinedRepair.waveId
+      )).map(value => ({ ...value, repairScopeRunId: value.repairScopeRunId ?? source.runId }))
+      return {
+        importedArtifacts: [], inheritedRejectedAttempts,
+        evidence: {
+          sourceRunId: source.runId, sourceStateGeneration: source.stateGeneration,
+          sourceStateDigest: input.sourceStateDigest, checkpointDigest: checkpoint.digest,
+          importedTaskIds: [], inheritedRejectedAttemptCount: inheritedRejectedAttempts.length,
+          unknownUsageAttemptCount: source.failedWaveRecovery?.unknownUsageAttemptCount ?? 0,
+          priorUnknownUsageAttemptCount: source.failedWaveRecovery?.unknownUsageAttemptCount ?? 0,
+          sourceRuntimeRelease: source.runtimeRelease,
+          targetRuntimeRelease: input.targetRuntimeRelease, quarantinedRepair,
+        },
+      }
+    }
+  }
   if (independentDiscovery) return prepareIndependentDiscoveryRecovery(input)
   const stage = definition.stages[source.cursor.stageIndex]
   const wave = stage?.waves[source.cursor.waveIndex]
@@ -381,7 +428,13 @@ export async function prepareFailedWaveRecovery(input: {
   const importedArtifacts = source.artifacts.filter(artifact => (
     artifact.stageId === stage.id && artifact.waveId === wave.id
   ))
-  if (importedArtifacts.length === 0) throw new Error('failed-wave recovery has no accepted peer to import')
+  const sealedWaveRetry = importedArtifacts.length === 0 && reviewRepair === undefined
+    && input.promoteExecution === undefined && input.retainNative === undefined && input.unobservableNative === undefined
+    && input.repairQuarantined === undefined
+    ? await prepareSealedWaveRetry(input) : undefined
+  if (importedArtifacts.length === 0 && sealedWaveRetry === undefined) {
+    throw new Error('failed-wave recovery has no accepted peer to import')
+  }
   const importedTaskIds = new Set(importedArtifacts.map(artifact => artifact.taskId))
   const missingTasks = wave.tasks.filter(task => !importedTaskIds.has(task.id))
   let retainedNative: FailedWaveRecoveryEvidence['retainedNative']
@@ -421,8 +474,7 @@ export async function prepareFailedWaveRecovery(input: {
       || !missingTasks.some(task => task.id === input.promoteExecution?.taskId)) {
       throw new Error('promoted execution does not match a missing recovery task')
     }
-    const discoveryDeadline = Date.parse(source.modelStartedAt ?? '')
-      + definition.limits.phaseMinutes.discovery * 60_000
+    const discoveryDeadline = discoveryDeadlineMs(definition, source)
     if (!Number.isFinite(discoveryDeadline) || Date.now() < discoveryDeadline) {
       throw new Error('legacy promoted execution requires an expired discovery phase')
     }
@@ -435,7 +487,7 @@ export async function prepareFailedWaveRecovery(input: {
       ...(input.quarantined === undefined ? {} : { quarantined: input.quarantined }),
     })
   }
-  if (missingTasks.length === 0 || missingTasks.some(task => {
+  if (reviewRepair === undefined && sealedWaveRetry === undefined && (missingTasks.length === 0 || missingTasks.some(task => {
     const rejections = source.rejectedAttempts.filter(rejection => (
       rejection.stageId === stage.id && rejection.waveId === wave.id && rejection.taskId === task.id
         && (rejection.repairScopeRunId ?? source.runId) === source.runId
@@ -448,7 +500,7 @@ export async function prepareFailedWaveRecovery(input: {
       || ((promotedExecution?.taskId !== task.id || promotedExecution.sourceAttempt !== attemptLimit)
         && rejections.some(rejection => rejection.outputDigest !== null || rejection.quarantineUri !== null
           || rejection.includeDiagnosticsInRepair === true))
-  })) {
+  }))) {
     throw new Error('failed-wave recovery is limited to missing tasks with exhausted no-output attempts')
   }
   for (const record of importedArtifacts) {
@@ -491,7 +543,15 @@ export async function prepareFailedWaveRecovery(input: {
       checkpointDigest: checkpoint.digest,
       importedTaskIds: importedArtifacts.map(artifact => artifact.taskId).toSorted(),
       inheritedRejectedAttemptCount: inheritedRejectedAttempts.length,
-      unknownUsageAttemptCount: inheritedRejectedAttempts.filter(usageWasNotObserved).length,
+      unknownUsageAttemptCount: sealedWaveRetry === undefined
+        ? inheritedRejectedAttempts.filter(usageWasNotObserved).length
+          + (reviewRepair === undefined ? 0 : source.failedWaveRecovery?.unknownUsageAttemptCount ?? 0)
+        : inheritedRejectedAttempts.filter(value => value.repairScopeRunId === source.runId && usageWasNotObserved(value)).length
+          + (source.failedWaveRecovery?.unknownUsageAttemptCount ?? 0),
+      ...(sealedWaveRetry === undefined ? {} : { sealedWaveRetry,
+        priorUnknownUsageAttemptCount: source.failedWaveRecovery?.unknownUsageAttemptCount ?? 0 }),
+      ...(reviewRepair === undefined ? {} : { quarantinedRepair: reviewRepair,
+        priorUnknownUsageAttemptCount: source.failedWaveRecovery?.unknownUsageAttemptCount ?? 0 }),
       sourceRuntimeRelease: source.runtimeRelease,
       targetRuntimeRelease: input.targetRuntimeRelease,
       ...(promotedExecution === undefined ? {} : { promotedExecution }),

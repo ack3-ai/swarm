@@ -45,8 +45,9 @@ Create both first, matching the module so the import shows no changes:
   `printf 'Authorization: Bearer %s\n' "$STATE_TOKEN" | curl -fsS -H @- https://api.cloudflare.com/client/v4/accounts/<account-id>/tokens/verify`.
 
 Import both after `init` (below). Import other existing resources instead of recreating
-them. If `apply` reports that a new account already has a Secrets Store or a
-One-time PIN login method, import that too. The token's S3 credentials are its ID
+them. Cloudflare allows one Secrets Store per account: if the account already has one,
+set `secrets_store_name` to its name and import it (below). If `apply` reports an
+existing One-time PIN login method, import that too. The token's S3 credentials are its ID
 (access key ID) and the SHA-256 of its value (secret access key:
 `printf %s "$STATE_TOKEN" | sha256sum | cut -d' ' -f1`). Use them through `AWS_ACCESS_KEY_ID` and
 `AWS_SECRET_ACCESS_KEY`, and a Swarm management token through
@@ -86,6 +87,9 @@ terraform -chdir=cloudflare/terraform import -var-file=/path/to/private/swarm.tf
   cloudflare_r2_bucket.terraform_state '<account-id>/swarm-terraform-state/<jurisdiction>'
 terraform -chdir=cloudflare/terraform import -var-file=/path/to/private/swarm.tfvars \
   cloudflare_account_token.terraform_state '<account-id>/<token-id>'
+# Only if the account already has a Secrets Store (with secrets_store_name set to its name).
+terraform -chdir=cloudflare/terraform import -var-file=/path/to/private/swarm.tfvars \
+  cloudflare_secrets_store.swarm '<account-id>/<store-id>'
 terraform -chdir=cloudflare/terraform plan -var-file=/path/to/private/swarm.tfvars \
   -out=/path/to/private/swarm.tfplan
 # Inspect the complete plan before applying it.

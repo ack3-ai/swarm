@@ -1,3 +1,4 @@
+import { modelHeaderCredentialNames } from '../container/reasoning-config.mjs'
 import type { ExperimentDefinition } from './contracts.js'
 import type { Env } from './env.js'
 import { taskBackend } from './provider-identity.js'
@@ -52,6 +53,9 @@ export async function assertReleaseProviderCredentials(
     }
     if (!(await present(connection.apiKeyEnv))) {
       throw new PermanentRunFailure(`additive provider credential is missing for ${task.id}`, 'missing-credentials')
+    }
+    for (const name of modelHeaderCredentialNames(connection)) {
+      if (!(await present(name))) throw new PermanentRunFailure(`model header credential ${name} is missing`, 'missing-credentials')
     }
   }
   if (definition.forceSearch?.enabled === true || definition.nativeSearch?.enabled === true) {
