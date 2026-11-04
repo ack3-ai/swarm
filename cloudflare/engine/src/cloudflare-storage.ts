@@ -41,14 +41,27 @@ export class R2ArtifactStore implements ArtifactStore {
   constructor(private readonly bucket: R2Bucket) {}
 
   async put(record: Omit<ArtifactRecord, 'uri'>, content: string): Promise<ArtifactRecord> {
+    if (await sha256(content) !== record.contentDigest) throw new Error(`artifact submission digest mismatch: ${record.id}`)
     const key = `artifacts/${record.id}.json`
-    await this.bucket.put(key, content, {
-      httpMetadata: { contentType: 'application/json' },
-      customMetadata: { sha256: record.contentDigest, task: record.taskId },
-      sha256: record.contentDigest,
-      onlyIf: { etagDoesNotMatch: '*' },
-    })
-    return { ...record, uri: `r2://ARTIFACTS/${key}` }
+    const artifact = { ...record, uri: `r2://ARTIFACTS/${key}` }
+    // The bytes may have committed before the state CAS. Bucket locks can
+    // reject even a conditional retry; reuse only checksum-verified bytes.
+    if (await this.bucket.head(key) !== null) {
+      await this.read(artifact)
+      return artifact
+    }
+    try {
+      await this.bucket.put(key, content, {
+        httpMetadata: { contentType: 'application/json' },
+        customMetadata: { sha256: record.contentDigest, task: record.taskId },
+        sha256: record.contentDigest,
+        onlyIf: { etagDoesNotMatch: '*' },
+      })
+    } catch (error) {
+      if (await this.bucket.head(key) === null) throw error
+    }
+    await this.read(artifact)
+    return artifact
   }
 
   async read(record: ArtifactRecord): Promise<Readonly<Record<string, string>>> {
