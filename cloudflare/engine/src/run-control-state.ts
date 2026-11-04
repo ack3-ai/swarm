@@ -62,6 +62,7 @@ export async function settledControlState(state: RunState, operation: RunOperati
   if (state.controls?.revision === operation.revision
     && state.controls.lastReceipt.commandDigest === operation.commandDigest) {
     if (canonicalJson(state.controls.lastReceipt.outcome) !== canonicalJson(outcome)) throw new Error('command outcome differs from its persisted receipt')
+    await assertRunControls(state)
     return deepClone(state.controls)
   }
   if (state.executionAuthority === undefined

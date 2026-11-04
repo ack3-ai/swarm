@@ -66,3 +66,14 @@ it('rejects a stale revision, missing owner and tampered receipt', async () => {
   stale.commandDigest = await sha256(stale.command)
   await expect(applyAdmissionControl(audit0Definition, state, stale, now)).rejects.toThrow('revision')
 })
+
+it('rejects a tampered persisted effect on a same-command retry', async () => {
+  const { state, decide } = await fixture(), operation = await decide('pause', { kind: 'audit' })
+  const effect = await applyAdmissionControl(audit0Definition, state, operation, now)
+  for (const controls of [
+    { ...effect, pauses: [] },
+    { ...effect, lastReceipt: { ...effect.lastReceipt, pausesDigest: 'c'.repeat(64) } },
+  ]) {
+    await expect(applyAdmissionControl(audit0Definition, { ...state, controls }, operation, now)).rejects.toThrow('receipt')
+  }
+})
