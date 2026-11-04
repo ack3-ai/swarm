@@ -82,4 +82,39 @@ export const ROUTING_SCHEMA_SQL: readonly string[] = [
     claimed_at TEXT NOT NULL,
     PRIMARY KEY(source_run_id, workspace_key)
   )`,
+  `CREATE TABLE IF NOT EXISTS audit_execution_authority (
+    audit_id TEXT NOT NULL,
+    epoch INTEGER NOT NULL CHECK(epoch >= 0),
+    execution_id TEXT NOT NULL UNIQUE,
+    authority_json TEXT NOT NULL,
+    command_digest TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('active', 'fenced', 'retired')),
+    activated_at TEXT NOT NULL,
+    fence_command_digest TEXT,
+    fenced_at TEXT,
+    retirement_digest TEXT,
+    retired_at TEXT,
+    PRIMARY KEY(audit_id, epoch)
+  )`,
+  `CREATE TABLE IF NOT EXISTS audit_execution_launches (
+    audit_id TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    task_execution_id TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    admitted_at TEXT NOT NULL,
+    receipt_digest TEXT,
+    settled_at TEXT,
+    PRIMARY KEY(audit_id, epoch, request_digest),
+    FOREIGN KEY(audit_id, epoch) REFERENCES audit_execution_authority(audit_id, epoch)
+  )`,
+  `CREATE TABLE IF NOT EXISTS audit_run_commands (
+    audit_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(revision > 0),
+    command_id TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK(version > 0),
+    operation_json TEXT NOT NULL,
+    operation_digest TEXT NOT NULL,
+    PRIMARY KEY(audit_id, command_id, version),
+    UNIQUE(audit_id, revision, version)
+  )`,
 ]

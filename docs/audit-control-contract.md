@@ -23,3 +23,19 @@ results or an executing manifest.
 Runtime consumers must verify saved-work ownership, settle native work and
 preserve accepted evidence before admitting a continuation. Command validation
 alone proves none of those conditions.
+
+## Execution ownership
+
+`ExecutionAuthorityStore` records an execution's pinned runtime, launch claims,
+and the transition from active to fenced to retired. A launch requires the exact
+persisted run-state pointer. The caller must validate the task admission and root
+Workflow startup; `activate` alone proves neither. At most one unsettled native
+request may belong to a task occurrence; a settled attempt permits a retry. Pending cancellation and unacknowledged fork startup
+block admission. Fencing closes admission; retirement additionally requires all
+admitted launch claims to have terminal evidence.
+
+This storage primitive does not stop containers or prove physical shutdown.
+Its caller must verify native custody before supplying a retirement proof.
+The runner and control endpoints are not wired to this primitive in this change;
+the remaining control series supplies those boundaries. Historical executors are
+not reassigned by this store, and activation retries cannot reopen retired work.

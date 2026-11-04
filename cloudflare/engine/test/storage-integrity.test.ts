@@ -144,7 +144,7 @@ describe('Cloudflare content-addressed checkpoint storage', () => {
 
     await store.ensureSchema()
 
-    expect(prepared).toHaveLength(11)
+    expect(prepared).toHaveLength(14)
     expect(prepared[0]).toContain('CREATE TABLE IF NOT EXISTS experiment_runs')
     expect(prepared[0]).toContain('terminal_reason TEXT\n  )')
     expect(prepared[1]).toContain('CREATE INDEX IF NOT EXISTS experiment_runs_by_experiment_updated')
@@ -157,6 +157,9 @@ describe('Cloudflare content-addressed checkpoint storage', () => {
     expect(prepared[9]).toContain('CREATE TABLE IF NOT EXISTS retired_unmaterialized_routes')
     expect(prepared[10]).toContain('CREATE TABLE IF NOT EXISTS retained_native_workspace_claims')
     expect(prepared[10]).toContain('PRIMARY KEY(source_run_id, workspace_key)')
+    expect(prepared[11]).toContain('CREATE TABLE IF NOT EXISTS audit_execution_authority')
+    expect(prepared[12]).toContain('CREATE TABLE IF NOT EXISTS audit_execution_launches')
+    expect(prepared[13]).toContain('CREATE TABLE IF NOT EXISTS audit_run_commands')
   })
 
   it('persists small run and checkpoint routing envelopes independently of full state parsing', async () => {
