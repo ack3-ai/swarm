@@ -39,3 +39,22 @@ Its caller must verify native custody before supplying a retirement proof.
 The runner and control endpoints are not wired to this primitive in this change;
 the remaining control series supplies those boundaries. Historical executors are
 not reassigned by this store, and activation retries cannot reopen retired work.
+
+## Command journal
+
+`RunCommandJournal` stores immutable versions of pause/continue decisions in the
+existing D1 index. Admission atomically binds the command ID, content digest and
+next operator revision. Repeating the same request returns its recorded decision;
+reusing its ID for different content or racing a newer revision is rejected.
+When the caller supplies execution authority, admission also requires that exact
+active owner and a running audit in the same SQL statement.
+
+An accepted decision is not an applied effect. Internal reconciliation advances
+it with a version compare-and-swap; an applied outcome requires a receipt digest.
+Lost write acknowledgements can be reconciled by repeating the same request or
+transition. Readers verify row identity, command and record digests, and reject
+unsupported record fields.
+
+This slice does not expose an endpoint, pause a scheduler, validate receipt bytes,
+or admit native cancellation or forks. Scope/lifecycle checks, effect verification
+and durable delivery remain the responsibility of the following integration.
