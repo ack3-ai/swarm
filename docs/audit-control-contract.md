@@ -72,3 +72,14 @@ These functions do not persist state, acknowledge the command journal, stop runn
 agents or expose an endpoint. The following integration must persist the effect
 under execution ownership, verify it before acknowledgement, and consult the
 pauses before admitting new work. This PR alone does not enable operator controls.
+
+## Selected state receipts
+
+The run-index transaction now records the selected state key, generation, owner
+and predecessor in an immutable receipt. An uploaded snapshot alone is not proof
+that the state was selected. `assertStateSelected` checks this evidence without
+changing the run head or granting permission to publish another state.
+
+Installing the schema does not backfill receipts for historical heads. Those
+records stay with their original application version. The control-system runtime
+integration will consume these receipts; this step does not enable new commands.

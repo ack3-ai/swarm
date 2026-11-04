@@ -144,7 +144,7 @@ describe('Cloudflare content-addressed checkpoint storage', () => {
 
     await store.ensureSchema()
 
-    expect(prepared).toHaveLength(14)
+    expect(prepared).toHaveLength(20)
     expect(prepared[0]).toContain('CREATE TABLE IF NOT EXISTS experiment_runs')
     expect(prepared[0]).toContain('terminal_reason TEXT\n  )')
     expect(prepared[1]).toContain('CREATE INDEX IF NOT EXISTS experiment_runs_by_experiment_updated')
