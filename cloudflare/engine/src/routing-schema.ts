@@ -1,3 +1,5 @@
+import { STATE_SELECTION_SQL } from './state-selection.js'
+
 // Created on demand by the store and emitted by tools/runtime-slot-seed.ts, which
 // bootstraps the slot pool before the front door has served a routed request.
 // Routing checks the run index, so a fresh database gets it here too.
@@ -117,4 +119,5 @@ export const ROUTING_SCHEMA_SQL: readonly string[] = [
     PRIMARY KEY(audit_id, command_id, version),
     UNIQUE(audit_id, revision, version)
   )`,
+  ...STATE_SELECTION_SQL,
 ]

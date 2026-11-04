@@ -725,7 +725,7 @@ describe('runtime slot admission and rotation', () => {
         .run('runs/moved/states/elsewhere', moved.proof.runId)
     })
     await expect(moved.store.archiveStoppedRunAndReleaseLease(moved.proof))
-      .rejects.toThrow('archive differs')
+      .rejects.toThrow('state selection receipts are immutable')
     expect(moved.sqlite.prepare('SELECT released_at FROM runtime_slot_run_leases WHERE run_id = ?')
       .get(moved.proof.runId)).toMatchObject({ released_at: null })
   })
