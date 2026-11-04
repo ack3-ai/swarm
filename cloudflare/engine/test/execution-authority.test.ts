@@ -103,3 +103,13 @@ it('settles an ambiguous write by reading the same immutable launch claim', asyn
   expect(await store.admitLaunch(owner, 'task', request, pointer)).toBe(true)
   expect(await store.pendingLaunches(owner)).toHaveLength(1)
 })
+
+it('allows sequential retries but never overlapping requests for one task occurrence', async () => {
+  const { store } = await fixture()
+  expect(await store.admitLaunch(owner, 'task', request, pointer)).toBe(true)
+  await expect(store.admitLaunch(owner, 'task', proof, pointer)).rejects.toThrow('reservation is missing')
+  expect(await store.pendingLaunches(owner)).toHaveLength(1)
+  await store.settleLaunch(owner, request, command)
+  expect(await store.admitLaunch(owner, 'task', proof, pointer)).toBe(true)
+  expect(await store.pendingLaunches(owner)).toMatchObject([{ requestDigest: proof }])
+})

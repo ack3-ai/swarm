@@ -167,6 +167,9 @@ export class ExecutionAuthorityStore {
             WHERE run_id = audit_execution_authority.execution_id AND status = 'running'
               AND state_key = ?7 AND state_generation = ?8))
         AND NOT ${nativeControlIntent('?6')} AND NOT ${unstartedExecution('?6')}
+        AND NOT EXISTS (SELECT 1 FROM audit_execution_launches pending
+          WHERE pending.audit_id = ?1 AND pending.epoch = ?2 AND pending.task_execution_id = ?3
+            AND pending.request_digest != ?4 AND pending.receipt_digest IS NULL)
       ON CONFLICT DO NOTHING`).bind(authority.auditId, authority.epoch, taskExecutionId, requestDigest,
       new Date().toISOString(), canonicalJson(authority), key, expected.generation).run()
     const row = await this.index.prepare(`SELECT claim.task_execution_id, claim.receipt_digest,
@@ -186,7 +189,7 @@ export class ExecutionAuthorityStore {
     }
     if (row.cancellation_pending !== 0) throw new RunCommandConflict('operation-conflict', 'native launch has no active execution authority')
     if (row.state_key !== key || row.state_generation !== expected.generation) return false
-    if (row.task_execution_id !== taskExecutionId) throw new Error('native launch reservation is missing')
+    if (row.task_execution_id !== taskExecutionId) throw new RunCommandConflict('operation-conflict', 'native launch reservation is missing or conflicts with unsettled task work')
     return true
   }
 

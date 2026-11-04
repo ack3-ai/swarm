@@ -28,7 +28,9 @@ alone proves none of those conditions.
 
 `ExecutionAuthorityStore` records an execution's pinned runtime, launch claims,
 and the transition from active to fenced to retired. A launch requires the exact
-persisted run-state pointer. Pending cancellation and unacknowledged fork startup
+persisted run-state pointer. The caller must validate the task admission and root
+Workflow startup; `activate` alone proves neither. At most one unsettled native
+request may belong to a task occurrence; a settled attempt permits a retry. Pending cancellation and unacknowledged fork startup
 block admission. Fencing closes admission; retirement additionally requires all
 admitted launch claims to have terminal evidence.
 
