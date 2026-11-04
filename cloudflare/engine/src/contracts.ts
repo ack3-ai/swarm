@@ -819,6 +819,9 @@ export interface InFlightAgentAttempt {
 }
 
 export interface RunState {
+  /** Set by the control-system startup integration, never inferred from a command. */
+  executionAuthority?: import('./execution-authority.js').ExecutionAuthority
+  controls?: import('./run-control-state.js').RunControlState
   schemaVersion: 2
   experimentId: string
   runId: string

@@ -58,3 +58,17 @@ unsupported record fields.
 This slice does not expose an endpoint, pause a scheduler, validate receipt bytes,
 or admit native cancellation or forks. Scope/lifecycle checks, effect verification
 and durable delivery remain the responsibility of the following integration.
+
+## Admission effects
+
+Pause and continue operate on exact audit, stage, pool or task scopes. Continuing
+one scope does not clear overlapping holds. The pure effect transition validates
+the configured scope and command revision, then returns a receipt bound to the
+previous state digest and resulting pauses. Repeating an already recorded decision
+returns its original receipt; a different outcome is rejected. Rejected decisions
+preserve all holds.
+
+These functions do not persist state, acknowledge the command journal, stop running
+agents or expose an endpoint. The following integration must persist the effect
+under execution ownership, verify it before acknowledgement, and consult the
+pauses before admitting new work. This PR alone does not enable operator controls.
