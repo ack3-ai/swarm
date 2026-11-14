@@ -2,12 +2,14 @@ import type { ExperimentDefinition, RunState, StageDefinition, TaskDefinition, W
 import type { DashboardDefinition } from './dashboard-release.js'
 import { sha256 } from './canonical.js'
 import { dashboardHistory } from './dashboard-history.js'
+import { readDashboardDefinition } from './dashboard-release.js'
 import { parseExactAgentExecutionReceipt } from './agent-execution-receipt.js'
 import { renderTaskPrompt, selectVisibleArtifacts } from './prompts.js'
 import { taskPromptDeadline } from './runner.js'
 import { dashboardContext, nativeSessionId } from './dashboard-context.js'
 import { dashboardFilesystem } from './dashboard-filesystem.js'
 import { providerIdentity } from './provider-identity.js'
+import { compareText } from './text-order.js'
 
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
 const digestPattern = /^[a-f0-9]{64}$/
@@ -43,24 +45,27 @@ function historicalPrompt(definition: ExperimentDefinition | undefined, state: R
   } catch { return null }
 }
 
-/** Private read-only agent view; only configured tasks and real recovery ancestors can be selected. */
+/** Private read-only agent view of this execution's configured tasks. */
 export async function readDashboardAgent(input: {
   state: RunState; definition: DashboardDefinition; stage: StageDefinition; wave: WaveDefinition; task: TaskDefinition
-  store: { getState(runId: string): Promise<RunState> }; bucket: Pick<R2Bucket, 'list' | 'get'>
+  bucket: Pick<R2Bucket, 'list' | 'get'>
+  packages?: Pick<R2Bucket, 'get'>; history?: Awaited<ReturnType<typeof dashboardHistory>>
   attempt: string | null; offset: number
 }) {
-  const { state, definition, stage, wave, task, store, bucket } = input
-  const history = await dashboardHistory(state, store, bucket)
+  const { state, definition, stage, wave, task, bucket } = input
+  const history = input.history ?? await dashboardHistory(state, bucket)
   const attempts = new Map<string, { id: string; source: RunState; requestDigest: string; attempt: number;
-    recordedAt: string; promptDigest?: string; actorId?: string | undefined; capture: Record<string, unknown> | null }>()
+    recordedAt: string; promptDigest?: string; actorId?: string | undefined; model?: string; provider?: string;
+    capture: Record<string, unknown> | null }>()
   let incomplete = history.incomplete
   let remainingReads = 32
   for (const run of history.runs) {
     for (const entry of run.live.entries.filter(entry => entry.stageId === stage.id && entry.waveId === wave.id
-      && entry.taskId === task.id && entry.model === task.model && entry.provider === providerIdentity(task))) {
+      && entry.taskId === task.id)) {
       const id = `${run.state.runId}/${entry.requestDigest}`
       attempts.set(id, { id, source: run.state, requestDigest: entry.requestDigest, attempt: entry.attempt,
-        recordedAt: entry.recordedAt, promptDigest: entry.promptDigest, actorId: entry.actorId, capture: null })
+        recordedAt: entry.recordedAt, promptDigest: entry.promptDigest, actorId: entry.actorId,
+        model: entry.model, provider: entry.provider, capture: null })
     }
     const prefix = `monitor/agent-executions/${run.state.runId}/${task.id}/`
     const listing = await bucket.list({ prefix, delimiter: '/', limit: 100 })
@@ -80,7 +85,7 @@ export async function readDashboardAgent(input: {
         if (!value) continue
         if (value.schemaVersion !== 1 || value.runId !== run.state.runId || value.requestDigest !== requestDigest
           || value.taskId !== task.id || value.stageId !== stage.id || value.waveId !== wave.id
-          || value.model !== task.model || value.provider !== providerIdentity(task)) continue
+          || typeof value.model !== 'string' || typeof value.provider !== 'string') continue
         if (typeof value.prompt !== 'string' || typeof value.promptDigest !== 'string'
           || await sha256(value.prompt) !== value.promptDigest || !Number.isSafeInteger(value.attempt)
           || Number(value.attempt) < 1 || typeof value.startedAt !== 'string' || !Number.isFinite(Date.parse(value.startedAt))) {
@@ -88,42 +93,67 @@ export async function readDashboardAgent(input: {
         }
         const id = `${run.state.runId}/${requestDigest}`
         const prior = attempts.get(id)
-        if (prior && (prior.promptDigest !== value.promptDigest || prior.attempt !== value.attempt)) {
+        if (prior && (prior.promptDigest !== value.promptDigest || prior.attempt !== value.attempt
+          || prior.model !== value.model || prior.provider !== value.provider)) {
           throw new Error('agent capture differs from its execution receipt')
         }
         attempts.set(id, { id, source: run.state, requestDigest, attempt: Number(value.attempt),
-          recordedAt: value.startedAt, promptDigest: value.promptDigest, actorId: prior?.actorId, capture: value })
+          recordedAt: value.startedAt, promptDigest: value.promptDigest, actorId: prior?.actorId,
+          model: value.model, provider: value.provider, capture: value })
       }
     }
   }
-  const ordered = [...attempts.values()].sort((a, b) => b.recordedAt.localeCompare(a.recordedAt) || b.attempt - a.attempt)
+  const ordered = [...attempts.values()].sort((a, b) => compareText(b.recordedAt, a.recordedAt) || b.attempt - a.attempt)
   const chosen = input.attempt === null ? ordered[0] : attempts.get(input.attempt)
   if (input.attempt !== null && chosen === undefined) throw new Error('attempt does not belong to this configured task and run history')
+  const admissions = chosen?.source.journal?.filter(event => event.type === 'agent.attempt-admitted'
+    && event.payload !== null && typeof event.payload === 'object'
+    && (event.payload as { dispatchDigest?: string }).dispatchDigest === chosen.requestDigest) ?? []
+  const selectedExecution = admissions.length === 1
+    ? (admissions[0]!.payload as { execution?: { releaseDigest?: string } }).execution : undefined
+  const sourceDefinition = chosen && input.packages
+    ? await readDashboardDefinition(input.packages, chosen.source, true)
+    : definition
+  const originalDefinition = selectedExecution?.releaseDigest
+    ? sourceDefinition?.releases?.get(selectedExecution.releaseDigest)
+    : sourceDefinition?.historical
+  const originalStage = originalDefinition?.stages.find(value => value.id === stage.id)
+  const originalWave = originalStage?.waves.find(value => value.id === wave.id)
+  const originalTask = originalWave?.tasks.find(value => value.id === task.id)
+  const matchingOriginal = originalTask !== undefined && chosen?.model === originalTask.model
+    && chosen.provider === providerIdentity(originalTask)
   const contexts = new Map(ordered.map(item => [item.id, dashboardContext(item.source, {
     stageId: stage.id, waveId: wave.id, taskId: task.id, attempt: item.attempt,
     promptDigest: item.promptDigest, actorId: item.actorId,
   })]))
   const base = { runId: state.runId, taskId: task.id, stageId: stage.id, waveId: wave.id, incomplete,
-    attempts: ordered.map(item => ({ id: item.id, sourceRunId: item.source.runId, attempt: item.attempt, recordedAt: item.recordedAt, context: contexts.get(item.id) })),
+    sourceReference: history.sourceReference,
+    attempts: ordered.map(item => ({ id: item.id, sourceRunId: item.source.runId, attempt: item.attempt,
+      recordedAt: item.recordedAt, model: item.model ?? null, provider: item.provider ?? null,
+      context: contexts.get(item.id) })),
     selectedAttempt: chosen?.id ?? null, sourceRunId: chosen?.source.runId ?? null,
+    selectedModel: chosen?.model ?? null, selectedProvider: chosen?.provider ?? null,
+    selectedReleaseDigest: selectedExecution?.releaseDigest ?? null,
     context: chosen ? contexts.get(chosen.id)! : null,
-    filesystem: dashboardFilesystem(chosen?.source ?? state, definition, task, chosen ? {
+    filesystem: dashboardFilesystem(chosen?.source ?? state, originalDefinition && matchingOriginal
+      ? { stages: originalDefinition.stages } : definition, matchingOriginal ? originalTask : task, chosen ? {
       stageId: stage.id, waveId: wave.id, attempt: chosen.attempt,
       ...(chosen.promptDigest ? { promptDigest: chosen.promptDigest } : {}),
     } : null) }
-  const protocol = definition.historical?.prompts?.researcherProtocol
+  const protocol = matchingOriginal ? originalDefinition?.prompts?.researcherProtocol : undefined
   let promptText: string | null = null
   let promptStatus: 'recorded' | 'verified-reconstruction' | 'unavailable' = 'unavailable'
   if (chosen?.capture) { promptText = String(chosen.capture.prompt); promptStatus = 'recorded' }
   else if (chosen) {
-    const candidate = historicalPrompt(definition.historical, chosen.source, stage, wave, task, chosen.promptDigest)
+    const candidate = matchingOriginal ? historicalPrompt(originalDefinition, chosen.source,
+      originalStage!, originalWave!, originalTask!, chosen.promptDigest) : null
     if (candidate !== null && await sha256(candidate) === chosen.promptDigest) {
       promptText = candidate; promptStatus = 'verified-reconstruction'
     }
   }
   const prompt = { text: promptText, status: promptStatus, digest: chosen?.promptDigest ?? null,
     researcherProtocol: typeof chosen?.capture?.researcherProtocol === 'string' ? chosen.capture.researcherProtocol
-      : task.promptKind === 'research' && typeof protocol === 'string' ? protocol : null }
+      : matchingOriginal && task.promptKind === 'research' && typeof protocol === 'string' ? protocol : null }
   const events: AgentLogEvent[] = []
   if (chosen?.capture) {
     const prefix = `monitor/agent-executions/${chosen.source.runId}/${task.id}/${chosen.requestDigest}/`

@@ -1,3 +1,5 @@
+import { createControlledMachine } from './support/controlled-machine.js'
+import { restoreSelected } from './support/selected-snapshots.js'
 import { describe, expect, it } from 'vitest'
 import type { AgentProvider, AgentRequest } from '../src/contracts.js'
 import {
@@ -13,10 +15,10 @@ import { MemoryArtifactStore, runExperiment } from './support/memory-runner.js'
 
 async function runWith(provider: AgentProvider, runId: string) {
   const release = await sealReleasePackage(audit0PackageBody)
-  const machine = await RunMachine.create(audit0Definition, release.digest, runId, '2026-09-18T20:00:00.000Z')
+  const machine = await createControlledMachine(audit0Definition, release.digest, runId, '2026-09-18T20:00:00.000Z')
   const store = new MemoryArtifactStore()
   const outcome = await runExperiment({ definition: audit0Definition, machine, provider, artifactStore: store })
-  return { outcome, store }
+  return { outcome, store, machine }
 }
 
 function malformed(request: AgentRequest, result: Awaited<ReturnType<AgentProvider['run']>>) {
@@ -28,7 +30,7 @@ describe('durable output-only correction boundary', () => {
     const base = new DeterministicAuditProvider()
     const requests: AgentRequest[] = []
     const target = 'core-wave-0-research-1'
-    const { outcome, store } = await runWith({ async run(request) {
+    const { outcome, store, machine } = await runWith({ async run(request) {
       const result = await base.run(request)
       if (request.task.id !== target) return result
       requests.push(request)
@@ -50,19 +52,17 @@ describe('durable output-only correction boundary', () => {
     expect(rejections).toHaveLength(10)
     expect(rejections.every(value => value.outputDigest !== null && store.contents.has(value.quarantineUri!))).toBe(true)
     expect(rejections.map(value => value.formatRepairOrdinal)).toEqual([undefined, ...Array.from({ length: 9 }, (_, i) => i + 1)])
-    await expect(RunMachine.fromState(audit0Definition, outcome.state)).resolves.toBeDefined()
+    await expect(restoreSelected(machine, outcome.state)).resolves.toBeDefined()
     const changed = structuredClone(outcome.state)
     const correction = changed.rejectedAttempts.find(value => value.taskId === target && value.formatRepairOrdinal === 1)!
     correction.formatRepairSourceDigest = '0'.repeat(64)
-    await expect(RunMachine.fromState(audit0Definition, changed)).rejects.toThrow()
-    await expect(RunMachine.resume(audit0Definition, outcome.checkpoints.at(-1)!, 'format-tenth-success-resume'))
-      .resolves.toBeDefined()
+    await expect(restoreSelected(machine, changed)).rejects.toThrow()
   })
 
   it('stops after ten unsuccessful corrections and retains every quarantined response', async () => {
     const base = new DeterministicAuditProvider()
     const release = await sealReleasePackage(audit0PackageBody)
-    const machine = await RunMachine.create(audit0Definition, release.digest, 'format-ten-exhausted')
+    const machine = await createControlledMachine(audit0Definition, release.digest, 'format-ten-exhausted')
     const store = new MemoryArtifactStore()
     const attempts: number[] = []
     const target = 'core-wave-0-research-1'
@@ -86,7 +86,7 @@ describe('durable output-only correction boundary', () => {
     const requests: AgentRequest[] = []
     const target = 'additive-wave-0-research-1'
     const sessionId = 'session-11111111-1111-4111-8111-111111111111'
-    const { outcome } = await runWith({ async run(request) {
+    const { outcome, machine } = await runWith({ async run(request) {
       const result = await base.run(request)
       if (request.task.id !== target) return result
       requests.push(request)
@@ -109,7 +109,7 @@ describe('durable output-only correction boundary', () => {
     expect(outcome.state.rejectedAttempts.filter(value => value.taskId === target)
       .map(value => [value.outputDigest === null, value.formatRepairOrdinal ?? null]))
       .toEqual([[true, null], [false, null]])
-    await expect(RunMachine.fromState(audit0Definition, outcome.state)).resolves.toBeDefined()
+    await expect(restoreSelected(machine, outcome.state)).resolves.toBeDefined()
   })
 
   it('reattaches an interrupted correction to the same ordinal and prompt', async () => {
@@ -117,7 +117,7 @@ describe('durable output-only correction boundary', () => {
     const target = 'core-wave-0-research-1'
     const requests: AgentRequest[] = []
     let interrupted = false
-    const { outcome } = await runWith({ async run(request) {
+    const { outcome, machine } = await runWith({ async run(request) {
       const result = await base.run(request)
       if (request.task.id !== target) return result
       requests.push(request)
@@ -139,7 +139,7 @@ describe('durable output-only correction boundary', () => {
   it('reconstructs a persisted correction without repeating the original research turn', async () => {
     const base = new DeterministicAuditProvider()
     const release = await sealReleasePackage(audit0PackageBody)
-    let machine = await RunMachine.create(audit0Definition, release.digest, 'format-persisted-reattach')
+    let machine = await createControlledMachine(audit0Definition, release.digest, 'format-persisted-reattach')
     const store = new MemoryArtifactStore()
     const requests: AgentRequest[] = []
     const provider: AgentProvider = { async run(request) {
@@ -154,7 +154,7 @@ describe('durable output-only correction boundary', () => {
     }
     const persisted = machine.snapshot()
     expect(persisted.rejectedAttempts.some(value => value.taskId === 'core-wave-0-research-1')).toBe(true)
-    machine = await RunMachine.fromState(audit0Definition, persisted)
+    machine = await restoreSelected(machine, persisted)
     const outcome = await runExperiment({ definition: audit0Definition, machine, provider, artifactStore: store })
     expect(outcome.state.status).toBe('completed')
     expect(requests.map(request => request.attempt)).toEqual([1, 2])
@@ -166,7 +166,7 @@ describe('durable output-only correction boundary', () => {
     const target = 'additive-wave-0-research-1'
     const sessionId = 'session-11111111-1111-4111-8111-111111111111'
     const requests: AgentRequest[] = []
-    const { outcome } = await runWith({ async run(request) {
+    const { outcome, machine } = await runWith({ async run(request) {
       const result = await base.run(request)
       if (request.task.id !== target) return result
       requests.push(request)
@@ -187,13 +187,13 @@ describe('durable output-only correction boundary', () => {
     expect(requests[2]?.nativeTransport?.sessionId).toBe(sessionId)
     expect(requests[2]?.promptDigest).toBe(requests[1]?.promptDigest)
     expect(outcome.state.rejectedAttempts.filter(value => value.taskId === target)).toHaveLength(2)
-    await expect(RunMachine.fromState(audit0Definition, outcome.state)).resolves.toBeDefined()
+    await expect(restoreSelected(machine, outcome.state)).resolves.toBeDefined()
   })
 
   it('never treats provider identity or usage corruption as agent formatting', async () => {
     const base = new DeterministicAuditProvider()
     const release = await sealReleasePackage(audit0PackageBody)
-    const machine = await RunMachine.create(audit0Definition, release.digest, 'format-integrity-boundary')
+    const machine = await createControlledMachine(audit0Definition, release.digest, 'format-integrity-boundary')
     const store = new MemoryArtifactStore()
     const attempts: number[] = []
     await expect(runExperiment({ definition: audit0Definition, machine, artifactStore: store,
@@ -211,7 +211,7 @@ describe('durable output-only correction boundary', () => {
   it('retains the original quarantined output and workspace when correction transport exhausts', async () => {
     const base = new DeterministicAuditProvider()
     const release = await sealReleasePackage(audit0PackageBody)
-    const machine = await RunMachine.create(audit0Definition, release.digest, 'format-transport-exhausted')
+    const machine = await createControlledMachine(audit0Definition, release.digest, 'format-transport-exhausted')
     const store = new MemoryArtifactStore()
     const disposed: string[] = []
     const attempts: number[] = []
@@ -239,7 +239,7 @@ describe('durable output-only correction boundary', () => {
   it('does not open a model correction lane for deterministic output failure', async () => {
     const base = new DeterministicAuditProvider()
     const release = await sealReleasePackage(audit0PackageBody)
-    const machine = await RunMachine.create(audit0Definition, release.digest, 'format-deterministic-boundary')
+    const machine = await createControlledMachine(audit0Definition, release.digest, 'format-deterministic-boundary')
     const calls: number[] = []
     await expect(runExperiment({ definition: audit0Definition, machine, artifactStore: new MemoryArtifactStore(),
       provider: { async run(request) {
@@ -258,7 +258,7 @@ describe('durable output-only correction boundary', () => {
         .find(candidate => candidate.promptKind === promptKind && candidate.providerClass !== 'deterministic')!
       const base = new DeterministicAuditProvider()
       const requests: AgentRequest[] = []
-      const { outcome } = await runWith({ async run(request) {
+      const { outcome, machine } = await runWith({ async run(request) {
         const result = await base.run(request)
         if (request.task.id !== task.id) return result
         requests.push(request)

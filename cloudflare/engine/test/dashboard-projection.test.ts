@@ -49,7 +49,8 @@ function artifact(taskId: string, overrides: Partial<ArtifactRecord> = {}): Arti
     contentDigest: `output-${taskId}`, uri: `memory://${taskId}`, files: ['result.md'], assertions: [], protocol: {}, usage: usage(10), ...overrides }
 }
 function state(overrides: Partial<RunState> = {}): RunState {
-  const value: RunState = { schemaVersion: 2, experimentId: definition.id, runId: 'child', stateGeneration: 10,
+  const value: RunState = { schemaVersion: 3, experimentId: definition.id, runId: 'child', stateGeneration: 10,
+    executionAuthority: { auditId: 'root', executionId: 'child', epoch: 1, runtimeDigest: 'a'.repeat(64) },
     rootRunId: 'root', rootCreatedAt: at, modelStartedAt: at, phase: 'discovery', recoveryEpoch: 1,
     parentRunId: 'root', parentCheckpointDigest: 'checkpoint', releaseDigest: 'release', definitionDigest: 'definition',
     status: 'running', cursor: { stageIndex: 0, waveIndex: 1 }, artifacts: [], rejectedAttempts: [], stageEndReceipts: [],
@@ -92,8 +93,34 @@ describe('read-only dashboard projection', () => {
     }]).costAccountingComplete).toBe(true)
   })
   const minute = (n: number) => new Date(Date.parse(at) + n * 60_000).toISOString()
-  const admission = { stageId: 'discovery', waveId: 'wave-0', cursor: { stageIndex: 0, waveIndex: 0 }, admittedAt: at }
+  const admission = { taskOccurrences: [], inputArtifacts: [], inputDigest: '0'.repeat(64),
+    configuration: { releaseDigest: 'a'.repeat(64), definitionDigest: 'b'.repeat(64) }, stageId: 'discovery', waveId: 'wave-0', cursor: { stageIndex: 0, waveIndex: 0 }, admittedAt: at }
   const sealed = { stageId: 'discovery', waveId: 'wave-0', startedAt: at, completedAt: minute(10), durationMs: 600_000, artifactDigests: ['output-a'] }
+
+  it('shows a terminal provider failure as blocked at the current admission', () => {
+    const waveAdmission = { ...admission, taskOccurrences: [{ taskId: 'b', taskExecutionId: 'b-1' }] } as unknown as NonNullable<RunState['waveAdmission']>
+    const input = state({ cursor: { stageIndex: 0, waveIndex: 0 },
+      executionAuthority: {} as NonNullable<RunState['executionAuthority']>, waveAdmission,
+      journal: [
+        { sequence: 1, type: 'wave.admitted', at, previousDigest: null, digest: 'a'.repeat(64), payload: waveAdmission },
+        { sequence: 2, type: 'task.failed', at: minute(1), previousDigest: 'a'.repeat(64), digest: 'b'.repeat(64),
+          payload: { taskId: 'b', taskExecutionId: 'b-1', category: 'provider-rejected', retryable: false,
+            error: 'Provider quota unavailable' } },
+      ] })
+    const result = buildDashboardSnapshot(input, definition, emptyLive, minute(2))
+    expect(result.waves[0]?.tasks.find(item => item.taskId === 'b')).toMatchObject({ status: 'blocked',
+      statusDetail: 'Provider quota unavailable' })
+    expect(result.control?.blockedTasks).toEqual([expect.objectContaining({ taskId: 'b' })])
+  })
+
+  it('labels a stage fork by the stage it reruns', () => {
+    const input = state({ rootRunId: 'new-audit', parentRunId: null,
+      forkOrigin: { source: { runId: 'source-audit', state: { generation: 4, digest: 'a'.repeat(64) } },
+        stageId: 'review' } as NonNullable<RunState['forkOrigin']> })
+    const result = buildDashboardSnapshot(input, definition, emptyLive, at)
+    expect(result.run.fork).toEqual({ sourceRunId: 'source-audit', sourceGeneration: 4,
+      sourceDigest: 'a'.repeat(64), boundary: 'from review' })
+  })
 
   it.each([0, 1432])('uses a sealed single-task supervisor boundary (%i ms) without inventing provider usage', elapsedMs => {
     const configured = structuredClone(definition)
@@ -361,6 +388,18 @@ describe('read-only dashboard projection', () => {
     const stale = buildDashboardSnapshot(state({ rejectedAttempts: [rejection('a', { attempt: 2 })] }), definition,
       { ...emptyLive, entries: [receipt('a')] }, at)
     expect(stale.waves[0]?.tasks[0]?.status).toBe('rejected')
+  })
+
+  it('says when a rejected task waits in provider backoff, and until when (P2-06)', () => {
+    const backoff = { signature: 'claude:OVERLOADED', delayMs: 5 * 60_000 }
+    const waiting = (generatedAt: string, extra: Record<string, unknown> = {}) => buildDashboardSnapshot(state({
+      cursor: { stageIndex: 0, waveIndex: 0 },
+      rejectedAttempts: [rejection('a', { rejectedAt: minute(2), providerBackoff: backoff, ...extra })] }),
+    definition, emptyLive, generatedAt).waves[0]?.tasks[0]
+    expect(waiting(minute(3))).toMatchObject({ status: 'rejected',
+      statusDetail: `Provider backoff until ${minute(7)} (claude:OVERLOADED)` })
+    expect(waiting(minute(8))).not.toHaveProperty('statusDetail')
+    expect(waiting(minute(3), { providerBackoff: undefined })).not.toHaveProperty('statusDetail')
   })
 
   it('uses recovery admission for status while retaining inherited rejection accounting', () => {
@@ -729,4 +768,17 @@ describe('independent discovery views', () => {
     expect(result.waves.find(wave => wave.id === 'wave-0@endpoint-b')).toMatchObject({ status: 'pending', startedAt: null })
     expect(result.findings.find(finding => finding.id === 'OBS-SLOW')).toMatchObject({ firstContributors: [], earliestWave: null })
   })
+})
+
+it('shows inferred research-pool pauses using the scheduler scope rules', () => {
+  const source = state({ cursor: { stageIndex: 0, waveIndex: 0 },
+    controls: { revision: 1, pauses: [{ kind: 'pool', poolId: 'luna' }],
+      lastReceipt: { auditId: 'root', executionId: 'child', revision: 1, commandId: 'pause-pool',
+        commandDigest: 'a'.repeat(64), previousStateDigest: 'b'.repeat(64), pausesDigest: 'c'.repeat(64),
+        settledAt: at, outcome: { status: 'applied' } } } })
+  const configured = structuredClone(definition)
+  configured.stages[0]!.waves[0]!.tasks[1]!.providerClass = 'additive'
+  const tasks = buildDashboardSnapshot(source, configured, emptyLive).waves[0]!.tasks
+  expect(tasks.find(value => value.taskId === 'a')!.status).toBe('paused')
+  expect(tasks.find(value => value.taskId === 'b')!.status).toBe('awaiting-result')
 })

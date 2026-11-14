@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+import { stripTypeScriptTypes } from 'node:module'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from 'jose'
 import { dashboardAccessAllowed, monitoringRequestFromDashboard } from '../src/dashboard-access.js'
@@ -96,5 +98,28 @@ describe('dashboard Access boundary', () => {
     const input = new Request('https://swarm.example.workers.dev/dashboard/api/runs/run-a?view=full')
     expect(monitoringRequestFromDashboard(input)?.url).toBe('https://swarm.example.workers.dev/v1/monitor/runs/run-a?view=full')
     expect(monitoringRequestFromDashboard(new Request('https://swarm.example.workers.dev/v1/monitor/runs'))).toBeNull()
+  })
+
+  it('answers a failed dashboard API read with a JSON error, as the monitor routes do', async () => {
+    const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8')
+    const start = source.indexOf('      const dashboardRequest = monitoringRequestFromDashboard(request)')
+    expect(start).toBeGreaterThan(-1)
+    const branch = source.slice(start, source.indexOf('\n    }\n', start))
+    const handle = new Function('json', 'monitoringRequestFromDashboard', 'CloudflareRunStore', 'R2ArtifactStore',
+      'monitoringRoute', 'dashboardWorkflowStatus',
+      `${stripTypeScriptTypes(`async function handle(request, env) { ${branch} }`)}; return handle;`)
+    const route = vi.fn()
+    const run = (path: string) => handle((value: unknown, status = 200) => Response.json(value, { status }),
+      monitoringRequestFromDashboard, class {}, class {}, route, vi.fn())(
+      new Request(`https://swarm.example.workers.dev${path}`), {})
+    route.mockRejectedValueOnce(new Error('run state digest mismatch'))
+    const failed = await run('/dashboard/api/runs/run-a')
+    expect(failed.status).toBe(400)
+    expect(await failed.json()).toEqual({ error: 'run state digest mismatch' })
+    route.mockResolvedValueOnce(Response.json({ runs: [] }))
+    expect(await (await run('/dashboard/api/runs')).json()).toEqual({ runs: [] })
+    expect(route.mock.calls.map(([input]) => (input as Request).url)).toEqual([
+      'https://swarm.example.workers.dev/v1/monitor/runs/run-a', 'https://swarm.example.workers.dev/v1/monitor/runs',
+    ])
   })
 })

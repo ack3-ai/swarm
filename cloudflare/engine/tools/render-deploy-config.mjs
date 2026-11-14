@@ -80,6 +80,18 @@ config.vars = {
   ...catalogBindings(catalog),
 }
 config.secrets = { required: ['CONTROL_API_TOKEN'] }
+// Optional native read access for post-retention fixture cleanup. No provider keys.
+const observationStore = process.env.ACK3_SECRETS_STORE_ID
+if (observationStore !== undefined) {
+  const account = process.env.ACK3_CLOUDFLARE_ACCOUNT_ID
+  if (!/^[a-f0-9]{32}$/i.test(observationStore) || !/^[a-f0-9]{32}$/i.test(account ?? '')) {
+    throw new Error('native observation requires valid Secrets Store and account IDs')
+  }
+  config.vars.ACK3_CLOUDFLARE_ACCOUNT_ID = account
+  config.secrets_store_secrets = [{ binding: 'CLOUDFLARE_OBSERVABILITY_TOKEN',
+    store_id: observationStore, secret_name: 'swarm-cloudflare-observability-token' }]
+}
+
 config.workers_dev = true
 config.version_metadata = { binding: 'VERSION_METADATA' }
 config.services = Object.values(catalog.releases).map(release => {

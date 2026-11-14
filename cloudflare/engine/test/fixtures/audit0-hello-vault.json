@@ -24,7 +24,7 @@
     "maxModelCalls": 80,
     "maxDiscoveryRuntimeMs": 18000000
   },
-  "maxDiscoveryWaves": 64,
+  "maxDiscoveryWaves": 16,
   "modelPools": [
     {
       "id": "luna",
@@ -80,5 +80,6 @@
     "verification",
     "reporting"
   ],
-  "promptFile": "../../../../docs/examples/prompts.json"
+  "promptFile": "../../../../docs/examples/prompts.json",
+  "submitCheck": false
 }

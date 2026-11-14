@@ -1,5 +1,9 @@
-import { modelHeaderCredentialNames, validCodexAccessProgram } from '../container/reasoning-config.mjs'
-import { INSTRUCTION_KEYS, validateStagePrompts, validateStages } from './methods/system-prompts.js'
+import { modelHeaderCredentialNames, validClaudeAccounts, validCodexAccessProgram } from '../container/reasoning-config.mjs'
+import {
+  AUDIT_SCOPE_MAX_BYTES, INSTRUCTION_KEYS, POC_INSTRUCTION_KEYS, RESEARCH_DELTA_INSTRUCTION_KEYS, SCOPE_INSTRUCTION_KEYS, SCRATCH_CAPTURE,
+  SUBMIT_CHECK_INSTRUCTION_KEYS, validateStagePrompts, validateStages,
+} from './methods/system-prompts.js'
+import { SCRATCH_DIRECTORY_PATTERN } from '../container/scratch-rules.mjs'
 import {
   STAGE_KINDS,
   type ExperimentDefinition,
@@ -12,10 +16,12 @@ import { canonicalJson } from './canonical.js'
 import { requiresSubmission, SUBMISSION_PATH } from './submission.js'
 import { taskBackend } from './provider-identity.js'
 import { requestedEnvironmentImageDigest } from './environment-image.js'
+import { RECON_INSTRUCTION_KEYS, validateReconRelease } from './recon.js'
 
 const idPattern = /^[a-z0-9][a-z0-9._-]{0,99}$/
 const shaPattern = /^[0-9a-f]{40,64}$/
 const outputPathPattern = /^[A-Za-z0-9.][A-Za-z0-9._/-]{0,239}$/
+export const CLAUDE_FALLBACK_RULE = 'list 1 to 7 different CLAUDE_*OAUTH_TOKEN bindings, none equal to credentialSource or CLAUDE_CODE_OAUTH_TOKEN'
 
 function requireValue(condition: unknown, message: string): asserts condition {
   if (!condition) throw new TypeError(message)
@@ -75,16 +81,17 @@ function validateDefinitionShape(definition: ExperimentDefinition): void {
     'repository', 'commit', 'tree', 'sourcePackageVersion', 'production', 'resettable', 'runtime',
   ], 'experiment.target')
   rejectUnknownKeys(definition.target.runtime, [
-    'environmentBindings', 'preflightCommands', 'workspacePreparation',
+    'environmentBindings', 'preflightCommands', 'workspacePreparation', 'buildRequired', 'commandTimeoutMinutes',
   ], 'experiment.target.runtime')
   rejectUnknownKeys(definition.limits, [
     'maxWallTimeMs', 'maxModelCalls', 'maxInputTokens', 'maxOutputTokens', 'maxCostUsd', 'phaseMinutes',
   ], 'experiment.limits')
   rejectUnknownKeys(definition.limits.phaseMinutes, ['discovery'], 'experiment.limits.phaseMinutes')
   rejectUnknownKeys(definition.policy, [
-    'authorization', 'outcome', 'doneWhen', 'notDoneWhen', 'evidenceRules', 'completionRules',
+    'authorization', 'outcome', 'scope', 'doneWhen', 'notDoneWhen', 'evidenceRules', 'completionRules',
   ], 'experiment.policy')
-  rejectUnknownKeys(definition.prompts, INSTRUCTION_KEYS, 'experiment.prompts')
+  rejectUnknownKeys(definition.prompts, [...INSTRUCTION_KEYS, ...SCOPE_INSTRUCTION_KEYS, ...POC_INSTRUCTION_KEYS,
+    ...SUBMIT_CHECK_INSTRUCTION_KEYS, ...RESEARCH_DELTA_INSTRUCTION_KEYS, ...RECON_INSTRUCTION_KEYS], 'experiment.prompts')
   if (definition.forceSearchStages !== undefined) {
     requireValue(definition.forceSearch?.enabled === true, 'forceSearchStages requires forceSearch')
     requireValue(Array.isArray(definition.forceSearchStages)
@@ -126,7 +133,8 @@ function validateDefinitionShape(definition: ExperimentDefinition): void {
   }
   for (const [index, pool] of definition.pools.entries()) {
     rejectUnknownKeys(pool, [
-      'id', 'backend', 'provider', 'connection', 'model', 'cyberAccessProgram', 'reasoningEffort', 'thinking', 'subagents', 'credentialSource', 'agents', 'required',
+      'id', 'backend', 'provider', 'connection', 'model', 'cyberAccessProgram', 'reasoningEffort', 'thinking', 'subagents', 'credentialSource',
+      'fallbackCredentialSources', 'agents', 'required',
     ], `experiment.pools[${index}]`)
     if (pool.connection !== undefined) {
       rejectUnknownKeys(pool.connection, ['baseUrl', 'apiKeyEnv', 'headersEnv', 'usageWindowWait', 'contextWindow', 'maxTokens', 'costRates'], `experiment.pools[${index}].connection`)
@@ -140,7 +148,7 @@ function validateDefinitionShape(definition: ExperimentDefinition): void {
       rejectUnknownKeys(pool.subagents, ['default', 'stages'], `experiment.pools[${index}].subagents`)
       if (pool.subagents.stages !== undefined) {
         rejectUnknownKeys(pool.subagents.stages, [
-          'discovery', 'synthesis', 'coverage', 'negative-review', 'verification', 'reporting',
+          'recon', 'discovery', 'synthesis', 'coverage', 'negative-review', 'verification', 'reporting',
         ], `experiment.pools[${index}].subagents.stages`)
       }
     }
@@ -163,15 +171,20 @@ function validateDefinitionShape(definition: ExperimentDefinition): void {
         const taskPath = `${wavePath}.tasks[${taskIndex}]`
         rejectUnknownKeys(task, [
           'id', 'logicalRole', 'objective', 'providerClass', 'modelPool', 'model', 'cyberAccessProgram', 'reasoning', 'thinking', 'subagents', 'promptKind',
-          'backend', 'provider', 'connection', 'credentialSource',
+          'backend', 'provider', 'connection', 'credentialSource', 'fallbackCredentialSources',
           'visibility', 'workspaceMode', 'workspaceKey', 'output', 'research', 'perspective',
-          'observationPrefix', 'requiredTable', 'optional', 'retryPolicy',
+          'observationPrefix', 'requiredTable', 'optional', 'submitCheck', 'retryPolicy',
         ], taskPath)
         rejectUnknownKeys(task.output, ['schema', 'requiredFiles', 'requiredSections'], `${taskPath}.output`)
         if (task.research !== undefined) {
           rejectUnknownKeys(task.research, [
-            'wave', 'researcher', 'role', 'buildsOn', 'laneScratchPath',
+            'wave', 'researcher', 'role', 'buildsOn', 'laneScratchPath', 'scratchCapture',
           ], `${taskPath}.research`)
+          if (task.research.scratchCapture !== undefined) {
+            requireValue(canonicalJson(task.research.scratchCapture) === canonicalJson(SCRATCH_CAPTURE)
+              && SCRATCH_DIRECTORY_PATTERN.test(task.research.laneScratchPath),
+            `${taskPath}.research.scratchCapture must use the sealed PoC capture limits and lane path`)
+          }
         }
       }
     }
@@ -179,6 +192,7 @@ function validateDefinitionShape(definition: ExperimentDefinition): void {
 }
 
 function taskSubagentStage(task: TaskDefinition): SubagentStage | null {
+  if (task.promptKind === 'recon') return 'recon'
   if (task.promptKind === 'research') return 'discovery'
   if (task.promptKind === 'synthesis') return 'synthesis'
   if (task.promptKind === 'coverage-challenge') return 'coverage'
@@ -208,9 +222,14 @@ export function validateExperiment(definition: ExperimentDefinition): void {
     requireValue(/^[A-Z][A-Z0-9_]{0,127}$/.test(name), `invalid target runtime environment variable: ${name}`)
     requireValue(/^TARGET_[A-Z0-9_]{1,120}$/.test(binding), `invalid target runtime Cloudflare secret binding: ${binding}`)
   }
+  const commandTimeout = definition.target.runtime.commandTimeoutMinutes
+  requireValue(commandTimeout === undefined || (Number.isSafeInteger(commandTimeout) && commandTimeout >= 1 && commandTimeout <= 720),
+    'target runtime commandTimeoutMinutes must be a whole number of minutes between 1 and 720')
+  const buildRequired = definition.target.runtime.buildRequired
+  requireValue(buildRequired === undefined || buildRequired === false, 'target runtime buildRequired may only be sealed as false')
   requireValue(Array.isArray(definition.target.runtime.preflightCommands)
-    && definition.target.runtime.preflightCommands.length > 0,
-  'target runtime preflightCommands must be a non-empty array')
+    && (definition.target.runtime.preflightCommands.length > 0 || buildRequired === false),
+  'target runtime preflightCommands must be a non-empty array unless the build is optional')
   for (const command of definition.target.runtime.preflightCommands) {
     requireValue(typeof command === 'string' && command.trim().length > 0 && command.length <= 4_096,
       'target runtime preflight command is invalid')
@@ -244,8 +263,47 @@ export function validateExperiment(definition: ExperimentDefinition): void {
   requireValue(definition.stages.length > 0, 'at least one stage is required')
   requireValue(INSTRUCTION_KEYS.every(key => typeof definition.prompts[key] === 'string' && definition.prompts[key].trim() !== ''),
     'every agent instruction must be non-empty text')
+  // Optional: releases sealed before it existed have none and render as before.
+  requireValue(RESEARCH_DELTA_INSTRUCTION_KEYS.every(key => definition.prompts[key] === undefined
+    || (typeof definition.prompts[key] === 'string' && definition.prompts[key].trim() !== '')), 'researchDelta must be non-empty text')
+  // A scope and its rules are sealed together; releases without a scope have neither.
+  const scope = definition.policy.scope
+  if (scope === undefined) {
+    requireValue(SCOPE_INSTRUCTION_KEYS.every(key => definition.prompts[key] === undefined), 'scope instructions require an audit scope')
+  } else {
+    requireValue(typeof scope === 'string' && scope.trim() !== ''
+      && new TextEncoder().encode(scope).byteLength <= AUDIT_SCOPE_MAX_BYTES, 'audit scope must be non-empty text within its size limit')
+    requireValue(SCOPE_INSTRUCTION_KEYS.every(key => typeof definition.prompts[key] === 'string' && definition.prompts[key].trim() !== ''),
+      'an audit scope requires non-empty scopeRules and scopeReminder')
+  }
+  // PoC capture is sealed for every research task, with both PoC instructions and a verifier, or not at all.
+  const researchTasks = definition.stages.flatMap(stage => stage.waves.flatMap(wave => wave.tasks))
+    .filter(task => task.research !== undefined)
+  const captured = researchTasks.filter(task => task.research!.scratchCapture !== undefined).length
+  if (captured === 0) {
+    requireValue(POC_INSTRUCTION_KEYS.every(key => definition.prompts[key] === undefined), 'PoC instructions require keepPocs')
+  } else {
+    requireValue(captured === researchTasks.length, 'keepPocs must capture every research task')
+    requireValue(POC_INSTRUCTION_KEYS.every(key => typeof definition.prompts[key] === 'string' && definition.prompts[key].trim() !== ''),
+      'keepPocs requires non-empty pocCapture and pocReview')
+    requireValue(definition.stages.some(stage => stage.kind === 'verification'), 'keepPocs requires a verification stage')
+  }
+  // submitCheck is sealed on every model task with its instruction, or not at all.
+  const allTasks = definition.stages.flatMap(stage => stage.waves.flatMap(wave => wave.tasks))
+  const checked = allTasks.filter(task => task.submitCheck !== undefined)
+  requireValue(checked.every(task => task.submitCheck === true && task.providerClass !== 'deterministic'),
+    'submitCheck must be true and only on model tasks')
+  if (checked.length === 0) {
+    requireValue(SUBMIT_CHECK_INSTRUCTION_KEYS.every(key => definition.prompts[key] === undefined), 'the submitCheck instruction requires submitCheck')
+  } else {
+    requireValue(checked.length === allTasks.filter(task => task.providerClass !== 'deterministic').length,
+      'submitCheck must cover every model task')
+    requireValue(SUBMIT_CHECK_INSTRUCTION_KEYS.every(key => typeof definition.prompts[key] === 'string' && definition.prompts[key].trim() !== ''),
+      'submitCheck requires a non-empty submitCheck instruction')
+  }
   const configuredStages = definition.stages.filter(stage => stage.kind !== 'preflight').map(stage => stage.kind) as import('./contracts.js').AuditStageKind[]
   validateStages(configuredStages)
+  validateReconRelease(definition)
   validateStagePrompts(definition.stagePrompts, configuredStages)
   const releaseRoles = [
     {
@@ -306,6 +364,12 @@ export function validateExperiment(definition: ExperimentDefinition): void {
       requireValue(pool.subagents?.default.mode !== 'native'
         && !Object.values(pool.subagents?.stages ?? {}).some(policy => policy.mode === 'native'),
       `model pool ${pool.id} does not support bounded native subagents`)
+    }
+    if (pool.fallbackCredentialSources !== undefined) {
+      requireValue(pool.backend === 'claude', `model pool ${pool.id}: fallbackCredentialSources is only supported on Claude pools`)
+      requireValue(Array.isArray(pool.fallbackCredentialSources)
+        && validClaudeAccounts([pool.credentialSource, ...pool.fallbackCredentialSources]),
+      `model pool ${pool.id} has invalid fallbackCredentialSources: ${CLAUDE_FALLBACK_RULE}`)
     }
     if (pool.backend === 'dsh-chat-completions') {
       requireValue(typeof pool.provider === 'string' && /^[a-z0-9][a-z0-9._-]{0,99}$/.test(pool.provider),
@@ -412,7 +476,7 @@ export function validateExperiment(definition: ExperimentDefinition): void {
           || (task.retryPolicy === 'redirect-then-fresh-replacement' && task.providerClass === 'core' && task.promptKind === 'research')
           || (task.retryPolicy === 'fresh-repair' && task.providerClass === 'additive')
           || (task.retryPolicy === 'same-session-repair' && task.providerClass === 'core'
-            && (task.promptKind === 'synthesis' || task.promptKind === 'coverage-challenge'
+            && (task.promptKind === 'recon' || task.promptKind === 'synthesis' || task.promptKind === 'coverage-challenge'
               || task.promptKind === 'negative-review' || task.promptKind === 'verification'
               || task.promptKind === 'reporting'))
         requireValue(permittedRetry, `task ${task.id} has an invalid retry policy`)
@@ -427,6 +491,7 @@ export function validateExperiment(definition: ExperimentDefinition): void {
           if (pool.id !== task.modelPool) return false
           if ((backend === 'claude' || task.credentialSource !== undefined)
             && task.credentialSource !== pool.credentialSource) return false
+          if (canonicalJson(pool.fallbackCredentialSources) !== canonicalJson(task.fallbackCredentialSources)) return false
           if (pool.model !== task.model || pool.backend !== backend) return false
           if (pool.cyberAccessProgram !== task.cyberAccessProgram) return false
           if (pool.provider !== task.provider || canonicalJson(pool.connection) !== canonicalJson(task.connection)) return false

@@ -18,6 +18,11 @@ export function claudeOptions(request, environment) {
     CLAUDECODE: '',
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
   })
+  // A sealed command time limit also caps how long one foreground command may wait.
+  if (request.commandTimeoutMs !== undefined) {
+    env.BASH_MAX_TIMEOUT_MS = String(request.commandTimeoutMs)
+    env.BASH_DEFAULT_TIMEOUT_MS = String(Math.min(120_000, request.commandTimeoutMs))
+  }
   // Use the full native response allowance for these models; other defaults stay native.
   if (['claude-fable-5-1', 'claude-opus-5-5'].includes(request.model)) {
     env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = '128000'
@@ -49,15 +54,28 @@ export function claudeOptions(request, environment) {
   }
 }
 
-const continuationPrompt = 'Continue the unfinished task from the saved session after the subscription quota reset. Preserve prior work and tool results; do not repeat completed actions. Subscription waiting does not consume the research time allowance.'
+export const continuationPrompt = 'Continue the unfinished task from the saved session after the subscription quota reset. Preserve prior work and tool results; do not repeat completed actions. Subscription waiting does not consume the research time allowance.'
 const sessionIdPattern = /^[a-zA-Z0-9._:-]{8,200}$/
 const quotaResultError = error => error instanceof Error
   && (error.errorClass === 'error_result' || /\berror_result\b/.test(error.message))
+/** Account rotation: the root runner owns the other accounts' tokens, so this process
+ * hands an evidenced quota rejection back to it instead of waiting. */
+export const quotaHandoffExitCode = 75
+const validQuotaHandoff = value => value === undefined || (value !== null && typeof value === 'object'
+  && Object.keys(value).length === 1 && Number.isSafeInteger(value.queryIndex) && value.queryIndex >= 0)
+/** True for a model answer. The SDK reports a quota rejection as an assistant
+ * message with `error` set; that one is not an answer. Until the model has
+ * answered in an attempt, the session may not hold the attempt's prompt (a
+ * request rejected at once may not have saved it), so a resume sends it again. */
+export const modelAnswer = message => message?.type === 'assistant' && message.error === undefined
 
 export async function runClaude(request, environment, query, emit, stderr,
   { now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) } = {}) {
+  if (!validQuotaHandoff(request.claudeQuotaHandoff)) throw new Error('invalid Claude quota handoff')
   let current = request
-  for (let queryIndex = 0; ; queryIndex += 1) {
+  let answered = false
+  // Each handoff launch continues the query numbering, so usage counts every query once.
+  for (let queryIndex = request.claudeQuotaHandoff?.queryIndex ?? 0; ; queryIndex += 1) {
     let sessionId = current.continuationMode === 'resume' ? current.sessionId : null
     let rejected = null
     let result = null
@@ -70,6 +88,7 @@ export async function runClaude(request, environment, query, emit, stderr,
     try {
       for await (const message of session) {
         emit(message)
+        answered ||= modelAnswer(message)
         if ((message.type === 'system' && message.subtype === 'init') || message.type === 'result' || message.type === 'rate_limit_event') {
           if (message.session_id !== undefined || message.type !== 'rate_limit_event') {
             if (!sessionIdPattern.test(message.session_id)
@@ -97,9 +116,15 @@ export async function runClaude(request, environment, query, emit, stderr,
     }
     if (result?.subtype === 'success' && !result.is_error) return 0
     if (!resumableQuota()) return 1
+    if (request.claudeQuotaHandoff !== undefined) {
+      emit({ type: 'subscription_rejected', provider: 'claude', sessionId,
+        startedAt: new Date(rejected.startedAt).toISOString(), resetsAt: new Date(rejected.resetAt).toISOString() })
+      return quotaHandoffExitCode
+    }
     // Keep the one admitted process alive across Workflow observation slices.
-    // Never resend the original task or open a fresh native session. A stale
-    // reset returned after a re-rejection gets a bounded anti-spin delay.
+    // Never open a fresh native session; resend this attempt's prompt only while
+    // the model has not answered. A stale reset returned after a re-rejection
+    // gets a bounded anti-spin delay.
     const wakeAt = Math.max(rejected.resetAt + 1_000, now() + 60_000)
     emit({ type: 'subscription_wait_started', provider: 'claude', sessionId,
       startedAt: new Date(rejected.startedAt).toISOString(), resetsAt: new Date(rejected.resetAt).toISOString() })
@@ -107,7 +132,7 @@ export async function runClaude(request, environment, query, emit, stderr,
     emit({ type: 'subscription_wait', wait: { provider: 'claude', sessionId,
       startedAt: new Date(rejected.startedAt).toISOString(), resumedAt: new Date(now()).toISOString(),
       resetsAt: new Date(rejected.resetAt).toISOString() } })
-    current = { ...request, continuationMode: 'resume', sessionId, prompt: continuationPrompt }
+    current = { ...request, continuationMode: 'resume', sessionId, prompt: answered ? continuationPrompt : request.prompt }
   }
 }
 

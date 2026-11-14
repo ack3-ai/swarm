@@ -1,3 +1,7 @@
+import { createControlledMachine } from './support/controlled-machine.js'
+import { sha256 } from '../src/canonical.js'
+import { pauseWhen } from './support/admission-control.js'
+import { restoreSelected } from './support/selected-snapshots.js'
 import { AgentExecutionPending } from '../src/run-errors.js'
 import { discoveryDeadline } from '../src/discovery-clock.js'
 import { compileExperimentConfig } from './support/compile-config.js'
@@ -38,7 +42,8 @@ const deepseek = {
 async function preparedMachine(config: any, runId: string) {
   const body = compileExperimentConfig(config)
   const release = await sealReleasePackage(body)
-  const machine = await RunMachine.create(body.definition, release.digest, runId)
+  const machine = await createControlledMachine(body.definition, release.digest, runId, undefined, undefined,
+    { auditId: runId, executionId: runId, epoch: 0, runtimeDigest: await sha256(null) })
   const store = new MemoryArtifactStore()
   const base = new DeterministicAuditProvider()
   await advanceExperimentOneWave({ definition: body.definition, machine, provider: base, artifactStore: store })
@@ -161,17 +166,16 @@ describe('independent discovery pool waves', () => {
       .toEqual(new Set(['additive', 'core', 'pool-glm', 'pool-second-endpoint']))
   })
 
-  it('closes admission on an operator stop and drains every already-admitted cohort', async () => {
+  it('closes admission on an operator pause and drains every already-admitted cohort', async () => {
     const { body, machine, store, base } = await preparedMachine(
       manifest([luna, deepseek], 5), 'independent-stop-drain',
     )
-    let stopChecks = 0
     const checkpoint = await advanceExperimentOneWave({
       definition: body.definition,
       machine,
       provider: base,
       artifactStore: store,
-      stopRequested: async () => ++stopChecks > 1,
+      reconcileControls: pauseWhen(machine, () => (machine.view().discoveryScheduler?.pools.some(pool => pool.nextWaveIndex > 0) ?? false)),
     })
     const state = machine.snapshot()
     expect(checkpoint).toBe(false)
@@ -225,8 +229,20 @@ it('retains a quota-waiting admission across slices and excludes its six-hour wa
     const state = machine.snapshot()
     expect(state.modelStartedAt).toBe(new Date(start).toISOString())
     expect(discoveryDeadline(body.definition, state)).toBe(start + 11 * 60 * 60_000 + 1000)
-    const checkpoint = state.checkpoints.at(-1)!
-    const child = await RunMachine.resume(body.definition, checkpoint, 'quota-clock-child')
+    const child = await restoreSelected(machine)
     expect(discoveryDeadline(body.definition, child.snapshot())).toBe(discoveryDeadline(body.definition, state))
   } finally { vi.useRealTimers() }
+})
+
+it('classifies a broken discovery admission as integrity failure before any provider call', async () => {
+  const f = await preparedMachine(manifest([{ ...luna, agents: 1 }, deepseek], 1), 'invalid-discovery-admission')
+  const provider = { run: vi.fn(async (request: AgentRequest) => f.base.run(request)) }
+  const admission = vi.spyOn(f.machine, 'admitAgentAttempt').mockRejectedValue(new Error('invalid admitted occurrence'))
+  try {
+    await expect(advanceExperimentOneWave({ definition: f.body.definition, machine: f.machine,
+      provider, artifactStore: f.store })).rejects.toMatchObject({ category: 'integrity-failed', retryable: false })
+    expect(provider.run).not.toHaveBeenCalled()
+    expect(f.machine.view().budget.modelCalls).toBe(0)
+    expect(f.machine.view().rejectedAttempts).toHaveLength(0)
+  } finally { admission.mockRestore() }
 })

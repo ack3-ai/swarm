@@ -1,3 +1,5 @@
+import { createControlledMachine } from './support/controlled-machine.js'
+import { restoreSelected } from './support/selected-snapshots.js'
 import { describe, expect, it } from 'vitest'
 import type { AgentProvider, AgentRequest, AgentResult } from '../src/contracts.js'
 import { RunMachine } from '../src/machine.js'
@@ -5,7 +7,6 @@ import { advanceExperimentOneWave } from '../src/runner.js'
 import { AgentExecutionPending, PermanentRunFailure, TransientRunFailure } from '../src/run-errors.js'
 import { configuredResearchTaskPoolId } from '../src/research-scheduler.js'
 import {
-  canStopAtSealedWaveBoundary,
   failureForWorkflowProgress,
   workflowFailureDisposition,
   workflowProgress,
@@ -56,7 +57,7 @@ async function machineAtDiscovery(
   provider: AgentProvider,
   definition = audit0Definition,
 ): Promise<RunMachine> {
-  const machine = await RunMachine.create(definition, releaseDigest, runId)
+  const machine = await createControlledMachine(definition, releaseDigest, runId)
   await advanceExperimentOneWave({
     definition,
     machine,
@@ -116,7 +117,7 @@ describe('Workflow failure semantics', () => {
       calls += 1
       throw new PermanentRunFailure('fixture preflight rejected the target', 'preflight-failed')
     })
-    const machine = await RunMachine.create(audit0Definition, releaseDigest, 'permanent-preflight')
+    const machine = await createControlledMachine(audit0Definition, releaseDigest, 'permanent-preflight')
 
     await expect(executeWithWorkflowRetries(async () => {
       return advanceExperimentOneWave({
@@ -159,9 +160,7 @@ describe('Workflow failure semantics', () => {
     expect(state.artifacts.filter(artifact => artifact.taskId === target.id)).toHaveLength(1)
     expect(state.rejectedAttempts.filter(attempt => attempt.taskId === target.id)).toEqual([])
     expect(state.artifacts.find(artifact => artifact.taskId === target.id)?.usage.modelCalls).toBe(1)
-    await expect(RunMachine.resume(
-      audit0Definition, state.checkpoints.at(-1)!, 'transport-retry-child',
-    )).resolves.toBeDefined()
+    await expect(restoreSelected(machine, state)).resolves.toBeDefined()
   })
 
   it('survives three observation transport faults and recovers the same admitted attempt', async () => {
@@ -228,7 +227,7 @@ describe('Workflow failure semantics', () => {
       expect.objectContaining({ taskId: target.id, attempt: 1 }),
     ])
 
-    const recovered = await RunMachine.fromState(audit0Definition, machine.snapshot())
+    const recovered = await restoreSelected(machine, machine.snapshot())
     await expect(advanceExperimentOneWave({
       definition: audit0Definition, machine: recovered, provider, artifactStore: artifacts,
     })).resolves.toBe(true)
@@ -316,8 +315,7 @@ describe('Workflow failure semantics', () => {
     expect(pendingState.inFlightAgentAttempts).toEqual([
       expect.objectContaining({ taskId: target.id, attempt: 1, promptDigest: requests[0]?.promptDigest }),
     ])
-    expect(canStopAtSealedWaveBoundary(pendingState, true)).toBe(false)
-    const reconstructed = await RunMachine.fromState(definition, structuredClone(pendingState))
+    const reconstructed = await restoreSelected(machine, structuredClone(pendingState))
 
     await expect(advanceExperimentOneWave({
       definition, machine: reconstructed, provider, artifactStore: artifacts,
@@ -335,7 +333,6 @@ describe('Workflow failure semantics', () => {
     expect(reconstructed.snapshot().rejectedAttempts.filter(attempt => attempt.taskId === target.id)).toEqual([])
     expect(reconstructed.snapshot().budget.costUsd).toBeGreaterThan(definition.limits.maxCostUsd)
     expect(reconstructed.snapshot().inFlightAgentAttempts).toEqual([])
-    expect(canStopAtSealedWaveBoundary(reconstructed.snapshot(), true)).toBe(true)
   })
 
   it('gives a permanent exhausted repair precedence over a parallel transport failure', async () => {
@@ -428,7 +425,7 @@ describe('Workflow failure semantics', () => {
   })
 
   it('maps persisted failed, completed, and stopped states to distinct Workflow outcomes', async () => {
-    const failedMachine = await RunMachine.create(audit0Definition, releaseDigest, 'persisted-failed')
+    const failedMachine = await createControlledMachine(audit0Definition, releaseDigest, 'persisted-failed')
     await failedMachine.start()
     await failedMachine.fail('fixture terminal reason')
     const failed = workflowProgress(failedMachine.snapshot())

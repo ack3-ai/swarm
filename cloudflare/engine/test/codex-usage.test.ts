@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 // The parser runs inside the Sandbox image as native ESM.
 // @ts-expect-error JavaScript container module intentionally has no TS build step.
-import { codexUsage } from '../container/codex-usage.mjs'
+import { codexProviderFailure, codexUsage } from '../container/codex-usage.mjs'
 
 describe('Codex provider usage accounting', () => {
   it('budgets uncached input plus output rather than cached top-level input', () => {
@@ -43,5 +43,46 @@ describe('Codex provider usage accounting', () => {
       inputTokens: 60, rawInputTokens: 60, cachedInputTokens: 0,
       outputTokens: 5, cacheAccountingComplete: false,
     })
+  })
+})
+
+describe('Codex provider failure evidence (P2-06)', () => {
+  const failed = (message: string) => [
+    JSON.stringify({ type: 'thread.started', thread_id: 'thread-1' }),
+    // Retries in progress are reported as top-level errors; only the turn's final failure counts.
+    JSON.stringify({ type: 'error', message: 'Reconnecting... 2/5 (stream disconnected before completion: eof)' }),
+    JSON.stringify({ type: 'turn.failed', error: { message } }), '',
+  ].join('\n')
+
+  it('maps the last failed turn to a provider code and HTTP status for the receipt', () => {
+    // Message texts as Codex prints them (checked against the strings of a Codex 0.152 binary).
+    for (const [message, code, status] of [
+      ['exceeded retry limit, last status: 503 Service Unavailable, request id: abc', 'SERVER', 503],
+      ['exceeded retry limit, last status: 529 <unknown status code>', 'SERVER', 529],
+      ['exceeded retry limit, last status: 429 Too Many Requests', 'RATE_LIMIT', 429],
+      ['unexpected status 502 Bad Gateway: upstream', 'SERVER', 502],
+      ['unexpected status 401 Unauthorized: token expired', 'HTTP_401', 401],
+      ['stream disconnected before completion: error decoding response body', 'STREAM_CLOSED', null],
+      ['stream closed before response.completed', 'STREAM_CLOSED', null],
+      ['Error while reading the server response: connection reset', 'TRANSPORT', null],
+      ['Connection failed: error sending request', 'TRANSPORT', null],
+      ['request timed out', 'TIMEOUT', null],
+      ["We're currently experiencing high demand, which may cause temporary errors.", 'SERVER', null],
+      ['Selected model is at capacity. Please try a different model.', 'OVERLOADED', null],
+    ] as const) {
+      expect(codexProviderFailure(failed(message)), message).toEqual({ providerErrorCode: code, providerHttpStatus: status })
+    }
+  })
+
+  it('reports nothing for a quota, a model or tool failure, or a turn that did not fail', () => {
+    for (const message of ["You've hit your usage limit. Upgrade to Pro", 'Quota exceeded. Check your plan and billing details.',
+      "Codex ran out of room in the model's context window.", 'timeout waiting for child process to exit', '']) {
+      expect(codexProviderFailure(failed(message)), message).toBeNull()
+    }
+    expect(codexProviderFailure(`${JSON.stringify({ type: 'error', message: 'stream disconnected before completion' })}\n`)).toBeNull()
+    expect(codexProviderFailure(`${JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } })}\n`)).toBeNull()
+    expect(codexProviderFailure('not json\n')).toBeNull()
+    // A later successful turn clears an earlier failure.
+    expect(codexProviderFailure(`${failed('request timed out')}${JSON.stringify({ type: 'turn.completed' })}\n`)).toBeNull()
   })
 })

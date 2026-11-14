@@ -6,6 +6,18 @@ const html = readFileSync(new URL('../src/dashboard.html', import.meta.url), 'ut
 const script = html.match(/<script nonce="__CSP_NONCE__">([\s\S]*?)<\/script>/)![1]!
 const functions = script.split(/document\.addEventListener\(\s*["']click/)[0]!
 const evaluate = (expression: string): unknown => runInNewContext(`${functions}\n${expression}`, {})
+describe('run-control status display', () => {
+  it('separates a journal decision from the last saved decision and preserves unavailable status', () => {
+    const saved = { pauses: [], blockedTasks: [], lastOutcome: { commandId: 'prior', status: 'applied' } }
+    const applying = { kind: 'recorded', commandId: 'next', action: 'amend', status: 'applying', revision: 2 }
+    const summary = evaluate(`controlSummary(${JSON.stringify(saved)}, ${JSON.stringify(applying)})`) as string
+    expect(summary).toContain('Saved decision prior: applied')
+    expect(summary).toContain('Command journal next: amend · applying (revision 2)')
+    expect(evaluate(`controlSummary(null, {kind:'unavailable'})`)).toBe('Command journal status unavailable')
+    expect(html).toContain('This dashboard is read-only.')
+  })
+
+})
 describe('container observation incidents', () => {
   const fixture = `
     const task={taskId:'research-2',agentId:'luna-2',model:'luna',provider:'codex',role:'researcher',
@@ -36,6 +48,33 @@ describe('container observation incidents', () => {
       expect(evaluate(`${fixture} health.status='${status}';visibleTaskStatus(task,wave);`)).toBe('awaiting-result')
     }
     expect(evaluate(`${fixture} delete snapshot.observationHealth;visibleTaskStatus(task,wave);`)).toBe('awaiting-result')
+  })
+})
+describe('subscription quota waits', () => {
+  const fixture = `
+    const task={taskId:'research-2',agentId:'opus-2',model:'opus',provider:'claude',role:'researcher',
+      modelPool:'opus',promptKind:'research',status:'awaiting-result',lastAttempt:1,usage:{},provisionalUsage:{}};
+    const wave={stageId:'discovery',id:'opus/wave-4',sourceWaveId:'wave-4',tasks:[task]};
+    const health={runId:'run-1',stageId:'discovery',waveId:'wave-4',taskId:'research-2',attempt:1,status:'observing',
+      subscriptionWait:{provider:'claude',since:'2026-11-06T09:01:00Z',resetsAt:'2026-11-10T08:00:00Z'}};
+    snapshot={run:{id:'run-1'},waves:[wave],observationHealth:[health]};
+  `
+  it('shows the waiting task, its reset and a run-level count instead of normal work', () => {
+    const result = evaluate(`${fixture} ({card:laneCard(task,key(wave)),pool:poolProgressMarkup([wave]),
+      run:quotaWaitSummary(),reset:new Date('2026-11-10T08:00:00Z').toLocaleString()});`) as any
+    expect(result.card).toContain('Waiting for subscription quota')
+    expect(result.card).toContain(`Waiting for Claude quota · resets ${result.reset}`)
+    expect(result.card).not.toContain('bar live')
+    expect(result.pool).toContain('1 waiting for quota')
+    expect(result.pool).not.toContain('1 awaiting result')
+    expect(result.run).toBe(`1 task(s) waiting for subscription quota · earliest reset ${result.reset}`)
+  })
+  it('an unresponsive container or a finished task takes precedence, and no wait shows nothing', () => {
+    expect(evaluate(`${fixture} health.status='unresolved';visibleTaskStatus(task,wave);`)).toBe('unresponsive')
+    expect(evaluate(`${fixture} task.status='accepted';visibleTaskStatus(task,wave);`)).toBe('accepted')
+    expect(evaluate(`${fixture} health.subscriptionWait=null;[visibleTaskStatus(task,wave),quotaWaitSummary()];`))
+      .toEqual(['awaiting-result', ''])
+    expect(evaluate(`${fixture} health.runId='run-2';quotaWaitSummary();`)).toBe('')
   })
 })
 describe('readable agent transcript', () => {
@@ -133,6 +172,7 @@ describe('readable agent transcript', () => {
   it.each([
     { fetch: 'web_fetch', search: 'web_search' },
     { fetch: 'mcp__exa__web_fetch_exa', search: 'mcp__exa__web_search_exa' },
+    { fetch: 'mcp__exa__web_fetch_exa', search: 'mcp__exa__web_search_advanced_exa' },
   ])('shows native search calls, credit errors and timeouts without counting pending calls as completed: %j', ({ fetch, search }) => {
     const rows = [
       event({ type: 'item.started', item: { id: 'search', type: 'mcp_tool_call', server: 'exa', tool: 'web_search_exa', arguments: { query: '<script>query</script>' }, status: 'in_progress', result: null } }),
@@ -153,6 +193,15 @@ describe('readable agent transcript', () => {
     expect(result.html).toContain('&lt;script&gt;query&lt;/script&gt;')
     expect(result.html).not.toContain('<script>query')
     expect(result.html).not.toContain('source.sol')
+  })
+
+  it('lists Codex calls to Exa advanced search with the other searches', () => {
+    const rows = [event({ type: 'item.completed', item: { id: 'adv', type: 'mcp_tool_call', server: 'exa', tool: 'web_search_advanced_exa',
+      arguments: { query: 'guards', includeDomains: ['example.org'] }, status: 'completed', result: { content: [{ type: 'text', text: 'Guard article' }] } } })]
+    const result = evaluate(`const state=newAgentTranscript();appendAgentTranscript(state,${JSON.stringify(rows)},true);
+      ({entries:transcriptEntries(state,'search'),summary:searchTranscriptSummary(state)});`) as any
+    expect(result.entries).toHaveLength(1)
+    expect(result.summary).toContain('1 completed')
   })
 
   it('deduplicates MCP updates and distinguishes embedded errors from successful text', () => {
@@ -734,6 +783,21 @@ describe('configuration and history controls', () => {
     expect(elements.get('configuration-content').innerHTML).toContain('runtime-fixture')
     expect(elements.get('configuration-content').innerHTML).toContain('<dd>64</dd>')
     expect(elements.get('configuration-content').innerHTML).toContain('sha256:fixture')
+    expect(elements.get('configuration-content').innerHTML).toContain('<dt>Audit scope</dt><dd>Not set</dd>')
+  })
+
+  it('shows the sealed audit scope as escaped text', () => {
+    const elements = new Map<string, any>()
+    const document = { getElementById(id: string) {
+      if (!elements.has(id)) elements.set(id, { textContent: '', innerHTML: '' })
+      return elements.get(id)
+    } }
+    runInNewContext(`${functions}
+      snapshot={configuration:{scope:'In scope: src/<Vault>.sol',pools:[]}};
+      renderConfiguration();`, { document })
+    const html = elements.get('configuration-content').innerHTML
+    expect(html).toContain('<dd>Scope file (below)</dd>')
+    expect(html).toContain('<h3>Audit scope</h3><pre class="prompt-content">In scope: src/&lt;Vault&gt;.sol</pre>')
   })
 
   it('resumes Follow before a hidden-tab request finishes aborting', async () => {
@@ -826,5 +890,71 @@ describe('disclosures during dashboard refresh', () => {
     expect(element('handover-content').innerHTML).toBe('visible evidence')
     expect(element('handover-packet').innerHTML).toBe('visible evidence')
     expect(element('handover-status').textContent).toBe('Updating reviews and evidence… · 0 of 0 observations · 0 review disagreements')
+  })
+})
+
+describe('baseline build setting', () => {
+  it('shows whether the release requires its baseline build', () => {
+    const elements = new Map<string, any>()
+    const document = { getElementById(id: string) {
+      if (!elements.has(id)) elements.set(id, { textContent: '', innerHTML: '' })
+      return elements.get(id)
+    } }
+    for (const [runtime, label] of [[{}, 'Required'], [{ buildRequired: false }, 'Optional']] as const) {
+      runInNewContext(`${functions}
+        snapshot={configuration:{target:{runtime:${JSON.stringify(runtime)}},pools:[]}};
+        renderConfiguration();`, { document })
+      expect(elements.get('configuration-content').innerHTML).toContain(`<dt>Baseline build</dt><dd>${label}</dd>`)
+    }
+  })
+
+  it('shows the command time limit', () => {
+    const elements = new Map<string, any>()
+    const document = { getElementById(id: string) {
+      if (!elements.has(id)) elements.set(id, { textContent: '', innerHTML: '' })
+      return elements.get(id)
+    } }
+    for (const [runtime, label] of [[{}, 'None'], [{ commandTimeoutMinutes: 30 }, '30 minutes']] as const) {
+      runInNewContext(`${functions}
+        snapshot={configuration:{target:{runtime:${JSON.stringify(runtime)}},pools:[]}};
+        renderConfiguration();`, { document })
+      expect(elements.get('configuration-content').innerHTML).toContain(`<dt>Command time limit</dt><dd>${label}</dd>`)
+    }
+  })
+
+  it('shows whether discovery PoC tests are kept for the verifier', () => {
+    const elements = new Map<string, any>()
+    const document = { getElementById(id: string) {
+      if (!elements.has(id)) elements.set(id, { textContent: '', innerHTML: '' })
+      return elements.get(id)
+    } }
+    for (const [extra, label] of [['', 'No'], ['keepPocs:true,', 'Yes, for the verifier']] as const) {
+      runInNewContext(`${functions}
+        snapshot={configuration:{${extra}target:{runtime:{}},pools:[]}};
+        renderConfiguration();`, { document })
+      expect(elements.get('configuration-content').innerHTML).toContain(`<dt>Keep PoC tests</dt><dd>${label}</dd>`)
+    }
+    for (const [extra, label] of [['', 'No'], ['submitCheck:true,', 'Yes, with ack3-submit']] as const) {
+      runInNewContext(`${functions}
+        snapshot={configuration:{${extra}target:{runtime:{}},pools:[]}};
+        renderConfiguration();`, { document })
+      expect(elements.get('configuration-content').innerHTML).toContain(`<dt>Submission check</dt><dd>${label}</dd>`)
+    }
+  })
+
+  it('lists the Claude accounts in use order only for pools with fallbacks', () => {
+    const elements = new Map<string, any>()
+    const document = { getElementById(id: string) {
+      if (!elements.has(id)) elements.set(id, { textContent: '', innerHTML: '' })
+      return elements.get(id)
+    } }
+    const pools = [{ id: 'claude', credentialSource: 'CLAUDE_A_OAUTH_TOKEN', fallbackCredentialSources: ['CLAUDE_B_OAUTH_TOKEN', 'CLAUDE_C_OAUTH_TOKEN'] },
+      { id: 'single', credentialSource: 'CLAUDE_D_OAUTH_TOKEN' }]
+    runInNewContext(`${functions}
+      snapshot={configuration:{target:{runtime:{}},pools:${JSON.stringify(pools)}}};
+      renderConfiguration();`, { document })
+    const content = elements.get('configuration-content').innerHTML
+    expect(content).toContain('<dt>Claude accounts (claude)</dt><dd>CLAUDE_A_OAUTH_TOKEN, CLAUDE_B_OAUTH_TOKEN, CLAUDE_C_OAUTH_TOKEN</dd>')
+    expect(content).not.toContain('Claude accounts (single)')
   })
 })

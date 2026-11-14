@@ -91,3 +91,30 @@ for (const enabled of [true, false]) {
       assert.ok(waits.every(wait => wait.sessionId === agent.id))
     })
 }
+
+test('a DSH window wait whose timer fires a little early still reports a valid wait (E22)', async () => {
+  const patch = await readFile(new URL('../container/harness/patch-dsh-pi.mjs', import.meta.url), 'utf8')
+  const edits = runInNewContext(patch.slice(patch.indexOf('const edits = ['),
+    patch.indexOf('// Validate every input')) + '\nedits')
+  // The replacement that times the wait, run as written with a fake clock and timer.
+  const [, waitCode] = edits.find(value => value.name === '@deepseek-ai/dsh-llm-retry').replacements
+    .find(([before]) => before.includes('agent.session.append("llm/retry", eventData);'))
+  const startedAt = Date.parse('2026-01-01T00:00:00Z')
+  const delayMs = 60_000
+  for (const firedAt of [startedAt + delayMs - 1, startedAt + delayMs, startedAt + delayMs + 5]) {
+    let clock = startedAt, stderr = ''
+    class FakeDate extends Date {
+      constructor(...args) { super(...(args.length === 0 ? [clock] : args)) }
+      static now() { return clock }
+    }
+    const run = new Function('agent', 'eventData', 'failure', 'delayMs', 'fusedSignal', 'ack3ResettingWindow',
+      'cancellableDelay', 'Date', 'process', `return (async () => {\n${waitCode}\n})()`)
+    await run({ id: 'session-window-fixture', session: { append() {} } }, {}, {}, delayMs, null, () => true,
+      async () => { clock = firedAt; return true }, FakeDate, { stderr: { write: text => { stderr += text } } })
+    const waits = subscriptionWaits(stderr) ?? []
+    assert.equal(waits.length, 1, `timer fired at +${firedAt - startedAt} ms`)
+    assert.equal(waits[0].startedAt, new Date(startedAt).toISOString())
+    assert.equal(waits[0].resetsAt, new Date(startedAt + delayMs).toISOString())
+    assert.equal(waits[0].resumedAt, new Date(Math.max(firedAt, startedAt + delayMs)).toISOString())
+  }
+})

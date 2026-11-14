@@ -12,6 +12,7 @@ const definition = { stages: [{ id: 'discovery', waves: [
 const admission = (waveId: string, taskId: string, attempt = 1, promptDigest = 'digest') => ({
   type: 'agent.attempt-admitted', at: '2026-10-05T00:00:00Z', payload: {
     stageId: 'discovery', waveId, taskId, attempt, promptDigest, continuationMode: 'new',
+    execution: { workspaceKey: [first, later, other].find(task => task.id === taskId)!.workspaceKey },
   },
 })
 const state = (...journal: ReturnType<typeof admission>[]) => ({ runId: 'source-run', journal }) as unknown as RunState
@@ -22,31 +23,9 @@ describe('dashboard filesystem allocation evidence', () => {
     failedWaveRecovery: { sourceRunId: 'source-run', retainedNative: { stageId: 'discovery', waveId: 'wave-0',
       taskId: first.id, workspaceKey: first.workspaceKey, workspaceAllocationRunId: 'source-run' } },
   }) as RunState
-  it('identifies the retained parent allocation for an admitted recovery task, without inventing parent history', () => {
-    expect(dashboardFilesystem(recovered(admission('wave-0', first.id)), definition, first, scope('wave-0')))
-      .toMatchObject({ sourceRunId: 'source-run', allocationId: 'source-run/lane-1',
-        usage: 'retained-from-parent', priorUses: null })
-  })
-  it('does not assign the retained allocation to other tasks, waves, stages or workspace keys', () => {
-    const current = recovered(admission('wave-0', other.id), admission('wave-1', later.id))
-    expect(dashboardFilesystem(current, definition, other, scope('wave-0')))
-      .toMatchObject({ allocationId: 'child-run/lane-2', usage: 'first-recorded-use' })
-    expect(dashboardFilesystem(current, definition, later, scope('wave-1')))
-      .toMatchObject({ allocationId: 'child-run/lane-1', usage: 'first-recorded-use' })
-    for (const [selectedTask, selectedScope] of [
-      [first, scope('wave-1')], [first, { ...scope('wave-0'), stageId: 'other-stage' }],
-      [{ ...first, workspaceKey: 'other-key' }, scope('wave-0')],
-    ] as const) {
-      expect(dashboardFilesystem(current, definition, selectedTask, selectedScope).sourceRunId).toBe('child-run')
-    }
-  })
-  it('keeps missing or ambiguous recovery admissions unknown', () => {
-    const event = admission('wave-0', first.id)
-    for (const current of [recovered(), recovered(event, event)]) {
-      expect(dashboardFilesystem(current, definition, first, scope('wave-0')))
-        .toMatchObject({ allocationId: 'source-run/lane-1', usage: 'unknown', priorUses: null })
-    }
-    expect(dashboardFilesystem(recovered(), definition, first, null).usage).toBe('not-recorded')
+  it('leaves historical retained allocations to their owning app version', () => {
+    expect(() => dashboardFilesystem(recovered(admission('wave-0', first.id)), definition, first, scope('wave-0')))
+      .toThrow('historical app version')
   })
   it('shows same-lane reuse even when every model conversation is fresh, excluding another lane', () => {
     const result = dashboardFilesystem(state(admission('wave-0', first.id), admission('wave-0', other.id),
@@ -75,4 +54,25 @@ describe('dashboard filesystem allocation evidence', () => {
     expect(dashboardFilesystem(state(admission('wave-0', first.id)), definition, review, scope('wave-0')))
       .toMatchObject({ policy: 'fresh-pristine', usage: 'first-recorded-use', importedEvidence: 'negative-review-packet-only' })
   })
+})
+
+
+it('uses recorded physical allocations across account amendments, not the current logical lane', () => {
+  const one = admission('wave-0', first.id), two = admission('wave-1', later.id)
+  Object.assign(one.payload, { execution: { workspaceKey: 'native-old-account' } })
+  Object.assign(two.payload, { execution: { workspaceKey: 'native-new-account' } })
+  const current = { ...state(one, two), executionAuthority: { auditId: 'source-run', executionId: 'source-run',
+    epoch: 0, runtimeDigest: 'a'.repeat(64) } }
+  expect(dashboardFilesystem(current, definition, later, scope('wave-1'))).toMatchObject({
+    allocationId: 'source-run/native-new-account', usage: 'first-recorded-use', priorUses: 0,
+  })
+  expect(dashboardFilesystem(current, definition, first, scope('wave-0'))).toMatchObject({
+    allocationId: 'source-run/native-old-account', usage: 'first-recorded-use', priorUses: 0,
+  })
+  // The prior route is no longer present in the current manifest. Its recorded
+  // allocation remains useful, but missing allocation evidence stays unknown.
+  const missing = admission('wave-0', first.id)
+  delete (missing.payload as Partial<typeof missing.payload>).execution
+  expect(dashboardFilesystem({ ...current, journal: state(missing).journal }, definition, first, scope('wave-0')))
+    .toMatchObject({ allocationId: null, usage: 'unknown', priorUses: null })
 })

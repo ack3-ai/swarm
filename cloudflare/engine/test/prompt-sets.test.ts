@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import document from './fixtures/audit0-hello-vault.json' with { type: 'json' }
 import prompts from '../../../docs/examples/prompts.json' with { type: 'json' }
 import { compileExperimentConfig } from '../src/config-compiler.js'
-import { DEFAULT_INSTRUCTIONS } from '../src/methods/system-prompts.js'
+import { DEFAULT_INSTRUCTIONS, DEFAULT_RESEARCH_DELTA } from '../src/methods/system-prompts.js'
 import { validateExperiment } from '../src/validation.js'
 import { sealReleasePackage } from '../src/release.js'
 import { captureDiscoveryRequests } from './support/research-prompts.js'
@@ -26,7 +26,7 @@ describe('user stage prompts and fixed system contracts', () => {
       // Research plan labels are dashboard metadata; agents never see the lane strategy.
       for (const label of ['anchor', 'scout', 'satellite']) expect(prompt).not.toContain(label)
     }
-    expect(body.definition.prompts).toEqual(DEFAULT_INSTRUCTIONS)
+    expect(body.definition.prompts).toEqual({ ...DEFAULT_INSTRUCTIONS, researchDelta: DEFAULT_RESEARCH_DELTA })
     body.definition.prompts.researcherProtocol = ''
     expect(() => validateExperiment(body.definition)).toThrow('every agent instruction must be non-empty text')
   })
@@ -34,7 +34,7 @@ describe('user stage prompts and fixed system contracts', () => {
     const config = { ...document, stages: ['discovery'], stageModelPools: {}, promptFile: 'custom.json', maxDiscoveryWaves: 1 }
     const instructions = { searchPrivacy: 'Keep every query generic.', assignmentPreamble: 'Do exactly this task.' }
     const body = compileExperimentConfig(config, { discovery: 'Review.', instructions })
-    expect(body.definition.prompts).toEqual({ ...DEFAULT_INSTRUCTIONS, ...instructions })
+    expect(body.definition.prompts).toEqual({ ...DEFAULT_INSTRUCTIONS, researchDelta: DEFAULT_RESEARCH_DELTA, ...instructions })
     expect(body.definition.stagePrompts).toEqual({ discovery: 'Review.' })
     const plain = await sealReleasePackage(compileExperimentConfig(config, { discovery: 'Review.' }))
     expect((await sealReleasePackage(body)).digest).not.toBe(plain.digest)

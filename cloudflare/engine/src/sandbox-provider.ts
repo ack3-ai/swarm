@@ -1,8 +1,19 @@
+import { deepClone } from './canonical.js'
+import { auditScopeHeader, auditScopePath } from './prompts.js'
+import { verifiedCancellationWinner, assertCurrentTaskOwner } from './command-custody.js'
+import { executionRequestBody } from './native-request.js'
+import { reserveNativeLaunch, assertNativeTaskAdmission, assertSupervisorTaskAdmission } from './native-launch-authority.js'
+import { assertCurrentWorkspaceRequest, nativeWorkspaceKey, nativeSandboxName, workspaceAllocationName } from './native-workspace.js'
+import { artifactReferences, assertDispatchedExecution } from './artifact-execution.js'
 import { modelHeaderCredentialNames } from '../container/reasoning-config.mjs'
+import { credentialsFromJson } from '../container/credential-json.mjs'
 import { getAgentSandbox, type SandboxClient } from './agent-sandbox-client.js'
+import { parseLogObservation, sandboxLogReadMaxBytes } from './sandbox-log-observation.js'
 import type { AgentProvider, AgentRequest, AgentResult } from './contracts.js'
 import type { Env } from './env.js'
 import { canonicalJson, sha256 } from './canonical.js'
+import { assertExecutionAuthority, ExecutionAuthorityStore } from './execution-authority.js'
+import { assertControlId, RunCommandConflict } from './run-commands.js'
 import {
   createCoverageUnion,
   createFinalObservationCustody,
@@ -13,11 +24,13 @@ import {
 } from './protocol-transforms.js'
 import { CloudflareRunStore, R2ArtifactStore } from './cloudflare-storage.js'
 import { writeAccepted } from './accepted-mounts.js'
+import { capturedBundlePath } from './poc-handoff.js'
 import { submissionTemplate, SUBMISSION_PATH } from './submission.js'
+import { SUBMIT_CHECK_CONTEXT_PATH, submitCheckContext } from './submission-check.js'
+import { mandatorySearchRequirement } from './native-research.js'
 import { agentResultReadFailure } from './agent-diagnostics.js'
-import { agentWorkingDirectory } from './agent-working-directory.js'
 import { clearUntrustedTaskOutputs } from './task-output-boundary.js'
-import { assertReleaseProviderCredentials, resolveCredentialBinding } from './release-provider-credentials.js'
+import { resolveCredentialBinding } from './release-provider-credentials.js'
 import { ensureCoverageChallengeOutput } from './coverage-output.js'
 import {
   AgentExecutionReceiptIntegrityError,
@@ -30,11 +43,10 @@ import { agentProcessId, waitForAgentProcess } from './agent-process.js'
 import { agentProcessWaitSliceMs, workflowAttemptTimeoutMs } from './workflow-step-config.js'
 import { boundedWorkspaceDisposal, type WorkspaceDisposalReceipt } from './workspace-disposal.js'
 import { boundedLaunchPrerequisite, boundedReadOnlyObservation, boundedTerminalLogDrain } from './bounded-observation.js'
-import { expiredObservationCooldownMs, R2AgentObservationCooldownStore } from './agent-observation-cooldown.js'
 import { R2AgentObservationHealthStore, type AgentObservationIdentity } from './agent-observation-health.js'
-import { annotateContainerResourceFailure, containerCapacity, lookupObservationResourceLoss } from './container-resource-diagnostics.js'
+import { annotateContainerResourceFailure, containerCapacity, lookupObservationResourceLoss, workspaceLimitNotes } from './container-resource-diagnostics.js'
 import { providerIdentity, taskBackend } from './provider-identity.js'
-import { subscriptionCredentialSource, codexWorkspaceId } from './subscription-credentials.js'
+import { claudeAccountBindings, subscriptionCredentialSource, codexWorkspaceId } from './subscription-credentials.js'
 import { resolveTargetEnvironment } from './target-environment.js'
 import { agentResultFromExecutionReceipt } from './late-upstream-handoff.js'
 import {
@@ -64,8 +76,10 @@ const targetWorkspaceEnvironment = {
 // Includes bounded source verification and workspace preparation before a
 // credential-bearing model process can be registered.
 export const executionLaunchGraceMs = 15 * 60_000
+/** Root script that stops every agent-user process left in a sandbox; older images lack it. */
+export const agentProcessSweepPath = '/usr/local/bin/ack3-stop-agent-processes'
 export const agentLogObservationIntervalMs = 15_000
-export const agentLogReadMaxBytes = 256 * 1024
+export const agentLogReadMaxBytes = sandboxLogReadMaxBytes
 export const agentLogFinalDrainSlices = 8
 // Keep one read-only Sandbox observation below the Workflow step's 30-minute
 // deadline. Expiry retains the exact paid attempt and never revokes its owner.
@@ -79,9 +93,14 @@ export const terminalLogDrainMs = 10_000
 // custody, but do not let an observation outage masquerade as a live audit
 // indefinitely. This bounds only the control plane's wait, not process life.
 export const agentObservationIncidentMaxMs = 60 * 60_000
+/** A failed preparation command is retried in place after these waits (E10). */
+export const workspacePreparationRetryWaitsMs: readonly number[] = [30_000, 60_000]
+/** A new try starts only this soon after the first began, so one launch's setup stays bounded. */
+export const workspacePreparationRetryWindowMs = 10 * 60_000
 
 function observationIdentityFor(request: AgentRequest): AgentObservationIdentity {
   return { runId: request.runId, stageId: request.stage.id, waveId: request.wave.id,
+    ...(request.taskExecutionId === undefined ? {} : { taskExecutionId: request.taskExecutionId }),
     taskId: request.task.id, attempt: request.attempt, promptDigest: request.promptDigest }
 }
 
@@ -113,41 +132,33 @@ function redactKnownCredentials(value: string, env: Env): string {
       typeof secret === 'string' && secret.length >= 8
       && (/^TARGET_/i.test(name) || /(?:AUTH|CREDENTIAL|KEY|PASSWORD|SECRET|TOKEN)/i.test(name))
     ))
+    // A Codex login binding is JSON: its tokens are listed one by one too, named as the container log names them (T3).
+    .flatMap(([name, secret]): [string, unknown][] => [[name, secret], ...(/_AUTH_JSON$/.test(name)
+      ? credentialsFromJson(String(secret), name.slice(0, -'_JSON'.length)).map(item => [item.name, item.value] as [string, unknown])
+      : [])])
     .sort((left, right) => String(right[1]).length - String(left[1]).length)
   let redacted = value
   for (const [name, secret] of credentials) redacted = redacted.replaceAll(String(secret), `<redacted:${name}>`)
   return redacted
 }
 
-function executionRequestBody(request: AgentRequest, workspaceId: string) {
-  return {
-    prompt: request.prompt, model: request.task.model, providerClass: request.task.providerClass,
-    backend: taskBackend(request.task),
-    ...(request.task.cyberAccessProgram === undefined ? {} : { cyberAccessProgram: request.task.cyberAccessProgram }),
-    ...(request.task.credentialSource === undefined ? {} : { credentialSource: request.task.credentialSource }),
-    ...(request.task.provider === undefined ? {} : { provider: request.task.provider }),
-    ...(request.task.connection === undefined ? {} : { connection: request.task.connection }),
-    ...(request.nativeSearchConnection === undefined ? {} : { searchConnection: request.nativeSearchConnection,
-      searchAttribution: { agent: request.task.model,
-        stage: request.stage.id, wave: request.wave.id, task: request.task.id } }),
-    ...(request.enableNativeSearch === undefined ? {} : { enableNativeSearch: request.enableNativeSearch }),
-    reasoningEffort: request.task.reasoning,
-    ...(request.task.thinking === undefined ? {} : { thinking: request.task.thinking }),
-    ...(request.task.subagents === undefined ? {} : { subagents: request.task.subagents }),
-    expectedFiles: [...request.task.output.requiredFiles, ...(request.optionalOutputFiles ?? [])],
-    taskId: request.task.id, runId: request.runId,
-    attempt: request.attempt, freshContext: request.freshContext, workspaceId,
-    ...(request.formatRepairOrdinal === undefined ? {} : { formatRepairOrdinal: request.formatRepairOrdinal }),
-    ...(request.formatRepairSourceDigest === undefined ? {} : { formatRepairSourceDigest: request.formatRepairSourceDigest }),
-    workingDirectory: agentWorkingDirectory(request.task.promptKind),
-    continuationMode: request.continuationMode, sessionId: request.sessionId,
-    ...(request.nativeTransport === undefined ? {} : { nativeTransport: request.nativeTransport }),
-    ...(request.workspaceAllocationRunId === undefined ? {}
-      : { workspaceAllocationRunId: request.workspaceAllocationRunId }),
-    ...(request.retainedSandboxObjectId === undefined ? {}
-      : { retainedSandboxObjectId: request.retainedSandboxObjectId }),
-    releaseDigest: request.releaseDigest,
-    ...(request.inputDigest === undefined ? {} : { inputDigest: request.inputDigest }),
+
+/** Copy the quarantined output files back for a repair attempt. */
+export async function writeRepairBaseline(sandbox: Pick<SandboxClient, 'exec' | 'mkdir' | 'writeFile'>,
+  request: Pick<AgentRequest, 'task' | 'repairFiles'>): Promise<void> {
+  for (const [path, content] of Object.entries(request.repairFiles)) {
+    // The runner rewrites its scratch test bundle; it stays in repairFiles for the digest binding.
+    if (path === capturedBundlePath(request.task)) continue
+    if (!request.task.output.requiredFiles.includes(path)) {
+      throw new PermanentRunFailure(`repair file is outside output contract: ${path}`, 'invalid-configuration')
+    }
+    const destination = `/workspace/results/${path}`
+    await sandbox.mkdir(destination.slice(0, destination.lastIndexOf('/')), { recursive: true })
+    await sandbox.writeFile(destination, content)
+    const writable = await sandbox.exec(`chown 10001:10001 ${destination} && chmod 0600 ${destination}`, { timeout: 10_000 })
+    if (!writable.success) {
+      throw new PermanentRunFailure(`repair baseline ownership failed: ${writable.stderr.slice(-2_000)}`, 'invalid-configuration')
+    }
   }
 }
 
@@ -166,6 +177,8 @@ export function agentProcessEnvironment(request: AgentRequest, env: Env,
   if (taskBackend(request.task) === 'claude') {
     return { ...targetWorkspaceEnvironment, ...scopedTargetEnvironment,
       CLAUDE_CODE_OAUTH_TOKEN: resolvedKey(request.task.credentialSource!),
+      // Fallback accounts keep their own binding names; the runner gives the CLI only the active token.
+      ...Object.fromEntries((request.task.fallbackCredentialSources ?? []).map(name => [name, resolvedKey(name)])),
       ...(request.nativeSearchConnection === undefined ? {} : {
         [request.nativeSearchConnection.apiKeyEnv]: resolvedKey(request.nativeSearchConnection.apiKeyEnv),
       }),
@@ -198,7 +211,6 @@ export function agentProcessEnvironment(request: AgentRequest, env: Env,
 export class SandboxAgentProvider implements AgentProvider {
   private readonly artifacts: R2ArtifactStore
   private readonly executionReceipts: R2AgentExecutionReceiptStore
-  private readonly observationCooldowns: R2AgentObservationCooldownStore
   private readonly observationHealth: R2AgentObservationHealthStore
   private readonly executionLogs: R2AgentExecutionLogStore
   private readonly nativeSessions: NativeSessionCustody
@@ -208,11 +220,11 @@ export class SandboxAgentProvider implements AgentProvider {
   private readonly sandboxTerminalReceiptMs = agentSandboxTerminalReceiptMs
   private readonly runtimeEnvironments = new Map<string, Readonly<Record<string, string>>>()
   private readonly credentialValues = new Map<string, string>()
+  private readonly preparationSleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
 
   constructor(private readonly env: Env) {
     this.artifacts = new R2ArtifactStore(env.ARTIFACTS)
     this.executionReceipts = new R2AgentExecutionReceiptStore(env.ARTIFACTS)
-    this.observationCooldowns = new R2AgentObservationCooldownStore(env.ARTIFACTS)
     this.observationHealth = new R2AgentObservationHealthStore(env.ARTIFACTS)
     this.executionLogs = new R2AgentExecutionLogStore(env.ARTIFACTS)
     this.nativeSessions = new NativeSessionCustody(env.ARTIFACTS)
@@ -220,27 +232,36 @@ export class SandboxAgentProvider implements AgentProvider {
   }
 
   async run(request: AgentRequest): Promise<AgentResult> {
+    assertCurrentWorkspaceRequest(request)
+    request = deepClone(request)
+    if (request.executionAuthority === undefined || request.execution === undefined) {
+      throw new PermanentRunFailure('native request belongs to its historical app version', 'integrity-failed')
+    }
+    try {
+      await assertDispatchedExecution(request.execution, { runId: request.runId, task: request.task,
+        attempt: request.attempt, inputArtifacts: artifactReferences(request.visibleArtifacts) })
+      if (request.execution.releaseDigest !== request.releaseDigest
+        || request.execution.taskExecutionId !== request.taskExecutionId) throw new Error('execution configuration binding differs')
+    } catch (error) {
+      throw new PermanentRunFailure('native request differs from its dispatched execution contract', 'integrity-failed', { cause: error })
+    }
+    assertExecutionAuthority(request.executionAuthority)
+    assertControlId(request.taskExecutionId, 'task execution id')
+    if (request.executionAuthority.executionId !== request.runId) {
+      throw new PermanentRunFailure('execution request differs from its authority', 'integrity-failed')
+    }
+    if (['coverage-union', 'review-union', 'final-seal'].includes(request.task.promptKind)) {
+      await this.assertCurrentAdmission(request)
+      assertCurrentTaskOwner(request)
+    }
     if (request.task.promptKind === 'coverage-union') return this.coverageUnion(request)
     if (request.task.promptKind === 'review-union') return this.reviewUnion(request)
     if (request.task.promptKind === 'final-seal') return this.finalSeal(request)
     await this.assertProviderCredentials(request)
-    if (request.workspaceAllocationRunId !== undefined && (
-      request.workspaceAllocationRunId === request.runId
-      || !/^[0-9a-f]{64}$/.test(request.retainedSandboxObjectId ?? '')
-      || (request.nativeTransport === undefined && request.formatRepairOrdinal === undefined)
-      || request.continuationMode !== 'resume' || request.freshContext || request.sessionId === null
-      || (request.nativeTransport !== undefined
-        && ![request.runId, request.workspaceAllocationRunId].includes(request.nativeTransport.sourceRunId))
-    )) {
-      throw new PermanentRunFailure('retained workspace request lacks native session custody', 'integrity-failed')
+    if (request.execution !== undefined && Object.hasOwn(request.execution, 'retainedSession')) {
+      throw new PermanentRunFailure('execution record belongs to its historical app version', 'integrity-failed')
     }
-    // A fresh replacement means a fresh model session in the same sealed lane.
-    // Keeping the lane ID stable preserves its checkout and scratch custody.
-    const sandboxId = `a0-${(await sha256(`${request.workspaceAllocationRunId ?? request.runId}:${request.task.workspaceKey}`)).slice(0, 30)}`
-    if (request.retainedSandboxObjectId !== undefined
-      && this.env.AGENT_SANDBOX.idFromName(sandboxId).toString() !== request.retainedSandboxObjectId) {
-      throw new PermanentRunFailure('retained Sandbox namespace or actor identity changed', 'integrity-failed')
-    }
+    const sandboxId = await nativeSandboxName(request)
     // Complete exact successful receipt recovery before touching the sandbox.
     const requestDigest = await sha256(canonicalJson(executionRequestBody(request, this.env.ACK3_CODEX_WORKSPACE_ID)))
     let durableCached: import('./agent-execution-receipt.js').AgentExecutionReceipt | null
@@ -257,8 +278,10 @@ export class SandboxAgentProvider implements AgentProvider {
         runId: request.runId, taskId: request.task.id, attempt: request.attempt,
         requestDigest, sandboxId, source: 'r2', exitCode: 0,
       })
+      await this.settleControlledLaunch(request, durableCached, requestDigest)
       return agentResultFromExecutionReceipt(request, durableCached, requestDigest)
     }
+    await this.assertCurrentAdmission(request)
     const observationIdentity = observationIdentityFor(request)
     let health: Awaited<ReturnType<R2AgentObservationHealthStore['get']>>
     try {
@@ -283,7 +306,10 @@ export class SandboxAgentProvider implements AgentProvider {
         }
         throw new TransientRunFailure('terminal receipt observation is temporarily unavailable', { cause: error })
       }
-      if (terminal !== null) return agentResultFromExecutionReceipt(request, terminal, requestDigest)
+      if (terminal !== null) {
+        await this.settleControlledLaunch(request, terminal, requestDigest)
+        return agentResultFromExecutionReceipt(request, terminal, requestDigest)
+      }
       let actorId = ''
       try { actorId = this.env.AGENT_SANDBOX.idFromName(sandboxId).toString() } catch { /* Missing diagnostic identity stays unknown. */ }
       const resources = await lookupObservationResourceLoss({ env: this.env, actorId,
@@ -309,25 +335,27 @@ export class SandboxAgentProvider implements AgentProvider {
         throw new TransientRunFailure('durable launch claim is temporarily unavailable', { cause: error })
       }
     }
-    if (durableCached === null) {
-      let retryAfter: number | null
-      try {
-        retryAfter = await this.observationCooldowns.get(request.runId, requestDigest)
-      } catch (error) {
-        throw new TransientRunFailure('durable observation cooldown is temporarily unavailable', { cause: error })
-      }
-      if (retryAfter !== null && Date.now() < retryAfter) {
-        throw new AgentExecutionPending(agentProcessId(requestDigest), 'unavailable')
-      }
-    }
-    const sandbox = getAgentSandbox(this.env.AGENT_SANDBOX, sandboxId,
+    assertCurrentTaskOwner(request)
+    const mutationOwner = deepClone(request.execution?.mutationOwner)
+    const sandbox = getAgentSandbox(this.env.AGENT_SANDBOX, sandboxId, {
+      ...(mutationOwner === undefined ? {} : { mutationOwner }),
       // Model calls and continuation scratch can outlive Workflow scheduling
       // gaps. Cloudflare stops an idle Sandbox and loses its processes/files;
       // disposal below remains the explicit terminal lifecycle boundary.
-      !retainedClaim || health?.incidentSince === null
+      ...(!retainedClaim || health?.incidentSince === null
         ? { keepAlive: true, inactivityTimeoutMs: 30 * 60_000,
-          labels: { experiment: request.experimentId, run: request.runId, lane: request.task.workspaceKey } }
-        : {})
+          labels: { experiment: request.experimentId, run: request.runId, lane: await nativeWorkspaceKey(request.task) } }
+        : {}) })
+    if (mutationOwner?.ordinal === 0) {
+      try {
+        const birth = await boundedLaunchPrerequisite(() => this.registerWorkspaceBirth(sandbox, sandboxId, mutationOwner),
+          Date.now() + this.sandboxLaunchPrerequisiteMs)
+        if (birth.expired) throw new AgentExecutionPending(agentProcessId(requestDigest), 'unavailable')
+      } catch (error) {
+        if (error instanceof RunFailure || error instanceof AgentExecutionPending) throw error
+        throw new TransientRunFailure('workspace birth publication remains uncertain', { cause: error })
+      }
+    }
     // Await the critical lifetime setting before an admitted agent can start work.
     const processId = agentProcessId(requestDigest)
     if (!retainedClaim || health?.incidentSince === null) {
@@ -354,7 +382,7 @@ export class SandboxAgentProvider implements AgentProvider {
         await this.deferExpiredObservation(observationIdentity, requestDigest, error.operation, error.startedAt)
       }
       if (error instanceof AgentExecutionPending) throw error
-      const annotated = await annotateContainerResourceFailure(sandbox, request, error)
+      const annotated = await annotateContainerResourceFailure(sandbox, request, error, requestDigest)
       if (annotated instanceof RunFailure || annotated instanceof AgentAttemptFailure) throw annotated
       throw new TransientRunFailure('Cloudflare Sandbox transport failed', { cause: annotated })
     }
@@ -363,14 +391,13 @@ export class SandboxAgentProvider implements AgentProvider {
   private async deferExpiredObservation(identity: AgentObservationIdentity,
     requestDigest: string, operation: string, startedAt: Date): Promise<void> {
     try {
-      await this.observationHealth.recordFailure(identity, requestDigest, operation, startedAt)
-      await this.observationCooldowns.put(identity.runId, requestDigest, Date.now() + expiredObservationCooldownMs)
+      await this.observationHealth.recordFailure(identity, requestDigest, operation, startedAt, new Date())
     } catch (error) {
       if (observationHealthIntegrityError(error)) {
         throw new PermanentRunFailure('agent observation health failed integrity', 'integrity-failed',
           { cause: error })
       }
-      throw new TransientRunFailure('durable observation cooldown could not be saved', { cause: error })
+      throw new TransientRunFailure('durable observation health could not be saved', { cause: error })
     }
   }
 
@@ -402,8 +429,11 @@ export class SandboxAgentProvider implements AgentProvider {
 
   private async assertProviderCredentials(request: AgentRequest): Promise<void> {
     if (taskBackend(request.task) === 'claude') {
-      const token = await this.credential(request.task.credentialSource!)
-      if (!token?.startsWith('sk-ant-oat')) throw new PermanentRunFailure('Claude subscription token is missing or invalid', 'missing-credentials')
+      for (const name of claudeAccountBindings(request.task)) {
+        if (!(await this.credential(name))?.startsWith('sk-ant-oat')) {
+          throw new PermanentRunFailure(`Claude subscription token ${name} is missing or invalid`, 'missing-credentials')
+        }
+      }
       if (request.nativeSearchConnection !== undefined
         && (await this.credential(request.nativeSearchConnection.apiKeyEnv)) === null) {
         throw new PermanentRunFailure('native search credential is missing', 'missing-credentials')
@@ -453,7 +483,10 @@ export class SandboxAgentProvider implements AgentProvider {
 
   private async runInSandbox(sandbox: SandboxClient, request: AgentRequest, observationIncident = false,
     observationIdentity?: AgentObservationIdentity, observedRequestDigest?: string): Promise<AgentResult> {
-    const sandboxId = `a0-${(await sha256(`${request.workspaceAllocationRunId ?? request.runId}:${request.task.workspaceKey}`)).slice(0, 30)}`
+    if (request.execution !== undefined && Object.hasOwn(request.execution, 'retainedSession')) {
+      throw new PermanentRunFailure('execution record belongs to its historical app version', 'integrity-failed')
+    }
+    const sandboxId = await nativeSandboxName(request)
     const requestPath = '/workspace/private/agent-request.json'
     const resultPath = '/workspace/private/agent-result.json'
     const requestBody = executionRequestBody(request, this.env.ACK3_CODEX_WORKSPACE_ID)
@@ -482,14 +515,16 @@ export class SandboxAgentProvider implements AgentProvider {
         throw new PermanentRunFailure('sandbox execution receipt failed integrity validation', 'integrity-failed')
       }
       if (sandboxReceiptMatch.status === 'exact') {
-        await this.executionReceipts.put(request.runId, requestDigest, sandboxReceiptMatch.receipt, request)
+        // Stored as the normal path stores it (T3).
+        const receipt = { ...sandboxReceiptMatch.receipt, stderr: this.redactKnownCredentials(sandboxReceiptMatch.receipt.stderr) }
+        await this.executionReceipts.put(request.runId, requestDigest, receipt, request)
         await this.ensureAgentLogRequest(request, requestDigest)
         await this.drainAgentLogs(sandbox, request, requestDigest)
         lifecycleLog('receipt-recovered', {
           runId: request.runId, taskId: request.task.id, attempt: request.attempt,
-          requestDigest, sandboxId, source: 'sandbox', exitCode: sandboxReceiptMatch.receipt.exitCode,
+          requestDigest, sandboxId, source: 'sandbox', exitCode: receipt.exitCode,
         })
-        return this.agentResult(sandbox, request, sandboxReceiptMatch.receipt, requestDigest)
+        return this.agentResult(sandbox, request, receipt, requestDigest)
       }
     }
 
@@ -531,7 +566,8 @@ export class SandboxAgentProvider implements AgentProvider {
       const nativeDshHttp2 = usesNativeDshHttp2(request.task)
       const credentialEnv = { ...this.env }
       for (const name of [request.task.connection?.apiKeyEnv, ...modelHeaderCredentialNames(request.task.connection), request.nativeSearchConnection?.apiKeyEnv,
-        request.task.credentialSource === undefined ? undefined : subscriptionCredentialSource(request.task)]) {
+        request.task.credentialSource === undefined ? undefined : subscriptionCredentialSource(request.task),
+        ...(request.task.fallbackCredentialSources ?? [])]) {
         if (name !== undefined) {
           const value = await this.credential(name)
           if (value === null) throw new PermanentRunFailure(`agent credential ${name} is missing`, 'missing-credentials')
@@ -553,18 +589,6 @@ export class SandboxAgentProvider implements AgentProvider {
         if (existingClaim === null) {
           try {
             if (request.nativeTransport !== undefined) await this.nativeSessions.assertRetryCustody(sandbox, request)
-            if (request.workspaceAllocationRunId !== undefined) {
-              const release = await this.runs.getRelease(request.releaseDigest)
-              const tree = release.body.definition.target.tree
-              const sourceMarker = await sandbox.exists(`/workspace/private/source-tree-${tree}`)
-              const preparation = release.body.definition.target.runtime.workspacePreparation
-              const preparationMarker = preparation === undefined ? null
-                : await sandbox.exists('/workspace/private/workspace-prepared.json')
-              if (!sourceMarker.exists || preparationMarker?.exists === false) {
-                throw new PermanentRunFailure('retained workspace preparation markers are missing',
-                  'session-recovery-unavailable')
-              }
-            }
             if (request.formatRepairOrdinal !== undefined && request.task.providerClass === 'additive'
               && request.task.backend === 'dsh-chat-completions') {
               await this.nativeSessions.assertFormatRepairCustody(sandbox, request)
@@ -584,6 +608,20 @@ export class SandboxAgentProvider implements AgentProvider {
           }
         }
       }
+      // Reservation and fencing share one atomic index. A reserved but not yet
+      // observable launch remains outstanding until terminal/physical evidence;
+      // a fence cannot silently drop it and activate a second executor.
+      try {
+        if (existingClaim === null) {
+          await reserveNativeLaunch(this.runs, new ExecutionAuthorityStore(this.env.INDEX), request, requestDigest)
+        }
+      } catch (error) {
+        if (error instanceof RunFailure) throw error
+        if (error instanceof RunCommandConflict || error instanceof TypeError) {
+          throw new PermanentRunFailure(`native launch authority conflict: ${error.message}`, 'integrity-failed', { cause: error })
+        }
+        throw new TransientRunFailure('native launch authority is temporarily unavailable', { cause: error })
+      }
       const launchClaim = existingClaim ?? await this.executionReceipts.claimStart(request.runId, requestDigest)
       admittedAt = launchClaim.claimedAt
       if (!launchClaim.acquired) {
@@ -597,10 +635,12 @@ export class SandboxAgentProvider implements AgentProvider {
             throw new PermanentRunFailure('sandbox execution receipt failed integrity validation', 'integrity-failed')
           }
           if (match.status === 'exact') {
-            await this.executionReceipts.put(request.runId, requestDigest, match.receipt, request)
+            // Stored as the normal path stores it (T3).
+            const receipt = { ...match.receipt, stderr: this.redactKnownCredentials(match.receipt.stderr) }
+            await this.executionReceipts.put(request.runId, requestDigest, receipt, request)
             await this.ensureAgentLogRequest(request, requestDigest)
             await this.drainAgentLogs(sandbox, request, requestDigest)
-            return this.agentResult(sandbox, request, match.receipt, requestDigest)
+            return this.agentResult(sandbox, request, receipt, requestDigest)
           }
         }
         process = await observe(() => sandbox.getProcess(processId), 'process-lookup')
@@ -640,6 +680,10 @@ export class SandboxAgentProvider implements AgentProvider {
           if (process === null) throw new AgentExecutionPending(processId, 'unavailable')
         }
       } else {
+        // Only the launch-claim holder reaches this point, after the lane's earlier
+        // attempt ended, so no agent runner or workspace preparation is running here.
+        // Stop what an earlier attempt left behind before setup touches the workspace (T2).
+        await this.stopLeftoverAgentProcesses(sandbox, request, requestDigest, sandboxId)
         // Target-controlled setup runs before the credential-bearing process
         // exists. The durable claim and grace clock protect this bounded work.
         await this.prepareSandbox(sandbox, request, requestDigest)
@@ -657,25 +701,14 @@ export class SandboxAgentProvider implements AgentProvider {
         })
         const revoked = await sandbox.exists(`${launchFencePath}/revoked`)
         if (revoked.exists) throw new AgentExecutionPending(processId, 'unavailable')
-        await writeAccepted(sandbox, request, this.artifacts)
+        await writeAccepted(sandbox, request, this.artifacts, { pocTests: await this.verifierReceivesPocTests(request) })
         const nativeResume = request.continuationMode === 'resume'
           && (request.nativeTransport !== undefined || request.formatRepairOrdinal !== undefined)
         if (!nativeResume) await clearUntrustedTaskOutputs(sandbox,
           [...request.task.output.requiredFiles, ...(request.optionalOutputFiles ?? [])], request.repairFiles)
         if (request.task.promptKind === 'coverage-challenge') await ensureCoverageChallengeOutput(sandbox)
         if (Object.keys(request.repairFiles).length > 0) {
-          for (const [path, content] of Object.entries(request.repairFiles)) {
-            if (!request.task.output.requiredFiles.includes(path)) {
-              throw new PermanentRunFailure(`repair file is outside output contract: ${path}`, 'invalid-configuration')
-            }
-            const destination = `/workspace/results/${path}`
-            await sandbox.mkdir(destination.slice(0, destination.lastIndexOf('/')), { recursive: true })
-            await sandbox.writeFile(destination, content)
-            const writable = await sandbox.exec(`chown 10001:10001 ${destination} && chmod 0600 ${destination}`, { timeout: 10_000 })
-            if (!writable.success) {
-              throw new PermanentRunFailure(`repair baseline ownership failed: ${writable.stderr.slice(-2_000)}`, 'invalid-configuration')
-            }
-          }
+          await writeRepairBaseline(sandbox, request)
           await sandbox.writeFile('/control/output-contract-diagnostics.json', canonicalJson({
             schemaVersion: 1,
             kind: 'canonical-output-contract-diagnostics',
@@ -688,7 +721,7 @@ export class SandboxAgentProvider implements AgentProvider {
             throw new PermanentRunFailure(`repair diagnostics permission failed: ${readable.stderr.slice(-2_000)}`, 'invalid-configuration')
           }
         } else if (!nativeResume) {
-          const template = submissionTemplate(request.task)
+          const template = await submissionTemplate(request.task, request.visibleArtifacts)
           if (template !== null) {
             const path = `/workspace/results/${SUBMISSION_PATH}`
             await sandbox.mkdir('/workspace/results/.swarm', { recursive: true })
@@ -817,7 +850,8 @@ export class SandboxAgentProvider implements AgentProvider {
     admittedAt: string | null = null,
   ): Promise<void> {
     try {
-      const startedAt = admittedAt ?? (await this.executionReceipts.claimStart(request.runId, requestDigest)).claimedAt
+      const startedAt = admittedAt ?? (await this.executionReceipts.getStart(request.runId, requestDigest))?.claimedAt
+      if (startedAt === undefined) throw new Error('agent log request lacks its native launch claim')
       let researcherProtocol: string | undefined
       try {
         researcherProtocol = (await this.runs.getRelease(request.releaseDigest)).body.definition.prompts.researcherProtocol
@@ -863,36 +897,23 @@ export class SandboxAgentProvider implements AgentProvider {
     active: () => boolean = () => true,
   ): Promise<boolean> {
     try {
-      const logPath = `/workspace/private/agent-log-${requestDigest}.jsonl`
       const cursor = await this.executionLogs.cursor({
         runId: request.runId,
         taskId: request.task.id,
         requestDigest,
       })
       if (!active() || !cursor.ready) return false
-      const present = await sandbox.exists(logPath)
+      const observed = await sandbox.observeAgentLog(requestDigest, cursor.index.sourceBytes, agentLogReadMaxBytes)
       if (!active()) return false
-      if (!present.exists) {
+      const record = parseLogObservation(observed, cursor.index.sourceBytes, agentLogReadMaxBytes)
+      if (record.status === 'missing') {
         if (terminal && active()) await this.executionLogs.finish({
           runId: request.runId, taskId: request.task.id, requestDigest, truncated: true,
         })
         return terminal
       }
-      const reader = `node -e 'const fs=require("fs");const p=process.argv[1],o=Number(process.argv[2]),m=Number(process.argv[3]);const f=fs.openSync(p,"r"),s=fs.fstatSync(f).size,n=Math.max(0,Math.min(m,s-o)),b=Buffer.alloc(n),r=fs.readSync(f,b,0,n,o);fs.closeSync(f);process.stdout.write(JSON.stringify({size:s,bytes:r,data:b.subarray(0,r).toString("base64")}))' ${logPath} ${cursor.index.sourceBytes} ${agentLogReadMaxBytes}`
-      const read = await sandbox.exec(reader, { timeout: 10_000 })
-      if (!active()) return false
-      if (!read.success) throw new Error('agent log bounded read failed')
-      const value: unknown = JSON.parse(read.stdout)
-      if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('agent log bounded read is invalid')
-      const record = value as Record<string, unknown>
-      if (!Number.isSafeInteger(record.size) || Number(record.size) < cursor.index.sourceBytes
-        || !Number.isSafeInteger(record.bytes) || Number(record.bytes) < 0 || Number(record.bytes) > agentLogReadMaxBytes
-        || typeof record.data !== 'string' || record.data.length > Math.ceil(agentLogReadMaxBytes / 3) * 4 + 4) {
-        throw new Error('agent log bounded read is invalid')
-      }
       const bytes = Uint8Array.from(atob(record.data), character => character.charCodeAt(0))
-      if (bytes.byteLength !== record.bytes) throw new Error('agent log bounded read length mismatch')
-      const reachedEnd = cursor.index.sourceBytes + bytes.byteLength >= Number(record.size)
+      const reachedEnd = record.offset + record.bytes === record.size
       if (!active()) return false
       const index = await this.executionLogs.sync({
         runId: request.runId,
@@ -966,6 +987,7 @@ export class SandboxAgentProvider implements AgentProvider {
     requestDigest: string,
     executionSuccess = result.exitCode === 0,
   ): Promise<AgentResult> {
+    await this.settleControlledLaunch(request, result, requestDigest)
     try {
       const accepted = await agentResultFromExecutionReceipt(request, result, requestDigest, executionSuccess,
         fields => lifecycleLog('late-upstream-handoff-candidate', fields))
@@ -991,7 +1013,69 @@ export class SandboxAgentProvider implements AgentProvider {
           'session-recovery-unavailable', { cause: error })
       }
       throw new AgentAttemptFailure(error.message, { cause: error, usage: error.usage!,
-        includeDiagnosticsInRepair: false, nativeTransport })
+        includeDiagnosticsInRepair: false, nativeTransport,
+        ...(error.providerTransient === undefined ? {} : { providerTransient: error.providerTransient }) })
+    }
+  }
+
+  private async settleControlledLaunch(request: AgentRequest,
+    receipt: import('./agent-execution-receipt.js').AgentExecutionReceipt, requestDigest: string): Promise<void> {
+    if (request.executionAuthority === undefined) return
+    try {
+      await new ExecutionAuthorityStore(this.env.INDEX).settleLaunch(
+        request.executionAuthority, requestDigest, await sha256(receipt),
+      )
+    } catch (error) {
+      if (error instanceof RunCommandConflict) {
+        try {
+          const selected = await new ExecutionAuthorityStore(this.env.INDEX).observeLaunch(
+            request.executionAuthority, request.taskExecutionId!, requestDigest)
+          if (selected?.receiptDigest !== null && selected?.receiptDigest !== undefined
+            && await verifiedCancellationWinner(this.env, request, requestDigest, selected.receiptDigest)) {
+            // The genuine receipt is already durable. Await the existing control
+            // transition, without accepting this output or retrying paid work.
+            throw new AgentExecutionPending(agentProcessId(requestDigest), 'cancelled')
+          }
+        } catch (observationError) {
+          if (observationError instanceof RunFailure || observationError instanceof AgentExecutionPending) throw observationError
+          if (observationError instanceof RunCommandConflict || observationError instanceof TypeError) {
+            throw new PermanentRunFailure('native cancellation settlement integrity failed', 'integrity-failed', { cause: observationError })
+          }
+          throw new TransientRunFailure('native cancellation settlement observation is unavailable', { cause: observationError })
+        }
+      }
+      if (error instanceof RunCommandConflict || error instanceof TypeError) {
+        throw new PermanentRunFailure('native launch settlement integrity failed', 'integrity-failed', { cause: error })
+      }
+      // The exact paid receipt is already durable. A lost database response is
+      // observation failure, never a failed model attempt or a fresh launch.
+      throw new TransientRunFailure('native launch settlement is temporarily unavailable', { cause: error })
+    }
+  }
+
+  private async assertCurrentAdmission(request: AgentRequest): Promise<void> {
+    let state: import('./contracts.js').RunState
+    try { state = await this.runs.getState(request.runId) }
+    catch (cause) {
+      if (cause instanceof RunFailure || cause instanceof AgentExecutionPending) throw cause
+      throw new TransientRunFailure('task admission state is temporarily unavailable', { cause })
+    }
+    try {
+      const check = request.task.providerClass === 'deterministic' ? assertSupervisorTaskAdmission : assertNativeTaskAdmission
+      await check(state, request, digest => this.runs.getRelease(digest), this.runs.executionSources())
+    } catch (cause) {
+      if (cause instanceof RunFailure || cause instanceof AgentExecutionPending) throw cause
+      if (cause instanceof RunCommandConflict) throw new TransientRunFailure('task selection changed; reload before execution', { cause })
+      throw new PermanentRunFailure('task admission evidence is invalid', 'integrity-failed', { cause })
+    }
+  }
+
+  private async registerWorkspaceBirth(sandbox: SandboxClient, sandboxId: string,
+    owner: import('./workspace-mutation-owner.js').WorkspaceMutationOwner): Promise<void> {
+    const receipt = await sandbox.initializeMutationOwner(owner)
+    if (canonicalJson(receipt.owner) !== canonicalJson(owner)
+      || receipt.objectId !== this.env.AGENT_SANDBOX.idFromName(sandboxId).toString()) {
+      throw new PermanentRunFailure('workspace birth receipt differs', 'integrity-failed')
     }
   }
 
@@ -999,9 +1083,12 @@ export class SandboxAgentProvider implements AgentProvider {
     runId: string
     workspaceKey: string
     freshSuffix?: string
+    mutationOwner?: import('./workspace-mutation-owner.js').WorkspaceMutationOwner
   }): Promise<WorkspaceDisposalReceipt> {
-    const sandboxId = `a0-${(await sha256(`${input.runId}:${input.workspaceKey}${input.freshSuffix ?? ''}`)).slice(0, 30)}`
+    input = deepClone(input)
+    const sandboxId = await workspaceAllocationName(input)
     const sandbox = getAgentSandbox(this.env.AGENT_SANDBOX, sandboxId, {
+      ...(input.mutationOwner === undefined ? {} : { mutationOwner: input.mutationOwner }),
       // Terminal workspace ownership disables keep-alive before destroy. If
       // teardown is delayed, the inactivity timeout remains a bounded fallback.
       keepAlive: false, inactivityTimeoutMs: 30 * 60_000,
@@ -1013,6 +1100,10 @@ export class SandboxAgentProvider implements AgentProvider {
     // Include lifetime configuration in the same terminal deadline. A late
     // keep-alive response must not initiate destruction after deferral.
     const receipt = await boundedWorkspaceDisposal(async expired => {
+      // An admitted synthetic unavailable result may never have created this
+      // actor. Birth registration is metadata-only and refuses stale owners.
+      if (input.mutationOwner?.ordinal === 0) await this.registerWorkspaceBirth(sandbox, sandboxId, input.mutationOwner)
+      if (expired()) return
       await sandbox.setKeepAlive(false)
       if (!expired()) await sandbox.destroy()
     })
@@ -1116,6 +1207,53 @@ export class SandboxAgentProvider implements AgentProvider {
     return true
   }
 
+  /** Keep a failed preparation try's failure file under a per-try name and log it, so the
+   * next try starts clean and the last failure is still the one reported. False when there is
+   * no failure file to keep: then the failure is not a command failure and is not retried. */
+  private async setAsideWorkspacePreparationFailure(sandbox: SandboxClient, request: AgentRequest,
+    requestDigest: string, tryNumber: number): Promise<boolean> {
+    if (!/^[a-f0-9]{64}$/.test(requestDigest)) return false
+    const path = `/workspace/private/workspace-preparation-failure-${requestDigest}.json`
+    const exists = await sandbox.exists(path)
+    if (!exists.success || !exists.exists) return false
+    let code: unknown = null, command: unknown = null
+    try {
+      const failure = JSON.parse((await sandbox.readFile(path)).content) as { code?: unknown, results?: { index?: unknown }[] }
+      code = typeof failure.code === 'string' ? failure.code : null
+      command = Array.isArray(failure.results) ? failure.results.at(-1)?.index ?? null : null
+    } catch { /* The kept file remains the evidence. */ }
+    const kept = `/workspace/private/workspace-preparation-failure-${requestDigest}.try-${tryNumber}.json`
+    const moved = await sandbox.exec(`mv -f -- '${path}' '${kept}'`, { timeout: 10_000 })
+    if (!moved.success) return false
+    lifecycleLog('workspace-preparation-retry', { runId: request.runId, taskId: request.task.id,
+      attempt: request.attempt, requestDigest, try: tryNumber, code, command })
+    return true
+  }
+
+  /** Stop the agent-user processes an earlier attempt left in this sandbox. An image without
+   * the script skips this, and a failed sweep is only logged: neither stops the launch. */
+  private async stopLeftoverAgentProcesses(sandbox: SandboxClient, request: AgentRequest,
+    requestDigest: string, sandboxId: string): Promise<void> {
+    const fields = { runId: request.runId, taskId: request.task.id, attempt: request.attempt, requestDigest, sandboxId }
+    if (!(await sandbox.exists(agentProcessSweepPath)).exists) {
+      lifecycleLog('agent-process-sweep-skipped', fields)
+      return
+    }
+    const swept = await sandbox.exec(agentProcessSweepPath, { timeout: 30_000 })
+    let counts: { stopped?: unknown; remaining?: unknown } = {}
+    try { counts = JSON.parse(swept.stdout) as typeof counts } catch {}
+    if (!swept.success) lifecycleLog('agent-process-sweep-failed', { ...fields, exitCode: swept.exitCode })
+    else if (counts.stopped !== 0 || counts.remaining !== 0) {
+      lifecycleLog('agent-processes-stopped', { ...fields, stopped: counts.stopped, remaining: counts.remaining })
+    }
+  }
+
+  /** Only a verifier in a keepPocs release gets the discovery PoC tests. */
+  private async verifierReceivesPocTests(request: AgentRequest): Promise<boolean> {
+    if (request.task.promptKind !== 'verification') return false
+    return (await this.runs.getRelease(request.releaseDigest)).body.definition.prompts.pocReview !== undefined
+  }
+
   private async prepareSandbox(sandbox: SandboxClient, request: AgentRequest, requestDigest?: string): Promise<void> {
     const release = await this.runs.getRelease(request.releaseDigest)
     await sandbox.mkdir('/workspace/private', { recursive: true })
@@ -1124,6 +1262,16 @@ export class SandboxAgentProvider implements AgentProvider {
     if (!privateMode.success) throw new PermanentRunFailure('private workspace permissions failed', 'invalid-configuration')
     await sandbox.writeFile('/control/researcher-protocol.md',
       `${release.body.definition.prompts.researcherProtocol}\n\nWorkspace facts: /control/workspace-environment.md\n`)
+    // A copy agents can reread when a long session no longer holds the start of its prompt.
+    if (release.body.definition.policy.scope !== undefined) await sandbox.writeFile(auditScopePath, `${auditScopeHeader(release.body.definition)}\n`)
+    // What `ack3-submit` needs to rerun the Worker's checks: the task's output contract and accepted inputs.
+    if (request.task.submitCheck === true) {
+      await sandbox.writeFile(SUBMIT_CHECK_CONTEXT_PATH, canonicalJson(submitCheckContext(request.task,
+        [...request.task.output.requiredFiles, ...(request.optionalOutputFiles ?? [])], request.visibleArtifacts,
+        mandatorySearchRequirement(release.body.definition, request.task, request.stage.kind))))
+      const readable = await sandbox.exec(`chmod 0444 ${SUBMIT_CHECK_CONTEXT_PATH}`, { timeout: 10_000 })
+      if (!readable.success) throw new PermanentRunFailure('submission check context permission failed', 'invalid-configuration')
+    }
     const tree = release.body.definition.target.tree
     const commit = release.body.definition.target.commit
     const marker = await sandbox.exists(`/workspace/private/source-tree-${tree}`)
@@ -1141,15 +1289,29 @@ export class SandboxAgentProvider implements AgentProvider {
     const profile = release.body.definition.target.runtime.workspacePreparation
     if (profile !== undefined && request.task.providerClass !== 'deterministic') {
       const profileDigest = await sha256(canonicalJson(profile))
-      const prepared = await sandbox.exec('/usr/local/bin/ack3-prepare-workspace', {
+      const prepare = () => sandbox.exec('/usr/local/bin/ack3-prepare-workspace', {
         cwd: '/workspace/source', timeout: 9 * 60_000,
         env: {
           ACK3_EXPECTED_COMMIT: commit, ACK3_EXPECTED_TREE: tree,
           ACK3_WORKSPACE_PREPARATION_JSON: canonicalJson(profile),
           ACK3_WORKSPACE_PREPARATION_DIGEST: profileDigest,
+          ...(release.body.definition.target.runtime.buildRequired === false ? { ACK3_BUILD_REQUIRED: 'false' } : {}),
+          ...(release.body.definition.target.runtime.commandTimeoutMinutes === undefined ? {}
+            : { ACK3_COMMAND_TIMEOUT_MINUTES: String(release.body.definition.target.runtime.commandTimeoutMinutes) }),
           ...(requestDigest === undefined ? {} : { ACK3_REQUEST_DIGEST: requestDigest }),
         },
       })
+      const firstTryAt = Date.now()
+      let prepared = await prepare()
+      // A failed command (a registry timeout, a command over its limit) is retried in place.
+      // Only a failure that left its failure file is retried; the file is kept under a per-try name.
+      for (let retry = 0; !prepared.success && retry < workspacePreparationRetryWaitsMs.length; retry += 1) {
+        const wait = workspacePreparationRetryWaitsMs[retry]!
+        if (requestDigest === undefined || Date.now() - firstTryAt + wait > workspacePreparationRetryWindowMs
+          || !await this.setAsideWorkspacePreparationFailure(sandbox, request, requestDigest, retry + 1)) break
+        await this.preparationSleep(wait)
+        prepared = await prepare()
+      }
       if (!prepared.success) {
         const retained = requestDigest === undefined ? false
           : await this.persistWorkspacePreparationFailure(sandbox, request, requestDigest)
@@ -1161,10 +1323,13 @@ export class SandboxAgentProvider implements AgentProvider {
     } else {
       await sandbox.writeFile('/control/workspace-environment.md', [
         '# Workspace environment', '',
+        ...(release.body.definition.target.runtime.buildRequired === false ? ['The baseline build is optional for this audit and may fail here. Check whether the project builds before relying on tests; if it does not, work from the source.', ''] : []),
         'The verified source is an archive without Git history; `git status` is unavailable.',
         'No per-workspace preparation profile was sealed for this release.',
         'Project dependencies and dynamic test readiness are unverified in this workspace.', '',
-        'Optional OS tools: `sudo -n /usr/local/bin/ack3-install-os-packages PACKAGE` installs literal packages from configured repositories in this workspace. Use project-local package managers for project dependencies.', '',
+        'Optional OS tools: `sudo -n /usr/local/bin/ack3-install-os-packages PACKAGE` installs literal packages from configured repositories in this workspace. Use project-local package managers for project dependencies.',
+        'GitHub CLI: `gh` works when the audit provides a read-only `GH_TOKEN`; without one, use `git clone` or `curl` for public GitHub data. Keep GitHub searches generic so they reveal nothing about the target.',
+        ...workspaceLimitNotes(release.body.definition.target.runtime.commandTimeoutMinutes), '',
       ].join('\n'))
     }
     if (taskBackend(request.task) === 'claude') {
@@ -1227,7 +1392,6 @@ export class SandboxAgentProvider implements AgentProvider {
 
   private async preflight(sandbox: SandboxClient, request: AgentRequest): Promise<AgentResult> {
     const release = await this.runs.getRelease(request.releaseDigest)
-    await assertReleaseProviderCredentials(release.body.definition, this.env)
     const targetEnvironment = await this.runtimeEnvironment(request.releaseDigest)
     const result = await sandbox.exec('/usr/local/bin/ack3-preflight', {
       cwd: '/workspace/source', timeout: 3_600_000,
@@ -1243,6 +1407,7 @@ export class SandboxAgentProvider implements AgentProvider {
         ACK3_TARGET_PREFLIGHT_COMMANDS_JSON: JSON.stringify(
           release.body.definition.target.runtime.preflightCommands,
         ),
+        ...(release.body.definition.target.runtime.buildRequired === false ? { ACK3_TARGET_BUILD_REQUIRED: 'false' } : {}),
       },
     })
     if (!result.success) {

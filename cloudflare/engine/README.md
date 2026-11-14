@@ -23,6 +23,15 @@ bind stored credentials. Declare provider API keys and subscription accounts in 
 `runtime_secret_bindings` and pass its JSON output as `ACK3_RUNTIME_SECRET_BINDINGS` when
 rendering and deploying runtimes. See [Terraform credentials](../terraform/README.md#state-and-credentials).
 
+The container runner replaces credential values with `<redacted:NAME>` in the agent
+log, in the error output of the execution receipt and in the agent's output files.
+It treats as credentials the variables whose names contain `AUTH`, `CREDENTIAL`,
+`KEY`, `PASSWORD`, `SECRET` or `TOKEN`, or start with `TARGET_`, and each token in
+the Codex login. Name a target variable accordingly (for example `GH_TOKEN`, not
+`GH_ACCESS`), or its value is not redacted. An output file that contained a
+credential value is rejected; the correction names the file and the variable, never
+the value.
+
 ## Build and deployment
 
 Deploy code through Wrangler/CLI/API. Infrastructure resources and new services
@@ -35,7 +44,8 @@ preserve active audits' runtime versions and images.
 | Front door or dashboard | Code-only publication below. |
 | Supervisor, Workflow, prompt rendering or DSH runtime policy | Rotate an idle runtime; reuse an unchanged image. |
 | Installed tools, runner or dependencies | Build an image locally, then update an idle runtime. |
-| Infrastructure resources or bindings | [Terraform](../terraform/README.md), coordinated with the runtime deployment configuration. |
+| Account resources, Worker identities, new services or account-resource bindings | [Terraform](../terraform/README.md), coordinated with the runtime deployment configuration. |
+| Per-Worker code classes and local Workflow/Sandbox/coordinator bindings or migrations | Reviewed private-runtime publication through Wrangler, coordinated with the infrastructure binding contract; verify namespaces before activation. |
 
 ### First-time setup
 
@@ -49,6 +59,13 @@ You need:
 - Node and pnpm ([package.json](../../package.json)), Terraform 1.15.x, Docker with
   buildx, Git, `jq` and `zstd`.
 
+Before you audit private code, know what stays: R2 lock rules keep uploaded target
+source, releases, checkpoints and accepted results with no expiry, so Swarm cannot
+delete them, and Terraform refuses to destroy its storage and credentials. Only an
+account administrator can delete them, by removing the lock rules first; see
+[Remove one audit's data](../../docs/remove-audit-data.md). For a trial, use an
+account you can close afterwards.
+
 Details are in the [Terraform prerequisites](../terraform/README.md). Keep your own
 settings in `private/`, starting from the [private.example](../../private.example/README.md)
 template. Then:
@@ -58,6 +75,7 @@ template. Then:
 2. [Build and push the image](#local-container-builds).
 3. For each runtime: write its declaration, render and deploy it, and set any
    `TARGET_*` secrets your audits use ([Worker and runtime publication](#worker-and-runtime-publication)).
+   A first install needs only `runtime-01`; the other slots can stay empty.
 4. Write the runtime catalog, render the front door, and deploy it with its
    `CONTROL_API_TOKEN` secret.
 5. Optional, for code rotation: deploy every runtime slot (at least two) and
@@ -74,9 +92,13 @@ From a clean checkout of the reviewed commit, supply `ACK3_ENGINE_URL`,
 node cloudflare/engine/tools/rotate-runtime-code.mjs /path/to/private/rotation-intent.json COMMIT_SHA sha256:IMAGE_DIGEST ACCOUNT_ID
 ```
 
-This reserves the oldest idle slot, publishes code, verifies identity and activates
-it. The slot must already have the required image, bindings and capacity; code
-rotation preserves them. If the result is ambiguous, reconcile the saved intent
+This first builds the bundle and runs the type check and a focused test; if one
+fails, no slot is locked and the intent file is not written, so you can fix and run
+it again. It then reserves the oldest idle slot, publishes code, verifies identity
+and activates it. The slot must already have the required image, bindings and capacity; code
+rotation preserves them. A slot without its own `COORDINATORS` binding (published
+before runtimes had one) needs a full runtime publication instead; rotation refuses
+it. If the result is ambiguous, reconcile the saved intent
 instead of publishing again:
 
 ```sh
@@ -88,6 +110,13 @@ For an audit release explicitly activated on that runtime, dispatch once with:
 ```sh
 node cloudflare/engine/tools/start-audit-once.mjs RUN_ID EXPERIMENT_ID RELEASE_DIGEST RUNTIME_ID /path/to/private/audit-intent.json
 ```
+
+Admission durably queues the exact launch on the coordinator alarm. A `202` response
+with `dispatchPending: true` means dispatch is still being reconciled automatically;
+it does not prove that a Workflow or model session has started. Do not launch another
+run to compensate for a missing response. A proven routing or runtime-release
+identity conflict is refused durably; an identical request returns that refusal
+instead of silently selecting another runtime.
 
 Record elapsed time and verify production state. The deploy, rotation and start tools
 wait up to 30 seconds to observe the result. Set `ACK3_DEPLOY_DEADLINE_MS` to use a
@@ -177,9 +206,11 @@ pnpm --dir cloudflare/engine config:runtime /path/to/private/runtime-release.jso
 Deploy it with
 `pnpm --dir cloudflare/engine deploy:runtime wrangler.runtime.RUNTIME_ID.jsonc --secrets-store-bindings`.
 The helper refuses to overwrite a published Worker. If a first deploy fails after
-Wrangler has uploaded the Worker, that slot cannot be reused, because Terraform
-protects runtime Workers from deletion. Deploy to an unused slot instead, and raise
-`runtime_slot_count` in Terraform if none is free.
+Wrangler has uploaded the Worker, do not repeat initial publication. Inspect the exact deployed identity and
+reconcile its state. Use [runtime rotation](#rotate-runtime-code) for an already
+provisioned idle slot; preserve slots with active work or unsettled leases.
+Terraform protects runtime Workers from deletion, so during a first install deploy to
+an unused slot instead, and raise `runtime_slot_count` in Terraform if none is free.
 
 A Codex login is needed only for audits with Codex pools. Without `ACK3_CODEX_WORKSPACE_ID`,
 the runtime has no Codex binding and refuses Codex pools at start. To add one, install
@@ -209,15 +240,32 @@ printf 'Authorization: Bearer %s\n' "$CONTROL_API_TOKEN" | \
 
 Audit `environmentBindings` read `TARGET_*` Worker secrets on each runtime; set them
 from the engine directory with `pnpm exec wrangler secret put TARGET_NAME --config wrangler.runtime.RUNTIME_ID.jsonc`.
+Each `secret put` publishes a new runtime version. Audits that ran on the earlier version
+can then no longer be forked (`409 runtime release worker version changed`) unless you
+roll the runtime back to that version, so set `TARGET_*` secrets before you start audits.
 
 Render front-door configuration with `pnpm --dir cloudflare/engine config:deploy`.
 The front door requires its `CONTROL_API_TOKEN` secret, the value stored as
 `swarm-control-token`, and Wrangler refuses the first deploy without it. Pass it once
 with a private secrets file containing `{"CONTROL_API_TOKEN": "…"}`, from the engine directory:
-`pnpm exec wrangler deploy --config wrangler.deploy.jsonc --secrets-file /path/to/private/front-door-secrets.json`.
+`pnpm exec wrangler deploy --config wrangler.deploy.jsonc --secrets-file /path/to/secrets/front-door-secrets.json`.
 The rendered front door has no containers. Later deploys keep the secret; use
 `pnpm deploy:worker` there.
-Do not remove bindings used by active audits or supported recovery routes.
+Keep bindings for every runtime that still owns work, evidence access or pending cleanup.
+
+Terminal zero-model fixtures can be retired through
+`POST /v1/runtime-fixtures/:id/retire-terminal`. If native retention has expired,
+the same command accepts `postRetention` evidence: the sealed fixture checkpoint,
+exact native `10400` missing-instance receipts for both Workflows, and a complete
+fresh inventory of the matching application and namespace with no instances or
+assigned actors. The control service independently reads and matches the native
+evidence using its `CLOUDFLARE_OBSERVABILITY_TOKEN` Secrets Store binding; caller
+JSON alone cannot release a lease. Render that read-only binding with
+`ACK3_SECRETS_STORE_ID` and `ACK3_CLOUDFLARE_ACCOUNT_ID`. Missing credentials or native
+API errors refuse retirement. The checkpoint must be at least one day old. The archive records
+`instance-not-found`, not a fabricated `complete` status, and releases only that
+fixture's lease. It does not delete its checkpoint or route. A missing Workflow
+alone is insufficient, and audit runs cannot use this fixture retirement path.
 
 ### Runtime slot pool
 
@@ -238,8 +286,9 @@ Then render the front door with `ACK3_RUNTIME_SLOT_POOL_ENABLED=1` and publish i
 
 Rebuild only when the [Dockerfile](Dockerfile), installed tools or container files
 change. Target source and project dependencies belong in the audit configuration.
-You need Docker with buildx, and `jq` for the push step. The image is a few GB; on ARM
-hosts the `linux/amd64` build runs under emulation and is slower. Build for
+You need Docker with buildx. The push step also runs Wrangler and `jq` on the Docker
+host, from the repository's `pnpm install` or from a container (below). The image is
+a few GB; on ARM hosts the `linux/amd64` build runs under emulation and is slower. Build for
 `linux/amd64` using the engine directory as the build context:
 
 ```sh
@@ -283,6 +332,45 @@ short-lived registry credentials:
 )
 ```
 
+If the Docker host has no Node, replace `pnpm --dir cloudflare/engine exec wrangler` in
+the loop with a containerized Wrangler at the repository's version:
+`docker run --rm -e CLOUDFLARE_API_TOKEN -e CLOUDFLARE_ACCOUNT_ID -v swarm-npm-cache:/root/.npm node:22-slim npx --yes "wrangler@$(jq -er .devDependencies.wrangler cloudflare/engine/package.json)"`.
+
+If the API token stays in a dev container and only the host has Docker, pass the host
+a short-lived push credential instead. In the container, from the repository root:
+
+```sh
+(umask 077; pnpm --dir cloudflare/engine exec wrangler containers registries credentials \
+  registry.cloudflare.com --expiration-minutes 60 --push --json > private/registry-push.json)
+```
+
+On the host, after the build, from the same repository folder:
+
+```sh
+(
+  set -eu
+  export DOCKER_CONFIG="$(mktemp -d)"
+  # Runs on exit: after a successful push or after the last failed attempt.
+  trap 'rm -rf "$DOCKER_CONFIG" private/registry-push.json' EXIT
+  # Large layers can time out. Docker skips layers that were already uploaded.
+  attempt=1
+  until
+    jq -er '.password' private/registry-push.json | docker login registry.cloudflare.com \
+      --username "$(jq -er '.username' private/registry-push.json)" --password-stdin &&
+    docker push "$SWARM_IMAGE"
+  do
+    [ "$attempt" -lt 10 ] || exit 1
+    attempt=$((attempt + 1))
+    sleep 10
+  done
+  docker image inspect "$SWARM_IMAGE" --format '{{json .RepoDigests}}'
+)
+```
+
+This is the one secret that passes through `private/`. It can only push, expires
+after an hour and is deleted once the push has succeeded or all ten attempts have
+failed. If every attempt fails, mint a new one.
+
 Use the resulting digest in both the runtime declaration and audit configuration.
 To confirm it in the registry (for example with `docker manifest inspect`), request
 credentials with both `--push` and `--pull`; push-only credentials cannot read manifests.
@@ -291,55 +379,36 @@ GitHub Actions; remove only task-owned obsolete images and build artifacts.
 
 ## Checkpoints and recovery
 
-[Stop and resume commands](../../docs/running-audit.md#stop-or-resume) cover normal
-controls. Stop terminates the Workflow and requests workspace cleanup; verify
-native container absence separately. An immediate stop does not create a checkpoint.
+Use [audit controls](../../docs/audit-controls.md) to pause admission, continue,
+cancel or fork. Cancellation preserves accepted work, records interrupted evidence,
+verifies native shutdown and releases the runtime lease. Wait for its settled
+receipt before replacing failed work. A timeout or missing status response is not
+proof of shutdown.
 
-Recovery preserves accepted evidence and ancestry in a child run. For failed
-partial waves, use the [failed-wave recovery contract](src/failed-wave-recovery.ts);
-for an interrupted final completion, use the
-[terminal recovery contract](src/terminal-completion-recovery.ts).
-An operator may explicitly waive one quota-blocked discovery task only after
-other work drains and the source is fenced; see the
-[discovery pool waiver procedure](docs/discovery-pool-waiver.md).
-A failed root run with independent discovery may also recover its sole missing
-core task after a first-attempt terminal receipt mismatch. Recovery requires the
-matching rejection and terminal journal entry, drained work, exact source and
-checkpoint binding, and revalidation of the preserved artifacts. The mismatched
-receipt remains rejected; only the missing task runs again. Its missing usage
-remains unknown. Fence the source before dispatching the child.
+To change models or limits, publish an ordinary manifest and fork the exact saved
+source state. A stage or checkpoint boundary reruns the selected suffix; a saved
+frontier retains accepted partial-wave work and runs unfinished tasks. At a retired
+discovery frontier, remove an unavailable pool from the manifest and assign its
+later review role to another pool. Required output and independence checks still apply.
 
-For a first synthesis attempt rejected terminally for output size, the same
-failed-wave endpoint accepts `repairQuarantined: { taskId, requestDigest,
-outputDigest }`. It requires a retired source, a sealed checkpoint containing
-every accepted artifact, exact native request/receipt and quarantine bytes,
-and no admitted work. The child preserves accepted artifacts, the original
-model clock and all recorded usage. It starts a new synthesis session with the
-rejected files as untrusted repair context; it does not promote them or resume
-the destroyed native session. Subsequent malformed responses use the normal
-bounded correction policy. Every corrected output must pass normal validation.
+The source runtime exports saved work; the child verifies the export before
+execution. Accepted and rejected evidence, original clocks and recorded usage
+remain intact. Rejected output is not promoted into an accepted result, and inherited
+failed attempts do not consume the new task's retry allowance. Cross-version
+continuation requires an exporter on the source version.
 
-A sole verification or reporting task can use the failed-wave endpoint after
-its attempts end without output. Retire the failed source with complete native
-zero-work custody first, then select a corrected runtime with the same container
-image. Recovery requires the exact unchanged sealed frontier and rechecks the
-stored retirement fence at admission and bootstrap. It retries only that task,
-preserving accepted artifacts, the original clock, recorded usage and inherited
-unknown usage. A previously verified review image transition remains valid only
-for that same image; this path cannot authorize another image change.
+Successful completion and cancellation reconcile cleanup autonomously. Status
+GET requests only observe state; they do not archive runs or release leases.
+Unavailable shutdown evidence leaves cancellation pending under the same command
+ID. Preserve that ID when retrying; do not start a competing audit.
 
-Output limits are 4,000,000 UTF-8 bytes per file and 1,000,000 bytes for structured
-submission JSON. The deterministic final seal alone may add the exact UTF-8 byte
-length of its validated custody suffix to the file limit, so a size-valid report
-draft remains sealable. All other files retain the normal limit. Generated
-instructions state the agent output limits. Exceeding a limit
-is repairable; provider identity, unsafe paths and other integrity failures
-remain fatal. Larger limits do not waive schema or observation-custody checks.
-Never alter checkpoints or count missing usage receipts as zero.
+### Output limits
 
-Before releasing a stopped run's runtime lease, preserve its state and prove
-Workflow termination and physical cleanup through the
-[stopped-run retirement contract](src/stopped-run-retirement.ts).
+Agent files are limited to 4,000,000 UTF-8 bytes each; structured submission JSON
+is limited to 1,000,000 bytes. Exceeding a limit is repairable within the configured
+allowance. Integrity failures, including unsafe paths and provider identity
+mismatches, remain fatal. The final seal may append its validated evidence suffix
+to an otherwise size-valid report. These limits do not waive output validation.
 
 ## Monitoring and diagnostics
 
@@ -348,10 +417,13 @@ evidence and usage; controls use the authenticated API.
 
 | Read-only route | Result |
 | --- | --- |
-| `GET /v1/monitor/runs` | Paginated audit index. |
+| `GET /v1/monitor/runs` | Paginated audit index of runs with execution ownership. |
 | `GET /v1/monitor/runs/:id` | Activity and saved evidence summary. |
 | `GET /v1/monitor/runs/:id/artifacts/:digest` | Accepted artifact files. |
 | `GET /v1/runs/:id` | Run state and Workflow status. |
+
+Runs recorded before execution ownership are not listed, and the dashboard cannot
+open them. Their saved state and artifacts remain in R2.
 
 Saved activity can lag execution. Recorded usage includes rejected attempts and
 inherited work; do not sum parent and child totals. Recorded cost is not a provider
@@ -377,9 +449,24 @@ A native Claude `rejected` quota event with a valid reset and session ID keeps
 its admitted process pending. After the SDK finishes its error result, the runner
 closes that query, waits until the reported reset (with a one-minute retry floor),
 and uses `options.resume` with the same session and a continuation-only prompt.
-It does not replay the original task, enable extra usage or switch credentials.
+It never opens a new session or enables extra usage. A Claude pool with
+`fallbackCredentialSources` first resumes the same session at once on the next
+account whose reset has passed or is unknown, and waits only when every account is
+used up; each switch is stored as `subscriptionSwitches` on the receipt and usage.
+After a wait or a switch, a task whose model has not answered yet in this attempt
+resumes the same session with its own prompt instead of the continuation prompt,
+since the rejected request may not have saved it.
+The root agent runner runs that loop and starts one Claude runner per account, so
+the agent's processes only ever hold the active account's token.
 Unrelated SDK failures and quota responses without usable reset/session evidence
 still fail closed. Normal Workflow polling slices do not impose a task timeout.
+
+The wait has no maximum: a weekly limit can hold the task until that reset. The
+agent runner writes a status line to the task's log capture when a wait starts
+and ends. The redactor holds back the end of a silent stream, so this line carries
+only the provider and reset time. The log index keeps the open wait until it ends
+or the log completes, and the dashboard shows the task as waiting for
+subscription quota with its reset time and counts waiting tasks in the run summary.
 
 Completed waits travel with receipt usage into accepted or rejected work. The
 discovery deadline adds their interval union, so parallel quota waits count once
@@ -388,10 +475,10 @@ completed wait evidence adjusts subsequent admissions and phase completion.
 Other pools may keep working while a pool waits. Token and cost limits remain in
 force. Usage sums distinct native queries; incomplete samples remain incomplete.
 
-This preserves context while the same container survives. Native session files
+Context is retained while the same container survives. Native session files
 remain on its ephemeral disk: host loss is a separate custody failure and is not
-recovered by this wait loop. Deploying this behavior requires a new image and
-runtime; it cannot change an already pinned audit.
+recovered by this wait loop. Runner changes require a new image and runtime;
+active audits keep their pinned versions.
 
 ## Native prompt transport
 
@@ -400,11 +487,24 @@ corrections. Claude receives its request over stdin through the SDK runner.
 Prompt transport does not truncate validation diagnostics or apply an additional
 command-line size limit.
 
+### Runtime cleanup binding
+
+Each runtime requires its own `COORDINATORS` binding to `ExperimentCoordinator`
+and the renderer's `v3` SQLite-class migration. Its alarms reconcile commands and
+terminal cleanup independently of dashboard requests. This namespace is separate
+from the front-door coordinator.
+
+Verify the Workflow, Sandbox and coordinator namespaces before activating a
+runtime. Code-only rotation preserves bindings; use the runtime publication path
+when bindings or migrations change. Keep older runtimes until their work and
+cleanup have settled.
+
 ## Validation
 
 [Local contributor checks](../../CONTRIBUTING.md#local-setup) cover types, tests and
 bundling. Install `container/harness` dependencies with `npm ci --ignore-scripts`
-and run `node --test test/native-claude.test.mjs test/subscription-limits.test.mjs`
+and, from `cloudflare/engine`, run
+`node --test test/native-claude.test.mjs test/subscription-limits.test.mjs`
 for Claude/Codex subscription boundaries.
 
 The image pins DSH 0.2.1-rc.2 and pi-ai 1.3.0. Its
@@ -430,18 +530,3 @@ DSH_BIN=/path/to/dsh node cloudflare/engine/tools/test-native-dsh-recovery.mjs
 These use local fixtures. `LIVE_EXA=1` with `EXA_API_KEY` enables a real Exa request
 in the search test. Use `DSH_RUNNER_BIN` or `DSH_RECEIPT_WRAPPER_BIN` for tests of
 the installed container runner. Fixture success does not establish provider availability.
-
-### Repairing a quarantined review after a prompt launch failure
-
-The failed-wave recovery API can seed a fresh replica review session from its
-custody-verified rejected output when the original schema rejection was followed
-by two no-result correction launches. The saved correction requests must match
-the full diagnostic prompt and exceed Linux's per-argument bound. The source must
-be terminal and retired, with one accepted peer review; the target must use a new
-image. The verified recovery binds the original environment image to the source
-runtime and the replacement image to the exact destination runtime. Ordinary
-starts and resumes still require the sealed environment image. Accepted artifacts,
-the review packet, clock, previous rejections and usage
-are retained. Missing correction receipts remain unknown usage. Rejected files
-are untrusted repair context, never promoted to accepted decisions. The new output
-must pass the same validation and independent-review quorum.

@@ -1,3 +1,4 @@
+import { createControlledMachine } from './support/controlled-machine.js'
 import { describe, it, expect } from 'vitest'
 import { mkdtemp, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -5,13 +6,16 @@ import { join } from 'node:path'
 import document from './fixtures/audit0-hello-vault.json' with { type: 'json' }
 import prompts from '../../../docs/examples/prompts.json' with { type: 'json' }
 import { compileExperimentConfig } from '../src/config-compiler.js'
-import { AUDIT_STAGES, type AuditStageKind, type AgentRequest } from '../src/contracts.js'
+import { AUDIT_STAGES as ALL_AUDIT_STAGES, type AuditStageKind, type AgentRequest } from '../src/contracts.js'
 import { createAudit0RunPolicy } from '../src/runner.js'
 import { RunMachine } from '../src/machine.js'
 import { sealReleasePackage } from '../src/release.js'
 import { DeterministicAuditProvider } from './support/deterministic-audit-provider.js'
 import { loadAuditConfig } from '../tools/load-audit-config.js'
 import { MemoryArtifactStore, runExperiment } from './support/memory-runner.js'
+
+// The fixture disables native search, which recon requires; test/recon-stage.test.ts covers recon.
+const AUDIT_STAGES = ALL_AUDIT_STAGES.filter(stage => stage !== 'recon')
 
 function config(stages: readonly AuditStageKind[], backend: 'codex' | 'dsh-chat-completions' = 'codex', waves = 1) {
   const pool = { ...document.modelPools.find(pool => pool.backend === backend)!, agents: 1, required: true,
@@ -22,7 +26,7 @@ function config(stages: readonly AuditStageKind[], backend: 'codex' | 'dsh-chat-
 async function execute(selected: Omit<ReturnType<typeof config>, 'stageModelPools'> & { stageModelPools: Record<string, string | string[]> }) {
   const body = compileExperimentConfig(selected, prompts)
   const release = await sealReleasePackage(body)
-  const machine = await RunMachine.create(body.definition, release.digest, 'configurable-stages')
+  const machine = await createControlledMachine(body.definition, release.digest, 'configurable-stages')
   const calls: AgentRequest[] = []
   const provider = new DeterministicAuditProvider()
   const outcome = await runExperiment({ definition: body.definition, machine, artifactStore: new MemoryArtifactStore(),

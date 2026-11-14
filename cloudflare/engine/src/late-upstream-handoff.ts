@@ -4,14 +4,18 @@ import { canonicalJson } from './canonical.js'
 import { classifyDeepSeekUnavailability } from './deepseek-provider.js'
 import { providerDiagnosticsAreAgentActionable } from './provider-failure.js'
 import { providerIdentity } from './provider-identity.js'
+import { providerTransientSignature } from './provider-backoff.js'
 import { validateAgentResult } from './protocol-validation.js'
 import { AgentAttemptFailure, PermanentRunFailure } from './run-errors.js'
 import { readSubmission } from './submission.js'
+import { capturedBundlePath } from './poc-handoff.js'
+import { SUBMIT_CHECK_UNFINISHED } from './submission-check.js'
 
 function attemptUsage(result: AgentExecutionReceipt): ProviderUsage {
   return {
     modelCalls: 1,
     ...(result.subscriptionWaits === undefined ? {} : { subscriptionWaits: result.subscriptionWaits }),
+    ...(result.subscriptionSwitches === undefined ? {} : { subscriptionSwitches: result.subscriptionSwitches }),
     inputTokens: result.inputTokens,
     ...(result.rawInputTokens === undefined ? {} : { rawInputTokens: result.rawInputTokens }),
     ...(result.cachedInputTokens === undefined ? {} : { cachedInputTokens: result.cachedInputTokens }),
@@ -55,7 +59,9 @@ function additiveFailureMessage(result: AgentExecutionReceipt): string {
 const lateUpstreamHandoffStatuses = new Set([502, 504])
 
 function hasOnlyExpectedOutputs(request: AgentRequest, result: AgentExecutionReceipt): boolean {
-  const expected = new Set(request.task.output.requiredFiles)
+  // With keepPocs the runner also adds this task's scratch test bundle.
+  const bundle = capturedBundlePath(request.task)
+  const expected = new Set([...request.task.output.requiredFiles, ...(bundle === undefined ? [] : [bundle])])
   return Object.keys(result.files).every(path => expected.has(path))
 }
 
@@ -112,6 +118,7 @@ async function acceptedAgentResult(request: AgentRequest, result: AgentExecution
   })
   return {
     ...(result.subscriptionWaits === undefined ? {} : { subscriptionWaits: result.subscriptionWaits }),
+    ...(result.subscriptionSwitches === undefined ? {} : { subscriptionSwitches: result.subscriptionSwitches }),
     status: 'accepted', actorId: result.actorId, model: request.task.model,
     provider: providerIdentity(request.task),
     files: result.files, assertions: [], protocol: submission.protocol,
@@ -125,6 +132,8 @@ async function acceptedAgentResult(request: AgentRequest, result: AgentExecution
       ? {} : { costAccountingComplete: result.costAccountingComplete }),
     sessionId: result.actorId,
     ...(result.nativeSearchEvidence === undefined ? {} : { nativeSearchEvidence: result.nativeSearchEvidence }),
+    ...(result.submitCheck === undefined ? {} : { submitCheck: result.submitCheck }),
+    ...(result.outputCredentials === undefined ? {} : { outputCredentials: result.outputCredentials }),
   }
 }
 
@@ -160,8 +169,11 @@ export async function agentResultFromExecutionReceipt(
       try { candidate = await acceptedAgentResult(request, result) } catch (error) {
         if (!(error instanceof AgentAttemptFailure)) throw error
       }
-      if (candidate !== undefined
-        && (await validateAgentResult(request.task, candidate, request.visibleArtifacts)).length === 0) return candidate
+      // The provider ended the session, so the agent could not run `ack3-submit` itself; the runner
+      // already reran its checks on these final files. Keep the evidence; the runner's own validation
+      // then asks the agent, in a correction turn, to finish with `ack3-submit`.
+      if (candidate !== undefined && (await validateAgentResult(request.task, candidate, request.visibleArtifacts))
+        .filter(issue => issue !== SUBMIT_CHECK_UNFINISHED).length === 0) return candidate
       if (request.task.optional === true) {
         const { modelCalls: _, ...usage } = attemptUsage(result)
         return {
@@ -192,14 +204,18 @@ export async function agentResultFromExecutionReceipt(
           includeDiagnosticsInRepair: false }),
       })
     }
+    // A provider or transport failure waits and does not count as an attempt (P2-06).
+    const providerTransient = providerTransientSignature(request, result) ?? undefined
     if (request.task.providerClass === 'additive') {
       throw new AgentAttemptFailure(additiveFailureMessage(result), {
         usage: attemptUsage(result),
         includeDiagnosticsInRepair: providerDiagnosticsAreAgentActionable(result),
+        ...(providerTransient === undefined ? {} : { providerTransient }),
       })
     }
     throw new AgentAttemptFailure(`sandbox agent failed (${result.exitCode}): ${result.stderr.slice(-2_000)}`, {
       usage: attemptUsage(result),
+      ...(providerTransient === undefined ? {} : { providerTransient }),
     })
   }
   return acceptedAgentResult(request, result)

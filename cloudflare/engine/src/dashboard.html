@@ -405,7 +405,7 @@
       .pool-waves { display: flex; gap: 6px; align-items: center; overflow-x: auto; min-width: 0; padding-bottom: 4px; }
       .pool-wave { flex: none; padding: 8px 12px; border-bottom: 3px solid var(--blue); }
       .pool-wave[data-complete="true"] { border-bottom-color: var(--cyan); }
-      .pool-wave[data-unresponsive="true"] { border-bottom-color: var(--amber); }
+      .pool-wave[data-unresponsive="true"], .pool-wave[data-quota-wait="true"] { border-bottom-color: var(--amber); }
       @media (max-width: 650px) { .pool-row { grid-template-columns: 1fr; gap: 6px; } }
       #progress-roster { font-size: 14px; color: var(--ink); font-weight: 600; }
       .wave-progress .panel-head { flex-wrap: wrap; }
@@ -417,9 +417,12 @@
       .lane { --lane-color: #777984; }
       .lane[data-status="awaiting-result"] { --lane-color: var(--blue); }
       .lane[data-status="unresponsive"] { --lane-color: var(--amber); }
+      .lane[data-status="quota-wait"] { --lane-color: var(--amber); }
       .lane[data-status="returned"] { --lane-color: var(--amber); }
       .lane[data-status="accepted"] { --lane-color: var(--cyan); }
       .lane[data-status="rejected"], .lane[data-status="interrupted"] { --lane-color: #ff8e9c; }
+      .lane[data-status="blocked"] { --lane-color: #ff8e9c; }
+      .lane[data-status="paused"] { --lane-color: var(--amber); }
       .lane[data-status="unavailable"] { --lane-color: var(--purple); }
       .lane-card { display: flex; flex-direction: column; align-items: flex-start; padding: 13px; text-align: left; border-left: 3px solid var(--lane-color); min-width: 0; }
       .lane-card .lane-time { color: var(--ink); font-variant-numeric: tabular-nums; font-size: 16px; margin-top: 10px; }
@@ -948,6 +951,8 @@
           <div class="eyebrow" id="run-context">Recorded audit flow</div>
           <div class="row"><h1>Audit overview</h1><span id="run-status" class="pill" role="status"></span></div>
           <p id="run-summary"></p>
+          <p id="control-summary" class="fine"></p>
+          <p id="control-guidance" class="fine">This dashboard is read-only. Use the authenticated command API for pause, continue, cancel, or fork. The API validates each decision against the current audit.</p>
         </div>
         <div
           class="mono muted"
@@ -1226,6 +1231,7 @@
       const stageNames = {
         discovery: "Discovery",
         preflight: "Preflight",
+        recon: "Recon",
         synthesis: "Synthesis",
         coverage: "Coverage",
         "negative-review": "Negative review",
@@ -1502,14 +1508,32 @@
           ["Discovery time limit", limits.maxWallTimeMs == null ? "Not recorded" : duration(limits.maxWallTimeMs)],
           ["Model call limit", limits.maxModelCalls ?? "Not set"],
           ["Cost limit", limits.maxCostUsd == null ? "Not set" : money(limits.maxCostUsd)],
+          ["Baseline build", config.target?.runtime?.buildRequired === false ? "Optional" : "Required"],
+          ["Command time limit", config.target?.runtime?.commandTimeoutMinutes === undefined ? "None" : `${config.target.runtime.commandTimeoutMinutes} minutes`],
+          ["Keep PoC tests", config.keepPocs === true ? "Yes, for the verifier" : "No"],
+          ["Submission check", config.submitCheck === true ? "Yes, with ack3-submit" : "No"],
+          ...(config.pools || []).filter(pool => Array.isArray(pool.fallbackCredentialSources)).map(pool =>
+            [`Claude accounts (${pool.id})`, [pool.credentialSource, ...pool.fallbackCredentialSources].join(", ")]),
           ["Container image", config.environment?.image || runtime.containerImageDigest || "Not recorded"],
           ["Runtime", runtime.id || "Not recorded"],
+          ["Manifest revisions", (config.revisions || []).length || 1],
           ["Repository", config.target?.repository || "Not recorded"],
           ["Commit", config.target?.commit || "Not recorded"],
+          ["Audit scope", config.scope ? "Scope file (below)" : "Not set"],
         ];
+        const scope = config.scope ? `<h3>Audit scope</h3><pre class="prompt-content">${esc(config.scope)}</pre>` : "";
         const pools = (config.pools || []).map(pool => `<tr><td>${esc(pool.id)}</td><td>${esc(pool.model)}</td><td>${num(pool.agents)}</td><td>${pool.required ? "Required" : "Optional"}</td><td>${esc(pool.reasoningEffort || "Not recorded")}</td></tr>`).join("");
-        $("configuration-content").innerHTML = `<dl class="config-grid">${rows.map(([name,value]) => `<div class="${name === "Container image" ? "wide" : ""}"><dt>${esc(name)}</dt><dd>${esc(value)}</dd></div>`).join("")}</dl><p class="fine">Discovery limits stop new research. Started work and later stages finish.</p><h3>Research model pools</h3><div class="table-wrap"><table><thead><tr><th>Pool</th><th>Model</th><th>Researchers</th><th>Participation</th><th>Reasoning</th></tr></thead><tbody>${pools}</tbody></table></div>`;
+        $("configuration-content").innerHTML = `<dl class="config-grid">${rows.map(([name,value]) => `<div class="${name === "Container image" ? "wide" : ""}"><dt>${esc(name)}</dt><dd>${esc(value)}</dd></div>`).join("")}</dl><p class="fine">Discovery limits stop new research. Started work and later stages finish.</p><h3>Research model pools</h3><div class="table-wrap"><table><thead><tr><th>Pool</th><th>Model</th><th>Researchers</th><th>Participation</th><th>Reasoning</th></tr></thead><tbody>${pools}</tbody></table></div>${scope}`;
         $("configuration-json").textContent = JSON.stringify(config, null, 2);
+      }
+      function controlSummary(control, command) {
+        return [
+          control?.pauses?.length ? `${control.pauses.length} admission hold(s)` : "",
+          control?.blockedTasks?.length ? `${control.blockedTasks.length} blocked task(s)` : "",
+          control?.lastOutcome ? `Saved decision ${control.lastOutcome.commandId}: ${control.lastOutcome.status}${control.lastOutcome.detail ? ` · ${control.lastOutcome.detail}` : ""}` : "",
+          command?.kind === "recorded" ? `Command journal ${command.commandId}: ${command.action} · ${command.status} (revision ${command.revision})` : "",
+          command?.kind === "unavailable" ? "Command journal status unavailable" : "",
+        ].filter(Boolean).join(" · ");
       }
       function render() {
         if (!snapshot) return;
@@ -1526,16 +1550,20 @@
         $("run-context").textContent =
           `${snapshot.run.experimentId}`;
         $("run-summary").textContent =
-          snapshot.run.id +
-          (snapshot.run.parentRunId
-            ? ` · resumed from ${snapshot.run.parentRunId}`
-            : "");
+          `Audit ${snapshot.run.rootRunId} · execution ${snapshot.run.id}` +
+          (snapshot.run.parentRunId ? ` · continued from ${snapshot.run.parentRunId}` : "") +
+          (snapshot.run.fork ? ` · source ${snapshot.run.fork.sourceRunId} at generation ${snapshot.run.fork.sourceGeneration} (${snapshot.run.fork.sourceDigest.slice(0, 12)}; ${snapshot.run.fork.boundary})` : "");
+        const control = snapshot.control;
+        const command = snapshot.commandStatus;
+        $("control-summary").textContent = [controlSummary(control, command), quotaWaitSummary()].filter(Boolean).join(" · ");
+        $("control-guidance").hidden = isExample;
         $("freshness").textContent =
           `${workflowRefresh.label}\nUpdated ${new Date(snapshot.generatedAt).toLocaleTimeString()}`;
-        $("notice").hidden = !isExample && executionStatus !== "unknown" && executionStatus === snapshot.run.status && !snapshot.provisionalCompletions.length && !snapshot.freshness.receiptsTruncated;
+        const usageIncomplete = snapshot.accountingUncertain === true;
+        $("notice").hidden = !isExample && executionStatus !== "unknown" && executionStatus === snapshot.run.status && !snapshot.provisionalCompletions.length && !snapshot.freshness.receiptsTruncated && !usageIncomplete;
         $("notice").textContent = isExample
           ? "Example data"
-          : `${executionStatus === "unknown" ? "Execution status unavailable. " : executionStatus === "paused" ? "Workflow paused. " : executionStatus !== snapshot.run.status ? "Workflow ended; saved run status is stale. Unfinished execution times are unknown. " : ""}${snapshot.provisionalCompletions.length} result(s) awaiting validation.${snapshot.freshness.receiptsTruncated ? " Receipt listing is incomplete." : ""}`;
+          : `${executionStatus === "unknown" ? "Execution status unavailable. " : executionStatus === "paused" ? "Workflow paused. " : executionStatus !== snapshot.run.status ? "Workflow ended; saved run status is stale. Unfinished execution times are unknown. " : ""}${snapshot.provisionalCompletions.length} result(s) awaiting validation.${snapshot.freshness.receiptsTruncated ? " Receipt listing is incomplete." : ""}${usageIncomplete ? " Recorded usage may omit inherited or interrupted model calls." : ""}`;
         const count = snapshot.findings.filter((f) => f.inReport).length;
         const metrics = [
           [
@@ -1595,8 +1623,9 @@
       const taskStatusLabels = {
         pending: "Planned", "awaiting-result": "Awaiting result", returned: "Returned · unvalidated",
         accepted: "Accepted", rejected: "Attempt rejected", unavailable: "Unavailable",
+        blocked: "Blocked · decision needed", paused: "Admission paused",
         interrupted: "Run ended · no result", "not-run": "Not run", unknown: "Status unknown",
-        unresponsive: "Container unresponsive",
+        unresponsive: "Container unresponsive", "quota-wait": "Waiting for subscription quota",
       };
       function taskObservation(task, wave) {
         if (!snapshot || !wave || task.status !== "awaiting-result") return null;
@@ -1605,12 +1634,26 @@
           && h.taskId === task.taskId && h.attempt === task.lastAttempt) || null;
       }
       function visibleTaskStatus(task, wave) {
-        return taskObservation(task, wave)?.status === "unresolved" ? "unresponsive" : task.status;
+        const health = taskObservation(task, wave);
+        return health?.status === "unresolved" ? "unresponsive" : health?.subscriptionWait ? "quota-wait" : task.status;
+      }
+      const providerNames = { claude: "Claude", codex: "Codex", dsh: "DSH" };
+      function localTime(value) {
+        return value && Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString() : null;
+      }
+      function quotaWaitSummary() {
+        const waits = (snapshot?.observationHealth || []).filter(h => h.runId === snapshot.run.id && h.subscriptionWait);
+        if (!waits.length) return "";
+        const earliest = waits.map(h => h.subscriptionWait.resetsAt).sort((a, b) => Date.parse(a) - Date.parse(b))[0];
+        return `${waits.length} task(s) waiting for subscription quota · earliest reset ${localTime(earliest) || "unknown"}`;
       }
       function observationMarkup(health) {
+        if (health?.status !== "unresolved" && health?.subscriptionWait) {
+          const wait = health.subscriptionWait;
+          return `<small>${esc(`Waiting for ${providerNames[wait.provider] || wait.provider} quota · resets ${localTime(wait.resetsAt) || "at an unknown time"}`)}</small>`;
+        }
         if (health?.status !== "unresolved") return "";
-        const time = value => value && Number.isFinite(Date.parse(value))
-          ? new Date(value).toLocaleString() : null;
+        const time = localTime;
         const last = time(health.lastSuccessfulProcessAt), next = time(health.nextObservationAfter);
         return `<small>${esc(last ? `Process last confirmed ${last}` : "Process status unavailable")}</small>`
           + (next ? `<small>Next check ${esc(next)}</small>` : "");
@@ -1704,7 +1747,7 @@
             text: [item.command, item.aggregated_output].filter(Boolean).join("\n\n"),
             output: logValue(item.aggregated_output), exitCode: item.exit_code, folded: true };
           if (item.type === "mcp_tool_call") return { ...entry, kind: item.error || item.status === "failed" || item.result?.isError ? "error" : "tool",
-            searchTool: item.server === "exa" && ["web_search_exa", "web_fetch_exa"].includes(item.tool), tool: `${item.server || "MCP"} / ${item.tool || "tool"}`,
+            searchTool: item.server === "exa" && ["web_search_exa", "web_search_advanced_exa", "web_fetch_exa"].includes(item.tool), tool: `${item.server || "MCP"} / ${item.tool || "tool"}`,
             title: `Tool · ${item.server || "MCP"} / ${item.tool || "tool"}`, status: item.status,
             command: logFields(item.arguments), output: item.result == null && item.error == null ? undefined : [logValue(item.result), logValue(item.error)].filter(Boolean).join("\n"),
             text: [logFields(item.arguments), logValue(item.result), logValue(item.error)].filter(Boolean).join("\n\n") };
@@ -1721,7 +1764,7 @@
           text: logValue(event.text) + (event.truncated ? "\n[Truncated by the harness]" : "") };
         if (event.type === "tool_call") return { ...entry, kind: "tool", title: `Tool · ${event.tool || "tool"}`, tool: event.tool || "tool",
           key: typeof event.callId === "string" ? `call:${event.callId}` : undefined, status: "requested",
-          searchTool: ["web_search", "web_fetch", "mcp__exa__web_search_exa", "mcp__exa__web_fetch_exa"].includes(event.tool),
+          searchTool: ["web_search", "web_fetch", "mcp__exa__web_search_exa", "mcp__exa__web_search_advanced_exa", "mcp__exa__web_fetch_exa"].includes(event.tool),
           command: logFields(event.input), text: logFields(event.input), folded: true };
         if (event.type === "tool_result") return { ...entry, kind: ["error", "failed"].includes(event.status) || event.result?.isError ? "error" : "tool", title: "Tool result",
           key: typeof event.callId === "string" ? `call:${event.callId}` : undefined, result: true, status: event.status || "returned",
@@ -1926,8 +1969,8 @@
           $("inspector-attempt").value = data.selectedAttempt || "";
           renderDisclosures($("inspector-context"), contextMarkup(data), `${selectedKey}:${data.selectedAttempt}`);
           renderDisclosures($("inspector-filesystem"), filesystemMarkup(data.filesystem), `${selectedKey}:${data.selectedAttempt}`);
-          $("inspector-prompt").textContent = data.prompt.text || (data.selectedAttempt ? "The exact prompt was not retained or could not be verified against its recorded digest." : "No execution attempt is recorded, so there is no delivered prompt to inspect.");
-          $("inspector-prompt-status").textContent = !data.selectedAttempt ? "No recorded execution" : data.prompt.status === "recorded" ? "Original recorded prompt" : data.prompt.status === "verified-reconstruction" ? "Verified from saved configuration." : "Exact prompt unavailable";
+          $("inspector-prompt").textContent = data.prompt.text || (data.selectedAttempt ? "The exact prompt was not retained or could not be verified against its recorded digest." : data.sourceReference ? `This run imported the result. The original execution belongs to source ${data.sourceReference.runId} at generation ${data.sourceReference.state.generation} (${data.sourceReference.state.digest.slice(0, 12)}). Open that run in its original runtime to inspect the session.` : "No execution attempt is recorded, so there is no delivered prompt to inspect.");
+          $("inspector-prompt-status").textContent = !data.selectedAttempt ? data.sourceReference ? "Imported execution" : "No recorded execution" : data.prompt.status === "recorded" ? "Original recorded prompt" : data.prompt.status === "verified-reconstruction" ? "Verified from saved configuration." : "Exact prompt unavailable";
           $("inspector-protocol").textContent = data.prompt.researcherProtocol || "";
           $("inspector-protocol").closest("details").hidden = !data.prompt.researcherProtocol;
           if (data.logs.mode === "stderr-tail-only") { inspectorTail = ""; inspectorTranscript = newAgentTranscript(); }
@@ -1943,7 +1986,7 @@
             ? (data.logs.truncated ? "Capture incomplete: some output was not saved." : "")
             : data.logs.mode === "stderr-tail-only" ? "Only diagnostic output was saved for this attempt."
             : "No output saved yet.";
-          if (data.incomplete) $("inspector-status").textContent += " Recovery history listing is incomplete.";
+          if (data.incomplete) $("inspector-status").textContent += " Execution history listing is incomplete.";
           if (data.selectedAttempt && data.attempts[0]?.id && data.attempts[0].id !== data.selectedAttempt) $("inspector-status").textContent += " A newer attempt is available.";
           $("inspector-more").hidden = !captured || inspectorOffset >= data.logs.chunkCount;
           if (captured && $("inspector-follow").checked && !document.hidden && (inspectorOffset < data.logs.chunkCount || !data.logs.complete))
@@ -2021,7 +2064,7 @@
         $("performance-note").textContent = performanceData?.note || "Request time includes the endpoint’s queueing, response and network time. Agent, wave and stage rates above also include work between requests. Historical subscription agents may lack request timing. ";
         if (!performanceLoading) $("performance-status").textContent = isExample
           ? "Request timing is available for real runs."
-          : performanceData ? `${performanceData.receiptsWithTelemetry}/${performanceData.inspectedReceipts} saved attempts contain request timing · read ${new Date(performanceData.observedAt).toLocaleTimeString()}${performanceData.incomplete ? " · incomplete history" : ""}. In-flight requests are unknown.`
+          : performanceData ? `${performanceData.receiptsWithTelemetry}/${performanceData.inspectedReceipts} saved attempts contain request timing · read ${new Date(performanceData.observedAt).toLocaleTimeString()}${performanceData.incomplete ? " · incomplete history" : ""}${performanceData.sourceRunId ? ` · source execution ${performanceData.sourceRunId} excluded` : ""}. In-flight requests are unknown.`
           : "Load saved request measurements for the selected wave. Choose an agent to narrow the view.";
       }
       async function loadPerformance() {
@@ -2102,13 +2145,14 @@
             const accepted = tasks.filter(task => task.status === "accepted").length;
             const waiting = tasks.filter(task => visibleTaskStatus(task, wave) === "awaiting-result").length;
             const unresponsive = tasks.filter(task => visibleTaskStatus(task, wave) === "unresponsive").length;
+            const quotaWait = tasks.filter(task => visibleTaskStatus(task, wave) === "quota-wait").length;
             const returned = tasks.filter(task => task.status === "returned").length;
             const other = [...new Set(tasks.map(task => task.status))]
               .filter(status => !["accepted", "awaiting-result", "returned"].includes(status))
               .map(status => `${tasks.filter(task => task.status === status).length} ${(taskStatusLabels[status] || taskStatusLabels.unknown).toLowerCase()}`);
             const local = tasks[0].localWave;
             pools.get(id).waves.push({ key: key(wave), label: Number.isSafeInteger(local) ? `Wave ${local}` : wave.id,
-              accepted, waiting, unresponsive, returned, other, total: tasks.length });
+              accepted, waiting, unresponsive, quotaWait, returned, other, total: tasks.length });
           }
         }
         return [...pools.values()];
@@ -2119,8 +2163,8 @@
         return '<div><h3>Discovery waves</h3></div>'
           + pools.map(pool => `<div class="pool-row"><div><strong>${esc(pool.id)}</strong><small>${esc(modelName(pool.model))} · ${esc(pool.provider)}</small></div><div class="pool-waves">`
             + (pool.waves.length ? pool.waves.map(wave => {
-              const detail = `${wave.accepted}/${wave.total} accepted${wave.waiting ? ` · ${wave.waiting} awaiting result` : ""}${wave.unresponsive ? ` · ${wave.unresponsive} unresponsive` : ""}${wave.returned ? ` · ${wave.returned} returned` : ""}${wave.other.length ? ` · ${wave.other.join(" · ")}` : ""}`;
-              return `<button class="pool-wave ${selectedWave === wave.key ? "selected" : ""}" data-wave="${esc(wave.key)}" data-complete="${wave.accepted === wave.total}" data-unresponsive="${wave.unresponsive > 0}" title="${esc(detail)}" aria-label="${esc(`${pool.id} · ${wave.label} · ${detail}`)}">${esc(wave.label)}<small>${esc(detail)}</small></button>`;
+              const detail = `${wave.accepted}/${wave.total} accepted${wave.waiting ? ` · ${wave.waiting} awaiting result` : ""}${wave.unresponsive ? ` · ${wave.unresponsive} unresponsive` : ""}${wave.quotaWait ? ` · ${wave.quotaWait} waiting for quota` : ""}${wave.returned ? ` · ${wave.returned} returned` : ""}${wave.other.length ? ` · ${wave.other.join(" · ")}` : ""}`;
+              return `<button class="pool-wave ${selectedWave === wave.key ? "selected" : ""}" data-wave="${esc(wave.key)}" data-complete="${wave.accepted === wave.total}" data-unresponsive="${wave.unresponsive > 0}" data-quota-wait="${wave.quotaWait > 0}" title="${esc(detail)}" aria-label="${esc(`${pool.id} · ${wave.label} · ${detail}`)}">${esc(wave.label)}<small>${esc(detail)}</small></button>`;
             }).join("") : '<span class="muted">Not started</span>') + '</div></div>').join("");
       }
       function assignmentWaves(id) {
@@ -2142,9 +2186,10 @@
         return `<button class="lane lane-card ${selectedAgent === task.agentId ? "active" : ""}" data-status="${esc(status)}" data-agent="${esc(task.agentId)}" data-task-wave="${esc(waveKey)}" aria-pressed="${selectedAgent === task.agentId}">
           <span class="lane-state">${esc(label)}</span><strong>${esc(assignmentLabel(task))}</strong>
           <small>${esc(modelName(task.model))} · ${esc(task.role)}</small>
+          ${task.statusDetail ? `<small>${esc(task.statusDetail)}</small>` : ""}
 
           <small class="lane-time">${timingMarkup(task.timing)}</small><small>${esc(taskTimeLabel(task))}</small>
-          <div class="bar ${task.timing?.live && status !== "unresponsive" ? "live" : ""}" aria-hidden="true"><span style="width:${Math.min(100, Math.max(0, (elapsedTime(task.timing) ?? 0) / Math.max(1, elapsedTime(waveTiming) ?? 1) * 100))}%"></span></div>
+          <div class="bar ${task.timing?.live && !["unresponsive", "quota-wait"].includes(status) ? "live" : ""}" aria-hidden="true"><span style="width:${Math.min(100, Math.max(0, (elapsedTime(task.timing) ?? 0) / Math.max(1, elapsedTime(waveTiming) ?? 1) * 100))}%"></span></div>
           ${observationMarkup(taskObservation(task, wave))}
           <small>${esc(usage)}</small>
           <small>${throughputMarkup(task.throughput, noModelCalls)}</small>
@@ -2160,7 +2205,7 @@
         $("progress-wave").value = wave ? key(wave) : "";
         const tasks = wave?.tasks || [];
         const count = status => tasks.filter(t => visibleTaskStatus(t, wave) === status).length;
-        const otherStates = ["unresponsive", "rejected", "unavailable", "interrupted", "not-run", "unknown"]
+        const otherStates = ["unresponsive", "quota-wait", "blocked", "paused", "rejected", "unavailable", "interrupted", "not-run", "unknown"]
           .filter(status => count(status)).map(status => `${count(status)} ${taskStatusLabels[status].toLowerCase()}`);
         $("progress-summary").textContent = wave
           ? `${wave.status === "complete" ? "Complete" : wave.status === "current" ? "Current wave" : wave.status === "not-run" ? "Wave not run" : ["failed", "stopped", "incomplete"].includes(wave.status) ? `Run ${wave.status}` : "Planned wave"} · ${count("accepted")} accepted · ${count("returned")} returned · ${count("awaiting-result")} awaiting result${otherStates.length ? ` · ${otherStates.join(" · ")}` : ""} · ${tasks.length} configured jobs`

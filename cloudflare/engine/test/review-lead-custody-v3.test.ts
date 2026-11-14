@@ -114,6 +114,12 @@ describe('opt-in v3 review and lead custody', () => {
       id, disposition: 'unresolved', reference: 'U-1', rationale: 'Later transition remains untested.',
     }] })]
     const packet = await createNegativeReviewInput(frontier)
+    // R2 stores canonical JSON; key ordering must not alter review evidence.
+    const restored = JSON.parse(canonicalJson(frontier)) as ArtifactRecord[]
+    expect(await createNegativeReviewInput(restored)).toEqual(packet)
+    restored[0]!.protocol.research!.observations[0]!.consequence = 'A different synthetic consequence.'
+    expect((await createNegativeReviewInput(restored)).inputSha256).not.toBe(packet.inputSha256)
+
     expect(packet.entries[0]?.leadCheck?.remainingUntestedConditions).toEqual(['The object has completed setup.'])
     const primary = workspace()
     const replica = workspace()

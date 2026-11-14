@@ -5,9 +5,12 @@ import { describe, expect, it, vi } from 'vitest'
 import { canonicalJson, sha256 } from '../src/canonical.js'
 import { assertReleaseEnvironmentMatchesRuntime } from '../src/environment-image.js'
 import {
-  pinnedRuntime, resolveRuntimeSelector, RuntimeRouter,
+  resolveRuntimeSelector, RuntimeRouter,
 } from '../src/runtime-release.js'
 import { validateNewSearchAdmission } from '../src/validation.js'
+
+import { RunCommandConflict } from '../src/run-commands.js'
+import { registerDelivery } from '../src/run-control-delivery.js'
 
 const engine = new URL('..', import.meta.url).pathname
 const declarationA = {
@@ -35,7 +38,7 @@ const runtimeB = {
 }
 
 function coordinator(failFirstRouteReservation = false, requestedImageDigest?: string,
-  retiredSearch = false, unobservable = false) {
+  retiredSearch = false, routeCollision = false) {
   const source = readFileSync(join(engine, 'src/worker.ts'), 'utf8')
   const code = stripTypeScriptTypes(source.slice(
     source.indexOf('export class ExperimentCoordinator'),
@@ -48,57 +51,32 @@ function coordinator(failFirstRouteReservation = false, requestedImageDigest?: s
     runtimeSelector: { mode: 'latest' },
   }]])
   interface FixtureStorage {
+    getAlarm(): Promise<number | null>
+    setAlarm(at: number): Promise<void>
     get(key: string): Promise<unknown>
     put(key: string, value: unknown): Promise<void>
     transaction<T>(fn: (transaction: FixtureStorage) => T | Promise<T>): Promise<T>
   }
+  let alarm: number | null = null
   const storage: FixtureStorage = {
+    getAlarm: async () => alarm, setAlarm: async at => { alarm = at },
     get: async (key: string) => data.get(key),
     put: async (key: string, value: unknown) => { data.set(key, value) },
     transaction: async fn => fn(storage),
   }
   const dispatch = vi.fn(async (_env, payload: { runId: string }) => payload.runId)
   let failNext = failFirstRouteReservation
-  const checkpointRuntime = vi.fn(async () => runtimeA)
-  const failedWaveRecovery = {
-    sourceRunId: 'failed-source', sourceStateGeneration: 70, sourceStateDigest: 'f'.repeat(64),
-    checkpointDigest: 'e'.repeat(64), importedTaskIds: ['negative-review-primary'],
-    inheritedRejectedAttemptCount: 2, unknownUsageAttemptCount: 2,
-    sourceRuntimeRelease: runtimeA, targetRuntimeRelease: runtimeB,
-    ...(unobservable ? { unobservableNative: {
-      stageId: 'discovery', waveId: 'wave-1', taskId: 'core-wave-1-research-1',
-      attempt: 1, promptDigest: '1'.repeat(64), requestDigest: '2'.repeat(64),
-      fenceProofDigest: '3'.repeat(64),
-    } } : {}),
-  }
-  const fenced = vi.fn(async () => failedWaveRecovery.unobservableNative)
-  const prepareFailedWaveRecovery = vi.fn(async (_input?: Record<string, unknown>) => ({
-    importedArtifacts: [{}], inheritedRejectedAttempts: [], evidence: failedWaveRecovery,
-  }))
-  const terminalCompletionRecovery = {
-    sourceRunId: 'terminal-source', sourceStateGeneration: 106, sourceStateDigest: '9'.repeat(64),
-    checkpointDigest: '8'.repeat(64), sourceRuntimeRelease: runtimeA, targetRuntimeRelease: runtimeB,
-  }
-  const prepareTerminalCompletionRecovery = vi.fn(async () => terminalCompletionRecovery)
-  const runtimeTransition = { ...terminalCompletionRecovery, sourceRunId: 'stopped-source',
-    checkpointDigest: 'e'.repeat(64), inheritedRecoveryDigest: '7'.repeat(64) }
-  const prepareCheckpointRuntimeTransition = vi.fn(async () => runtimeTransition)
-  const validateResume = vi.fn(async () => ({}))
+  const storeCreated = vi.fn()
   class Store {
-    async retiredUnmaterializedRoute() { return null }
-    async retiredRunWorkflow() { return { status: 'errored' } }
+    constructor() { storeCreated() }
     async getStateIfPresent() { return null }
     async reserveRunRoute() {
       if (failNext) {
         failNext = false
+        if (routeCollision) throw new RunCommandConflict('idempotency-conflict', 'run already exists with different routing')
         throw new Error('temporary D1 failure')
       }
     }
-    checkpointRuntime = checkpointRuntime
-    async getState() { return { experimentId: 'fixture',
-      ...(unobservable ? { inFlightAgentAttempts: [{}] } : {}) } }
-    fencedUnobservableNativeEvidence = fenced
-    async getCheckpoint() { return { digest: 'e'.repeat(64), body: { releaseDigest: 'c'.repeat(64), experimentId: 'fixture' } } }
     async getRelease() { return { body: { definition: { id: 'fixture', pools: [],
       ...(retiredSearch ? { forceSearch: { enabled: true, promptSet: 'native-exa-v1' } } : {}),
     },
@@ -128,8 +106,6 @@ function coordinator(failFirstRouteReservation = false, requestedImageDigest?: s
       const body = init?.body === undefined ? {} : JSON.parse(String(init.body)) as Record<string, unknown>
       return Response.json({
         workflowInstanceId: body.childRunId ?? body.runId ?? 'new-run', runtimeRelease: runtimeB,
-        ...(url.endsWith('/audit-recoveries') ? { failedWaveRecovery } : {}),
-        ...(url.endsWith('/audit-terminal-recoveries') ? { terminalCompletionRecovery } : {}),
       }, { headers: { 'x-ack3-runtime-worker-version': runtimeB.workerVersionId } })
     }) },
   }
@@ -138,55 +114,36 @@ function coordinator(failFirstRouteReservation = false, requestedImageDigest?: s
     'CloudflareRunStore',
     'RuntimeRouter',
     'assertReleaseEnvironmentMatchesRuntime',
-    'pinnedRuntime',
     'resolveRuntimeSelector',
     'sameRuntimeRelease',
     'engineRole',
     'dispatchAuditWorkflow',
-    'runtimeResponseBody',
     'canonicalJson',
     'sha256',
     'json',
     'runIdPattern',
     'digestPattern',
-    'R2ArtifactStore', 'R2AgentExecutionReceiptStore', 'R2AgentExecutionLogStore',
-    'prepareFailedWaveRecovery',
-    'prepareTerminalCompletionRecovery',
-    'prepareCheckpointRuntimeTransition',
-    'RunMachine',
-    'validateNewSearchAdmission',
+    'validateNewSearchAdmission', 'registerDelivery', 'RunCommandConflict',
     `${code}; return ExperimentCoordinator;`,
   )(
     class { env = env; ctx = { storage, id: { toString: () => 'fixture' } } },
     Store,
     RuntimeRouter,
     assertReleaseEnvironmentMatchesRuntime,
-    pinnedRuntime,
     resolveRuntimeSelector,
     (left: typeof runtimeA, right: typeof runtimeA) => JSON.stringify(left) === JSON.stringify(right),
     (value: typeof env) => value.ENGINE_ROLE,
     dispatch,
-    async (response: Response) => {
-      const value = await response.json() as Record<string, unknown>
-      if (!response.ok) throw new Error(String(value.error ?? response.status))
-      return value
-    },
     canonicalJson,
     sha256,
     (value: unknown, status = 200, headers = {}) => Response.json(value, { status, headers }),
     /^[a-z0-9][a-z0-9._-]{0,99}$/,
     /^[a-f0-9]{64}$/,
-    class {}, class {}, class {},
-    prepareFailedWaveRecovery,
-    prepareTerminalCompletionRecovery,
-    prepareCheckpointRuntimeTransition,
-    { recoverFailedWave: async () => ({}), recoverTerminalCompletion: async () => ({}), resume: validateResume },
-    validateNewSearchAdmission,
+    validateNewSearchAdmission, registerDelivery, RunCommandConflict,
   ) as new () => { fetch(request: Request): Promise<Response> }
   return {
-    instance: new Coordinator(), dispatch, checkpointRuntime, fenced,
-    prepareFailedWaveRecovery, prepareTerminalCompletionRecovery,
-    prepareCheckpointRuntimeTransition, validateResume, targetFetch: env.RUNTIME_B.fetch,
+    instance: new Coordinator(), dispatch, storeCreated, targetFetch: env.RUNTIME_B.fetch,
+    reservations: () => [...data.keys()].filter(key => key.startsWith('run-reservation:')),
     setPointer: (pointer: unknown) => data.set('release-pointer', pointer),
   }
 }
@@ -196,34 +153,6 @@ const startRequest = () => new Request('https://coordinator.internal/runs', {
   body: JSON.stringify({ runId: 'new-run' }),
   headers: { 'x-ack3-experiment': 'fixture' },
 })
-
-const resumeRequest = () => new Request('https://coordinator.internal/resumes', {
-  method: 'POST',
-  body: JSON.stringify({ childRunId: 'child-run', checkpointDigest: 'd'.repeat(64) }),
-  headers: { 'x-ack3-experiment': 'fixture' },
-})
-
-const recoveryRequest = (overrides: Record<string, unknown> = {}) => new Request('https://coordinator.internal/recoveries', {
-  method: 'POST',
-  body: JSON.stringify({
-    childRunId: 'recovery-child', sourceRunId: 'failed-source', sourceStateGeneration: 70,
-    sourceStateDigest: 'f'.repeat(64), checkpointDigest: 'e'.repeat(64), runtimeId: runtimeB.id,
-    ...overrides,
-  }),
-  headers: { 'x-ack3-experiment': 'fixture' },
-})
-
-const terminalRecoveryRequest = (overrides: Record<string, unknown> = {}) => new Request(
-  'https://coordinator.internal/terminal-recoveries', {
-    method: 'POST',
-    body: JSON.stringify({
-      childRunId: 'terminal-child', sourceRunId: 'terminal-source', sourceStateGeneration: 106,
-      sourceStateDigest: '9'.repeat(64), checkpointDigest: '8'.repeat(64), runtimeId: runtimeB.id,
-      ...overrides,
-    }),
-    headers: { 'x-ack3-experiment': 'fixture' },
-  },
-)
 
 describe('front-door runtime reservation', () => {
   it('does not dispatch a new run through a historical pointer without a runtime selector', async () => {
@@ -276,48 +205,6 @@ describe('front-door runtime reservation', () => {
     expect(matched.dispatch).toHaveBeenCalledTimes(1)
   })
 
-  it('rejects a mismatched image before checkpoint recovery work or child dispatch', async () => {
-    const f = coordinator(false, `sha256:${'f'.repeat(64)}`)
-    const response = await f.instance.fetch(recoveryRequest())
-    expect(response.status).toBe(409)
-    expect(await response.json()).toMatchObject({ error: 'audit environment image does not match the selected runtime' })
-    expect(f.prepareFailedWaveRecovery).not.toHaveBeenCalled()
-    expect(f.dispatch).not.toHaveBeenCalled()
-  })
-
-  it('reserves an explicit validated checkpoint upgrade once and binds retries to its original evidence', async () => {
-    const f = coordinator()
-    const body = { childRunId: 'upgraded-child', checkpointDigest: 'e'.repeat(64), runtimeId: runtimeB.id,
-      transition: { sourceRunId: 'stopped-source', sourceStateGeneration: 106, sourceStateDigest: '9'.repeat(64) } }
-    const request = (value = body) => new Request('https://coordinator.internal/resumes', {
-      method: 'POST', body: JSON.stringify(value), headers: { 'x-ack3-experiment': 'fixture' },
-    })
-    const first = await f.instance.fetch(request())
-    expect(first.status).toBe(202)
-    const routed = f.targetFetch.mock.calls.find(([url]) => url.endsWith('/audit-resumes'))!
-    expect(JSON.parse(String(routed[1]!.body))).toMatchObject({ childRunId: 'upgraded-child',
-      runtimeRelease: runtimeB, runtimeTransition: { sourceRunId: 'stopped-source', inheritedRecoveryDigest: '7'.repeat(64) } })
-    expect((await f.instance.fetch(request())).status).toBe(202)
-    expect(f.targetFetch.mock.calls.filter(([url]) => url.endsWith('/audit-resumes'))).toHaveLength(1)
-    expect(f.prepareCheckpointRuntimeTransition).toHaveBeenCalledTimes(1)
-    expect(f.validateResume).toHaveBeenCalledTimes(1)
-    expect((await f.instance.fetch(request({ ...body, transition: { ...body.transition, sourceStateGeneration: 107 } }))).status).toBe(409)
-  })
-
-  it('rejects an implicit target override or an upgrade combined with output revalidation before reservation', async () => {
-    const f = coordinator()
-    for (const body of [
-      { childRunId: 'new-child', checkpointDigest: 'e'.repeat(64), runtimeId: runtimeB.id },
-      { childRunId: 'new-child', checkpointDigest: 'e'.repeat(64), runtimeId: runtimeB.id,
-        transition: { sourceRunId: 'stopped-source', sourceStateGeneration: 1, sourceStateDigest: 'a'.repeat(64) },
-        revalidate: { sourceRunId: 'old', outputDigest: 'b'.repeat(64) } },
-    ]) expect((await f.instance.fetch(new Request('https://coordinator.internal/resumes', {
-      method: 'POST', body: JSON.stringify(body), headers: { 'x-ack3-experiment': 'fixture' },
-    }))).status).toBe(400)
-    expect(f.targetFetch).not.toHaveBeenCalled()
-    expect(f.prepareCheckpointRuntimeTransition).not.toHaveBeenCalled()
-  })
-
   it('resolves latest at fresh run reservation and keeps one dispatch for identical retries', async () => {
     const { instance, dispatch } = coordinator()
     const first = await instance.fetch(startRequest())
@@ -333,8 +220,8 @@ describe('front-door runtime reservation', () => {
   it('reconciles a transient route-persistence failure without resolving a different owner', async () => {
     const { instance, dispatch } = coordinator(true)
     const failed = await instance.fetch(startRequest())
-    expect(failed.status).toBe(409)
-    expect(await failed.json()).toMatchObject({ error: 'temporary D1 failure' })
+    expect(failed.status).toBe(202)
+    expect(await failed.json()).toMatchObject({ dispatchPending: true })
     expect(dispatch).not.toHaveBeenCalled()
 
     const retry = await instance.fetch(startRequest())
@@ -343,87 +230,36 @@ describe('front-door runtime reservation', () => {
     expect(dispatch).toHaveBeenCalledTimes(1)
   })
 
-  it('reconciles the same pre-dispatch failure for a checkpoint child', async () => {
-    const { instance, checkpointRuntime } = coordinator(true)
-    const failed = await instance.fetch(resumeRequest())
-    expect(failed.status).toBe(409)
-    expect(await failed.json()).toMatchObject({ error: 'temporary D1 failure' })
-
-    const retry = await instance.fetch(resumeRequest())
-    expect(retry.status).toBe(202)
-    expect(await retry.json()).toMatchObject({
-      workflowInstanceId: 'child-run',
-      runtimeRelease: { id: runtimeA.id },
-    })
-    expect(checkpointRuntime).toHaveBeenCalledTimes(1)
+  it.each(['resumes', 'recoveries', 'terminal-recoveries', 'discovery-waivers',
+    'retire-failed-native', 'retire-unmaterialized-recovery'].flatMap(endpoint => [
+      'unparsed historical proof', {}, { runtimeId: runtimeB.id }, { transition: {}, revalidate: {} },
+      { revalidate: { sourceRunId: 'failed-parent', outputDigest: 'b'.repeat(64) } },
+      { repairQuarantined: { taskId: 'synthesizer' } }, { promoteExecution: {} }, { retainNative: {} },
+    ].map(body => ({ endpoint, body }))))('refuses obsolete $endpoint before parsing or reserving ($body)', async ({ endpoint, body }) => {
+    const f = coordinator(true)
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const request = new Request(`https://coordinator.internal/${endpoint}`, {
+        method: 'POST', headers: { 'x-ack3-experiment': 'fixture' },
+        body: typeof body === 'string' ? body : JSON.stringify(body),
+      })
+      const parse = vi.spyOn(request, 'json').mockRejectedValue(new Error('obsolete intent must not be read'))
+      const response = await f.instance.fetch(request)
+      expect(response.status).toBe(404)
+      expect(await response.json()).toEqual({ error: 'not found' })
+      expect(parse).not.toHaveBeenCalled()
+    }
+    expect(f.storeCreated).not.toHaveBeenCalled()
+    expect(f.dispatch).not.toHaveBeenCalled()
+    expect(f.targetFetch).not.toHaveBeenCalled()
+    expect(f.reservations()).toEqual([])
   })
 
-  it('binds failed-wave recovery to one exact source state and target runtime', async () => {
-    const { instance, prepareFailedWaveRecovery } = coordinator()
-    const first = await instance.fetch(recoveryRequest())
-    expect(first.status).toBe(202)
-    expect(await first.json()).toMatchObject({
-      workflowInstanceId: 'recovery-child',
-      failedWaveRecovery: { sourceRunId: 'failed-source', sourceStateGeneration: 70 },
-      runtimeRelease: { id: runtimeB.id },
-    })
+})
 
-    const retry = await instance.fetch(recoveryRequest())
-    expect(retry.status).toBe(202)
-    expect(await retry.json()).toMatchObject({ reusedReservation: true, runtimeRelease: { id: runtimeB.id } })
-    expect(prepareFailedWaveRecovery).toHaveBeenCalledTimes(1)
-
-    const changedSource = await instance.fetch(recoveryRequest({ sourceStateDigest: '0'.repeat(64) }))
-    expect(changedSource.status).toBe(409)
-    expect(await changedSource.json()).toMatchObject({ error: 'run already exists: recovery-child' })
-
-    const changedRuntime = await instance.fetch(recoveryRequest({ runtimeId: runtimeA.id }))
-    expect(changedRuntime.status).toBe(409)
-    expect(await changedRuntime.json()).toMatchObject({ error: 'run already exists: recovery-child' })
-  })
-
-  it('forwards explicit synthesis repair custody and binds it to the child reservation', async () => {
-    const { instance, prepareFailedWaveRecovery, targetFetch } = coordinator()
-    const repairQuarantined = { taskId: 'synthesizer', requestDigest: 'a'.repeat(64), outputDigest: 'b'.repeat(64) }
-    expect((await instance.fetch(recoveryRequest({ repairQuarantined }))).status).toBe(202)
-    expect(prepareFailedWaveRecovery.mock.calls[0]?.[0]).toMatchObject({ repairQuarantined })
-    const dispatch = targetFetch.mock.calls.find(([url]) => url.endsWith('/audit-recoveries'))!
-    expect(JSON.parse(String(dispatch[1]!.body))).toMatchObject({ repairQuarantined })
-    expect((await instance.fetch(recoveryRequest({ repairQuarantined: {
-      ...repairQuarantined, outputDigest: 'c'.repeat(64),
-    } }))).status).toBe(409)
-    expect((await coordinator().instance.fetch(recoveryRequest({ repairQuarantined: {
-      ...repairQuarantined, outputDigest: 'bad',
-    } }))).status).toBe(400)
-  })
-
-  it('rechecks a fenced unobservable task before reservation and route dispatch', async () => {
-    const { instance, fenced, prepareFailedWaveRecovery, targetFetch } = coordinator(false, undefined, false, true)
-    const result = await instance.fetch(recoveryRequest())
-    expect(result.status).toBe(202)
-    expect(fenced).toHaveBeenCalledTimes(3)
-    expect(prepareFailedWaveRecovery.mock.calls[0]?.[0]).toMatchObject({
-      unobservableNative: { taskId: 'core-wave-1-research-1', fenceProofDigest: '3'.repeat(64) },
-    })
-    expect(targetFetch).toHaveBeenCalled()
-  })
-
-  it('dispatches an identical terminal completion recovery once', async () => {
-    const { instance, prepareTerminalCompletionRecovery } = coordinator()
-    const first = await instance.fetch(terminalRecoveryRequest())
-    expect(first.status).toBe(202)
-    expect(await first.json()).toMatchObject({
-      workflowInstanceId: 'terminal-child',
-      terminalCompletionRecovery: { sourceRunId: 'terminal-source', sourceStateGeneration: 106 },
-      runtimeRelease: { id: runtimeB.id },
-    })
-    const retry = await instance.fetch(terminalRecoveryRequest())
-    expect(retry.status).toBe(202)
-    expect(await retry.json()).toMatchObject({ reusedReservation: true })
-    expect(prepareTerminalCompletionRecovery).toHaveBeenCalledTimes(1)
-
-    const changed = await instance.fetch(terminalRecoveryRequest({ sourceStateGeneration: 107 }))
-    expect(changed.status).toBe(409)
-    expect(await changed.json()).toMatchObject({ error: 'run already exists: terminal-child' })
-  })
+it('returns the same durable refusal on the initial POST and an identical retry after a proven collision', async () => {
+  const f = coordinator(true, undefined, false, true)
+  const first = await f.instance.fetch(startRequest()), second = await f.instance.fetch(startRequest())
+  expect(first.status).toBe(409); expect(second.status).toBe(409)
+  expect(await first.json()).toEqual(await second.json())
+  expect(f.dispatch).not.toHaveBeenCalled()
 })

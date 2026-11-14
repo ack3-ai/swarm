@@ -3,8 +3,9 @@ import type { ExperimentDefinition, PromptCatalog } from '../../src/contracts.js
 /** A sealed agent instruction with its {{NAME}} placeholders filled, for asserting placement. */
 export function instruction(definition: Pick<ExperimentDefinition, 'prompts'>, key: keyof PromptCatalog,
   values: Readonly<Record<string, string>> = {}): string {
-  return Object.entries(values).reduce((text, [name, value]) => text.split(`{{${name}}}`).join(value),
-    definition.prompts[key])
+  const template = definition.prompts[key]
+  if (template === undefined) throw new TypeError(`instruction ${key} is not sealed in this release`)
+  return Object.entries(values).reduce((text, [name, value]) => text.split(`{{${name}}}`).join(value), template)
 }
 
 /** The sealed search question for one native search tool. */

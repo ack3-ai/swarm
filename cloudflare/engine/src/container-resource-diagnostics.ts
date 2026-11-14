@@ -2,7 +2,7 @@ import type { SandboxClient } from './agent-sandbox-client.js'
 import type { AgentRequest } from './contracts.js'
 import { canonicalJson } from './canonical.js'
 import { resolveCredentialBinding } from './release-provider-credentials.js'
-import { PermanentRunFailure } from './run-errors.js'
+import { observedAgentAttemptUsage, PermanentRunFailure } from './run-errors.js'
 
 export const containerCapacity = {
   instanceType: 'custom',
@@ -10,6 +10,16 @@ export const containerCapacity = {
   memoryMiB: 8_192,
   diskMB: 6_000,
 } as const
+
+/** Workspace-note lines about resources and the sealed command time limit. */
+export function workspaceLimitNotes(commandTimeoutMinutes: number | undefined): string[] {
+  return [
+    `Resources: ${containerCapacity.vcpu} CPU and ${containerCapacity.memoryMiB / 1024} GB of memory. Disk: ${containerCapacity.diskMB / 1000} GB in total, including dependencies and build output. Run builds and tests one job at a time (for example \`-j1\`). If memory runs out, your commands are stopped first.`,
+    ...(commandTimeoutMinutes === undefined ? [] : [
+      `Command time limit: every command you start, background jobs included, is stopped after ${commandTimeoutMinutes} minutes. Split longer work, for example fewer fuzz runs or one test file at a time.`,
+    ]),
+  ]
+}
 
 export type ContainerResourceFailureKind = 'memory' | 'disk' | 'instance-capacity'
 
@@ -21,6 +31,13 @@ export interface ContainerResourceSnapshot {
   diskUsedKB: number | null
   diskAvailableKB: number | null
   diskUsePercent: number | null
+  /** memory.events when the agent runner started this attempt, when the runner recorded them. */
+  memoryEventsAtLaunch?: Readonly<Record<string, number>>
+}
+
+/** Written by the container's agent runner at start, read only on failure. */
+export function memoryBaselinePath(requestDigest: string): string {
+  return `/workspace/private/memory-events-${requestDigest}`
 }
 
 interface CommandResult {
@@ -64,8 +81,16 @@ export function classifyContainerResourceFailure(
 ): ContainerResourceFailureKind | null {
   const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
   const failedProcess = /sandbox|container|process|result (?:read|file)/i.test(message)
-  if (((snapshot.memoryEvents.oom ?? 0) > 0 || (snapshot.memoryEvents.oom_kill ?? 0) > 0) && failedProcess
-    || /\b(?:out of memory|oom[-_ ]?kill|memory limit exceeded)\b/i.test(message)) return 'memory'
+  // Agent commands are the kernel's first OOM victims, so an OOM before this attempt
+  // (or one that only stopped a command) is no evidence that this failure was memory.
+  const before = snapshot.memoryEventsAtLaunch ?? {}
+  const newOom = ['oom', 'oom_kill'].some(key => (snapshot.memoryEvents[key] ?? 0) > (before[key] ?? 0))
+  // A parsed runner receipt (its usage travels with the error) proves the runner survived:
+  // a command killed for memory earlier in the attempt did not cause this failure (E8).
+  // The memory label is kept for a lost process or container.
+  const receiptBacked = observedAgentAttemptUsage(error) !== null
+  if (!receiptBacked && (newOom && failedProcess
+    || /\b(?:out of memory|oom[-_ ]?kill|memory limit exceeded)\b/i.test(message))) return 'memory'
   if (/\bENOSPC\b|no space left on device|disk quota exceeded/i.test(message)) return 'disk'
   if (/container (?:instance )?(?:limit|capacity)|maximum (?:container )?instances|too many containers/i.test(message)) {
     return 'instance-capacity'
@@ -92,18 +117,23 @@ async function read(sandbox: DiagnosticSandbox, command: string): Promise<string
   }
 }
 
-export async function captureContainerResourceSnapshot(sandbox: DiagnosticSandbox): Promise<ContainerResourceSnapshot> {
-  const [events, current, maximum, disk] = await Promise.all([
+export async function captureContainerResourceSnapshot(
+  sandbox: DiagnosticSandbox, baselinePath?: string,
+): Promise<ContainerResourceSnapshot> {
+  const [events, current, maximum, disk, baseline] = await Promise.all([
     read(sandbox, 'cat /sys/fs/cgroup/memory.events'),
     read(sandbox, 'cat /sys/fs/cgroup/memory.current'),
     read(sandbox, 'cat /sys/fs/cgroup/memory.max'),
     read(sandbox, 'df -Pk /workspace'),
+    baselinePath === undefined || !/^\/workspace\/private\/memory-events-[a-f0-9]{64}$/.test(baselinePath)
+      ? Promise.resolve('') : read(sandbox, `cat ${baselinePath}`),
   ])
   return {
     memoryCurrentBytes: integer(current),
     memoryMaxBytes: integer(maximum),
     memoryEvents: parseMemoryEvents(events),
     ...parseDiskUsage(disk),
+    ...(baseline === '' ? {} : { memoryEventsAtLaunch: parseMemoryEvents(baseline) }),
   }
 }
 
@@ -111,8 +141,10 @@ export async function annotateContainerResourceFailure(
   sandbox: SandboxClient,
   request: AgentRequest,
   error: unknown,
+  requestDigest?: string,
 ): Promise<unknown> {
-  const snapshot = await captureContainerResourceSnapshot(sandbox)
+  const snapshot = await captureContainerResourceSnapshot(sandbox,
+    requestDigest === undefined ? undefined : memoryBaselinePath(requestDigest))
   const kind = classifyContainerResourceFailure(error, snapshot)
   if (kind === null) return error
   const detail = {

@@ -1,3 +1,4 @@
+import { createControlledMachine } from './controlled-machine.js'
 import type { AgentRequest, ExperimentDefinition, TaskDefinition } from '../../src/contracts.js'
 import { RunMachine } from '../../src/machine.js'
 import { renderTaskPrompt } from '../../src/prompts.js'
@@ -11,7 +12,7 @@ export async function captureDiscoveryRequests(definition: ExperimentDefinition)
   const bounded = { ...definition, discoverySafetyCeiling: 4, stages: definition.stages.map(stage => (
     stage.kind === 'discovery' ? { ...stage, waves: stage.waves.slice(0, 4) } : stage
   )) }
-  const machine = await RunMachine.create(bounded, 'a'.repeat(64), 'research-prompt-contract')
+  const machine = await createControlledMachine(bounded, 'a'.repeat(64), 'research-prompt-contract')
   const artifactStore = new MemoryArtifactStore()
   const requests: AgentRequest[] = []
   const base = new DeterministicAuditProvider()

@@ -1,10 +1,14 @@
+import { createControlledMachine } from './support/controlled-machine.js'
+import { restoreSelected } from './support/selected-snapshots.js'
 import { readFile } from 'node:fs/promises'
 import { describe, expect, it } from 'vitest'
 import type { AgentProvider, AgentResult, TaskDefinition } from '../src/contracts.js'
 import {
   RunMachine, acceptedMountMode, agentWorkingDirectory, createAudit0RunPolicy, discoveryResearchPromptPath, SUBMISSION_PATH, submissionTemplate, sealReleasePackage, validateExperiment,
 } from '../src/index.js'
-import { audit0Definition, audit0PackageBody } from './support/audit0-config.js'
+import document from './fixtures/audit0-hello-vault.json' with { type: 'json' }
+import { audit0Definition } from './support/audit0-config.js'
+import { compileExperimentConfig } from './support/compile-config.js'
 import { DeterministicAuditProvider } from './support/deterministic-audit-provider.js'
 import { MemoryArtifactStore, runExperiment } from './support/memory-runner.js'
 
@@ -59,10 +63,10 @@ describe('Cloudflare live-readiness boundaries', () => {
   it('seeds one role-specific structured template after stale output cleanup', async () => {
     const source = await readFile(new URL('../src/sandbox-provider.ts', import.meta.url), 'utf8')
     const cleanupAt = source.indexOf('await clearUntrustedTaskOutputs(')
-    const templateAt = source.indexOf('const template = submissionTemplate(request.task)')
+    const templateAt = source.indexOf('const template = await submissionTemplate(request.task, request.visibleArtifacts)')
     expect(cleanupAt).toBeGreaterThan(-1)
     expect(templateAt).toBeGreaterThan(cleanupAt)
-    expect(submissionTemplate(challenge('challenge-open-adversarial'))).toContain('"complete": false')
+    expect(await submissionTemplate(challenge('challenge-open-adversarial'))).toContain('"complete": false')
     expect(challenge('challenge-open-adversarial').output.requiredFiles).toContain(SUBMISSION_PATH)
   })
 
@@ -74,12 +78,12 @@ describe('Cloudflare live-readiness boundaries', () => {
 
   it('makes created output directories writable before dropping agent privilege', async () => {
     const source = await readFile(new URL('../container/agent-runner.mjs', import.meta.url), 'utf8')
-    const mkdirAt = source.indexOf('await mkdir(directory, { recursive: true })')
-    const chownAt = source.indexOf('await chown(directory, 10001, 10001)')
+    // prepareOutputFolders creates them without following symlinks (test/output-files.test.mjs).
+    const preparedAt = source.indexOf('await prepareOutputFolders(request.expectedFiles)')
     const privilegeDropAt = source.indexOf("execution = await execute('setpriv'")
-    expect(mkdirAt).toBeGreaterThan(-1)
-    expect(chownAt).toBeGreaterThan(mkdirAt)
-    expect(privilegeDropAt).toBeGreaterThan(chownAt)
+    expect(preparedAt).toBeGreaterThan(-1)
+    expect(privilegeDropAt).toBeGreaterThan(preparedAt)
+    expect(source).not.toContain('await chown(')
   })
 
   it('reattaches an exact process and starts paid work only after guarded setup is ready', async () => {
@@ -97,10 +101,9 @@ describe('Cloudflare live-readiness boundaries', () => {
     expect(readyAt).toBeGreaterThan(clearAt)
     expect(monitorAt).toBeGreaterThan(readyAt)
     expect(source).toContain('processId = agentProcessId(requestDigest)')
-    expect(source).toContain('request.inputDigest === undefined')
     expect(source).toContain('process = await sandbox.startProcess(guardedLaunch, {\n          processId,')
     expect(source).toContain('waitForAgentProcess(process, agentProcessWaitSliceMs, 1_000, {')
-    expect(source).toContain('agentLogReadMaxBytes = 256 * 1024')
+    expect(source).toContain('sandbox.observeAgentLog(requestDigest, cursor.index.sourceBytes, agentLogReadMaxBytes)')
     expect(source).not.toContain('sandbox.readFile(logPath)')
     const durableReceiptAt = source.indexOf('this.executionReceipts.put(request.runId, requestDigest, result, request)')
     const finalDrainAt = source.indexOf('this.drainAgentLogs(sandbox, request, requestDigest)', durableReceiptAt)
@@ -130,10 +133,12 @@ describe('Cloudflare live-readiness boundaries', () => {
         }
       },
     }
-    const release = await sealReleasePackage(audit0PackageBody)
-    const machine = await RunMachine.create(audit0Definition, release.digest, 'discovery-exhaustion', startedAt)
+    // Budget must end discovery long before the wave ceiling, so keep the 64-wave maximum here.
+    const body = compileExperimentConfig({ ...document, maxDiscoveryWaves: 64 })
+    const release = await sealReleasePackage(body)
+    const machine = await createControlledMachine(body.definition, release.digest, 'discovery-exhaustion', startedAt)
     const outcome = await runExperiment({
-      definition: audit0Definition,
+      definition: body.definition,
       machine,
       provider,
       artifactStore: new MemoryArtifactStore(),
@@ -144,14 +149,8 @@ describe('Cloudflare live-readiness boundaries', () => {
     expect(outcome.state.status).toBe('completed')
     expect(state.stageEndReceipts.find(receipt => receipt.stageIndex === 1)?.reason).toBe('measured-budget-inability')
     expect(new Set(state.artifacts.filter(artifact => artifact.stageId === 'discovery').map(artifact => artifact.waveId)).size)
-      .toBeLessThan(audit0Definition.discoverySafetyCeiling)
-    const discoveryCheckpoint = state.checkpoints.find(checkpoint => (
-      checkpoint.body.cursor.stageIndex === 2 && checkpoint.body.cursor.waveIndex === 0
-    ))!
-    const resumed = await RunMachine.resume(audit0Definition, discoveryCheckpoint, 'budget-admission-child')
-    expect(resumed.snapshot()).toMatchObject({
-      phase: 'synthesis', parentCheckpointDigest: discoveryCheckpoint.digest,
-    })
+      .toBeLessThan(body.definition.discoverySafetyCeiling)
+    await expect(restoreSelected(machine)).resolves.toBeDefined()
   })
 
   it('seals a deterministic receipt when the configured discovery safety ceiling is reached', async () => {
@@ -174,7 +173,7 @@ describe('Cloudflare live-readiness boundaries', () => {
         }
       },
     }
-    const machine = await RunMachine.create(definition, 'd'.repeat(64), 'safety-ceiling-fixture')
+    const machine = await createControlledMachine(definition, 'd'.repeat(64), 'safety-ceiling-fixture')
     const outcome = await runExperiment({
       definition, machine, provider, artifactStore: new MemoryArtifactStore(), policy: createAudit0RunPolicy(),
     })
@@ -190,10 +189,6 @@ describe('Cloudflare live-readiness boundaries', () => {
         ]),
       },
     })
-    const checkpoint = outcome.checkpoints.find(candidate => (
-      candidate.body.cursor.stageIndex === 2 && candidate.body.cursor.waveIndex === 0
-      && candidate.body.stageEndReceipts.some(receipt => receipt.reason === 'safety-ceiling-reached')
-    ))!
-    await expect(RunMachine.resume(definition, checkpoint, 'safety-ceiling-child')).resolves.toBeDefined()
+    await expect(restoreSelected(machine)).resolves.toBeDefined()
   })
 })

@@ -1,7 +1,7 @@
 import type { SandboxProcess } from './agent-sandbox-client.js'
 
 export function agentProcessId(requestDigest: string): string {
-  if (!/^[0-9a-f]{64}$/.test(requestDigest)) throw new TypeError('agent request digest is invalid')
+  if (typeof requestDigest !== 'string' || !/^[0-9a-f]{64}$/.test(requestDigest)) throw new TypeError('agent request digest is invalid')
   return `agent-${requestDigest.slice(0, 40)}`
 }
 

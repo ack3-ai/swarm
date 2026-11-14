@@ -7,7 +7,7 @@ Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 ## Local setup
 
 Use the Node.js and pnpm versions in [package.json](package.json); some tests also
-need `python3`. Check `node --version` and `pnpm --version` before installing dependencies.
+need `python3`, Git, `tar` and `zstd`. Check `node --version` and `pnpm --version` before installing dependencies.
 
 ```sh
 pnpm install --frozen-lockfile
@@ -24,6 +24,8 @@ resources; it is not a local audit server.
 Use a focused branch and pull request. Describe the user-visible change and how
 it was validated. Add a regression test for behavior changes; documentation-only
 changes need accuracy and link checks. Keep unrelated work out of the diff.
+Run `pnpm check` before pushing. CI runs it on pull requests that are ready for
+review; drafts and changes that touch only Markdown or `docs/images` skip it.
 
 Update affected documentation and examples with the implementation. Explain the
 current behavior and commands; put incident history and change rationale in the

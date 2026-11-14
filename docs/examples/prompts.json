@@ -1,4 +1,5 @@
 {
+  "recon": "Prefer official documentation, specifications and security advisories over blog posts.",
   "discovery": "Look for vulnerabilities that could lead to loss of funds, unauthorized access or denial of service, and support each one with a test or a precise code reference.",
   "synthesis": "Merge observations that share a root cause, and keep separate those that need different conditions or fixes.",
   "coverage": "Examine the parts of the target that earlier research covered least and report any new vulnerabilities.",

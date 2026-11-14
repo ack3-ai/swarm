@@ -52,12 +52,15 @@ export class AgentAttemptFailure extends Error {
   readonly includeDiagnosticsInRepair: boolean
   readonly nativeTransport: NativeTransportEvidence | undefined
   readonly nativeTerminalCustody: NativeTerminalCustodyEvidence | undefined
+  /** Set when the receipt shows a provider or transport failure (see provider-backoff.ts). */
+  readonly providerTransient: string | undefined
 
   constructor(message: string, options?: ErrorOptions & {
     usage?: ProviderUsage
     includeDiagnosticsInRepair?: boolean
     nativeTransport?: NativeTransportEvidence
     nativeTerminalCustody?: NativeTerminalCustodyEvidence
+    providerTransient?: string
   }) {
     super(message, options)
     this.name = 'AgentAttemptFailure'
@@ -65,6 +68,7 @@ export class AgentAttemptFailure extends Error {
     this.includeDiagnosticsInRepair = options?.includeDiagnosticsInRepair ?? true
     this.nativeTransport = options?.nativeTransport
     this.nativeTerminalCustody = options?.nativeTerminalCustody
+    this.providerTransient = options?.providerTransient
   }
 }
 
@@ -83,11 +87,13 @@ export function observedAgentAttemptUsage(error: unknown): ProviderUsage | null 
 export class AgentExecutionPending extends Error {
   constructor(
     readonly executionId: string,
-    readonly observation: 'unfinished' | 'unavailable' = 'unfinished',
+    readonly observation: 'unfinished' | 'unavailable' | 'cancelled' = 'unfinished',
     options?: ErrorOptions,
   ) {
     super(
-      observation === 'unfinished'
+      observation === 'cancelled'
+        ? `agent execution ${executionId} was cancelled; awaiting its control transition`
+        : observation === 'unfinished'
         ? `agent execution ${executionId} is awaiting a terminal result`
         : `agent execution ${executionId} status is temporarily unavailable`,
       options,

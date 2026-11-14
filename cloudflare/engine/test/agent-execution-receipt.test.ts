@@ -12,8 +12,7 @@ import {
   agentProcessWaitSliceMs,
   waveStepConfig,
   workflowAttemptTimeoutMs,
-  workflowBootstrapProgress,
-} from '../src/workflow-step-config.js'
+  } from '../src/workflow-step-config.js'
 import { providerDiagnosticsAreAgentActionable } from '../src/provider-failure.js'
 
 const digest = 'a'.repeat(64)
@@ -99,6 +98,20 @@ describe('exact Sandbox execution receipts', () => {
     expect(parseExactAgentExecutionReceipt('{', digest)).toBeNull()
   })
 
+  it('accepts up to 512 search entries, so a long recon or research attempt is not an integrity failure', () => {
+    const searches = (count: number) => ({ schemaVersion: 1, source: 'codex-exa', failed: 0, incomplete: 0,
+      completed: Array.from({ length: count }, (_, index) => ({ callId: `search-${index}`, queryDigest: 'a'.repeat(64),
+        resultDigest: 'b'.repeat(64), queries: [`public query ${index}`] })) })
+    const classify = (evidence: object) =>
+      classifyAgentExecutionReceipt(JSON.stringify({ ...receipt, nativeSearchEvidence: evidence }), digest).status
+    expect(classify(searches(65))).toBe('exact')
+    expect(classify(searches(512))).toBe('exact')
+    expect(classify(searches(513))).toBe('invalid')
+    expect(classify({ ...searches(1), failed: 512, incomplete: 512 })).toBe('exact')
+    expect(classify({ ...searches(1), failed: 513 })).toBe('invalid')
+    expect(classify({ ...searches(1), incomplete: 513 })).toBe('invalid')
+  })
+
   it('makes the unchanged-state platform failure retryable without duplicate completed calls', () => {
     expect(failure).toEqual({
       message: 'Attempt failed due to internal workflows error',
@@ -118,12 +131,8 @@ describe('exact Sandbox execution receipts', () => {
     expect(worker).toContain('const sealedWaveStepConfig = waveStepConfig()')
     expect(worker).toContain('...sealedWaveStepConfig')
     expect(worker).not.toContain("timeout: '2 hours'")
-    expect(worker).toContain('canStopAtSealedWaveBoundary(state, await store.stopRequested(runId))')
     expect(worker).toContain("observationFailed ? '30 seconds' : '15 seconds'")
     expect(worker).toContain('`recover-wave-state-${pollCycle}`')
-    const progress = { status: 'running', cursor: { stageIndex: 1, waveIndex: 0 } }
-    expect(workflowBootstrapProgress(progress)).toBe(progress)
-    expect(workflowBootstrapProgress({ progress, maxWaveExecutionMs: 3_600_000 })).toBe(progress)
     expect(waveStepConfig()).toEqual({
       retries: { limit: 3, delay: '2 seconds', backoff: 'exponential' },
       timeout: workflowAttemptTimeoutMs,

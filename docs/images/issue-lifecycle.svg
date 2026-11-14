@@ -45,7 +45,7 @@
 <text x="65" y="978" class="title">Reject output</text>
 <rect x="325" y="913" width="230" height="91" rx="12" fill="#f2efff" stroke="#cbbfec"/>
 <text x="345" y="944" class="tag" style="fill:#6546a3">LLM + TOOLS</text>
-<text x="345" y="978" class="title">Output correction</text>
+<text x="345" y="978" class="title">Correct output</text>
 <rect x="595" y="913" width="240" height="91" rx="12" fill="#fff2ee" stroke="#efc4b7"/>
 <text x="615" y="944" class="tag" style="fill:#a44228">IF EXHAUSTED</text>
 <text x="615" y="978" class="title">Audit fails</text>

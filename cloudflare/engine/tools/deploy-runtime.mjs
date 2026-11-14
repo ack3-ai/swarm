@@ -35,6 +35,18 @@ export function assertUnpublishedRuntimeVersions(value) {
   }
 }
 
+/** A stale rendered config must fail before credentials or cloud publication. */
+export function assertRuntimeCoordinatorBinding(config) {
+  const bindings = config?.durable_objects?.bindings
+  const selected = Array.isArray(bindings) ? bindings.filter(binding => binding?.name === 'COORDINATORS') : []
+  if (selected.length !== 1 || selected[0].class_name !== 'ExperimentCoordinator'
+    || selected[0].script_name !== undefined || selected[0].namespace_id !== undefined
+    || !Array.isArray(config?.migrations) || !config.migrations.some(migration =>
+      migration?.tag === 'v3' && migration.new_sqlite_classes?.includes('ExperimentCoordinator'))) {
+    throw new Error('runtime requires its local coordinator binding and v3 migration')
+  }
+}
+
 async function readBoundedAuthStdin() {
   if (process.stdin.isTTY) throw new Error('cloud-bound Codex auth must be piped through stdin')
   let text = ''
@@ -57,6 +69,7 @@ if (invokedPath !== undefined && fileURLToPath(import.meta.url) === invokedPath)
   if (parsed?.vars?.ENGINE_ROLE !== 'runtime' || parsed?.name === 'swarm') {
     throw new Error('runtime deployment config is invalid')
   }
+  assertRuntimeCoordinatorBinding(parsed)
   // A runtime rendered without ACK3_CODEX_WORKSPACE_ID has no Codex login to check.
   const codex = (parsed.vars?.ACK3_CODEX_WORKSPACE_ID ?? '') !== ''
   const expected = [

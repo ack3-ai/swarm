@@ -1,6 +1,10 @@
+import { AgentExecutionPending } from '../src/run-errors.js'
+import { artifactReferences } from '../src/artifact-execution.js'
+import { createControlledMachine } from './support/controlled-machine.js'
+import { DeterministicAuditProvider } from './support/deterministic-audit-provider.js'
 import { describe, expect, it } from 'vitest'
-import type { AgentResult, RejectedAttempt } from '../src/contracts.js'
-import { RunMachine, rejectedAttemptIdentity, sealReleasePackage } from '../src/index.js'
+import type { AgentRequest, AgentResult, RejectedAttempt } from '../src/contracts.js'
+import { advanceExperimentOneWave, RunMachine, rejectedAttemptIdentity, sealReleasePackage } from '../src/index.js'
 import { audit0Definition, audit0PackageBody } from './support/audit0-config.js'
 import { MemoryArtifactStore } from './support/memory-runner.js'
 
@@ -27,14 +31,24 @@ const rejection = {
   },
 }
 
+async function pending(id: string) {
+  const release = await sealReleasePackage(audit0PackageBody)
+  const machine = await createControlledMachine(audit0Definition, release.digest, id)
+  const store = new MemoryArtifactStore(), requests: AgentRequest[] = []
+  await advanceExperimentOneWave({ machine, definition: audit0Definition, artifactStore: store, provider: new DeterministicAuditProvider() })
+  await advanceExperimentOneWave({ machine, definition: audit0Definition, artifactStore: store,
+    provider: { async run(request) { requests.push(request); throw new AgentExecutionPending(request.task.id) } } })
+  const request = requests.find(request => request.task.id === rejection.taskId)!
+  if (request.execution === undefined) throw new Error('fixture lacks admitted execution')
+  return { machine, store, request: { ...request, execution: request.execution } }
+}
+
 describe('rejected attempt idempotency', () => {
   it('does not journal or charge an exact receipt twice', async () => {
-    const release = await sealReleasePackage(audit0PackageBody)
-    const machine = await RunMachine.create(audit0Definition, release.digest, 'rejection-idempotency')
-    await machine.start()
-
-    await machine.recordRejectedAttempt(rejection, '2026-09-20T19:00:00.000Z')
-    await machine.recordRejectedAttempt(rejection, '2026-09-20T19:00:05.000Z')
+    const { machine, request } = await pending('rejection-idempotency')
+    const receipt = { ...rejection, promptDigest: request.promptDigest, execution: request.execution }
+    await machine.recordRejectedAttempt(receipt, '2026-09-20T19:00:00.000Z')
+    await machine.recordRejectedAttempt(receipt, '2026-09-20T19:00:05.000Z')
 
     const state = machine.snapshot()
     expect(state.rejectedAttempts).toHaveLength(1)
@@ -56,11 +70,9 @@ describe('rejected attempt idempotency', () => {
   })
 
   it('does not journal or charge an exact accepted receipt twice', async () => {
-    const release = await sealReleasePackage(audit0PackageBody)
-    const machine = await RunMachine.create(audit0Definition, release.digest, 'accepted-idempotency')
-    const stage = audit0Definition.stages[1]!
-    const wave = stage.waves[0]!
-    const task = wave.tasks[0]!
+    const { machine, store, request } = await pending('accepted-idempotency')
+    const { stage, wave, task, promptDigest, execution } = request
+    const inputArtifacts = artifactReferences(request.visibleArtifacts)
     const result: AgentResult = {
       status: 'accepted',
       actorId: 'fixture-core-wave-0-research-1',
@@ -74,33 +86,35 @@ describe('rejected attempt idempotency', () => {
       costUsd: 0,
       sessionId: 'fixture-session',
     }
-    const store = new MemoryArtifactStore()
-    const promptDigest = '4'.repeat(64)
-    await machine.start()
 
-    const first = await machine.recordResult({ wave, task, promptDigest, result, artifactStore: store, stageId: stage.id },
+    const first = await machine.recordResult({ wave, task, promptDigest, result, artifactStore: store, stageId: stage.id, attempt: 1, inputArtifacts, execution },
       '2026-09-20T19:00:00.000Z')
-    const replay = await machine.recordResult({ wave, task, promptDigest, result, artifactStore: store, stageId: stage.id },
+    const replay = await machine.recordResult({ wave, task, promptDigest, result, artifactStore: store, stageId: stage.id, attempt: 1, inputArtifacts, execution },
       '2026-09-20T19:00:05.000Z')
 
     const state = machine.snapshot()
     expect(replay).toEqual(first)
-    expect(state.artifacts).toHaveLength(1)
+    expect(state.artifacts.filter(a => a.taskId === task.id)).toHaveLength(1)
     expect(state.budget).toMatchObject({ modelCalls: 1, inputTokens: 10, outputTokens: 5, costUsd: 0 })
-    expect(state.journal.filter(event => event.type === 'task.accepted')).toHaveLength(1)
+    expect(state.journal.filter(event => event.type === 'task.accepted' && (event.payload as { artifact: { taskId: string } }).artifact.taskId === task.id)).toHaveLength(1)
     await expect(machine.recordResult({
       wave, task, promptDigest, artifactStore: store, stageId: stage.id,
+      attempt: 1, inputArtifacts, execution,
       result: { ...result, files: { [task.output.requiredFiles[0]!]: 'changed output' } },
     })).rejects.toThrow(`task result already exists with different receipt: ${task.id}`)
   })
 
   it('accepts an exact wave-receipt replay with different timestamps', async () => {
     const release = await sealReleasePackage(audit0PackageBody)
-    const machine = await RunMachine.create(audit0Definition, release.digest, 'wave-receipt-idempotency')
+    const machine = await createControlledMachine(audit0Definition, release.digest, 'wave-receipt-idempotency')
     const stage = audit0Definition.stages[0]!
     const wave = stage.waves[0]!
     await machine.start()
-    await machine.admitWave(stage.id, wave.id, '2026-09-20T18:59:59.000Z')
+    await machine.admitWave(stage.id, wave.id)
+    await expect(machine.recordWaveReceipt(stage.id, wave, '2026-09-20T19:00:00.000Z'))
+      .rejects.toThrow('lacks a terminal result')
+    await advanceExperimentOneWave({ machine, definition: audit0Definition,
+      artifactStore: new MemoryArtifactStore(), provider: new DeterministicAuditProvider() })
 
     await machine.recordWaveReceipt(stage.id, wave, '2026-09-20T19:00:00.000Z', '2026-09-20T19:01:00.000Z')
     await machine.recordWaveReceipt(stage.id, wave, '2026-09-20T19:02:00.000Z', '2026-09-20T19:03:00.000Z')

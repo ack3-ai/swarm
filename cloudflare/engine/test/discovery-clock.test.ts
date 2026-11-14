@@ -56,3 +56,11 @@ it('accepts DSH window-wait evidence only from a connection that opts in', async
   expect(await integrity({ ...task.connection, usageWindowWait: false })).toContain(invalid)
 })
 
+
+
+it('unions inherited waits with local evidence and clips them to the preserved model clock', () => {
+  const state = { modelStartedAt: time(20), rootCreatedAt: time(-10), artifacts: [record(20, 50)], rejectedAttempts: [] }
+  const inherited = [wait(-10, 40), wait(35, 60), wait(-10, 40)]
+  expect(discoveryDeadline(audit0Definition, state, inherited))
+    .toBe(Date.parse(time(20)) + audit0Definition.limits.phaseMinutes.discovery * 60_000 + 40 * 60_000)
+})

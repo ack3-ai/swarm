@@ -53,3 +53,34 @@ export function codexUsage(stdout) {
 
   return { inputTokens, rawInputTokens, cachedInputTokens, outputTokens, actorId, cacheAccountingComplete }
 }
+
+// Codex prints these after its own retries; the texts are its error messages (P2-06).
+const codexFailures = [
+  [/\b(?:exceeded retry limit, last status:|unexpected status) (\d{3})\b/, status => status === 429 ? 'RATE_LIMIT'
+    : status >= 500 && status <= 599 ? 'SERVER' : `HTTP_${status}`],
+  [/^stream disconnected before completion\b|^stream closed before response\.completed\b/, () => 'STREAM_CLOSED'],
+  [/^Error while reading the server response\b|^Connection failed\b/, () => 'TRANSPORT'],
+  [/^request timed out\b/, () => 'TIMEOUT'],
+  [/^We're currently experiencing high demand\b/, () => 'SERVER'],
+  [/^Selected model is at capacity\b/, () => 'OVERLOADED'],
+]
+
+/** Provider code and HTTP status of the last failed turn, for the receipt; null when the
+ * last turn did not fail or its message names no provider or transport failure. */
+export function codexProviderFailure(stdout) {
+  let message = null
+  for (const line of stdout.split('\n')) {
+    let event
+    try { event = JSON.parse(line) } catch { continue }
+    if (event?.type === 'turn.failed') message = typeof event.error?.message === 'string' ? event.error.message : ''
+    if (event?.type === 'turn.completed') message = null
+  }
+  if (message === null) return null
+  for (const [pattern, code] of codexFailures) {
+    const match = message.match(pattern)
+    if (match === null) continue
+    const status = match[1] === undefined ? null : Number(match[1])
+    return { providerErrorCode: code(status), providerHttpStatus: status }
+  }
+  return null
+}

@@ -98,6 +98,7 @@ function ack3ResettingWindow(failure) {
         && failure.providerRetryAfterMs > 0 && failure.providerRetryAfterMs <= 86400000;
 }
 function cancellableDelay(delayMs, signal) {`.trimStart()],
+      // A timer can fire a millisecond early; resumedAt never precedes resetsAt (E22).
       ['\t\tagent.session.append("llm/retry", eventData);\n\t\tif (!await cancellableDelay(delayMs, fusedSignal)) return;',
         `\t\tagent.session.append("llm/retry", { ...eventData,\n\t\t\t...(ack3ResettingWindow(failure) ? { subscriptionWait: true } : {}) });
 \t\tconst windowStartedAt = ack3ResettingWindow(failure) ? Date.now() : null;
@@ -106,7 +107,7 @@ function cancellableDelay(delayMs, signal) {`.trimStart()],
 \t\t\ttype: "subscription_wait",
 \t\t\twait: { provider: "dsh", sessionId: agent.id,
 \t\t\t\tstartedAt: new Date(windowStartedAt).toISOString(),
-\t\t\t\tresumedAt: new Date().toISOString(),
+\t\t\t\tresumedAt: new Date(Math.max(Date.now(), windowStartedAt + delayMs)).toISOString(),
 \t\t\t\tresetsAt: new Date(windowStartedAt + delayMs).toISOString() }
 \t\t}) + "\\n");`],
       ['if (policy.mode === "normal" && previousRetry >= policy.maxRetries) return next();',

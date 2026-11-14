@@ -1,5 +1,5 @@
-import { nativeQuotaWait, type NativeQuotaWait } from './native-quota-wait.js'
 import { canonicalJson, sha256 } from './canonical.js'
+import { compareText } from './text-order.js'
 
 export const agentLogChunkMaxBytes = 64 * 1024
 export const agentLogTotalMaxBytes = 32 * 1024 * 1024
@@ -28,6 +28,13 @@ export interface AgentLogRequest {
   researcherProtocol?: string
 }
 
+/** A native quota wait the agent process reported and has not yet ended. */
+export interface AgentLogSubscriptionWait {
+  provider: 'claude'
+  since: string
+  resetsAt: string
+}
+
 export interface AgentLogIndex {
   schemaVersion: 1
   chunkCount: number
@@ -37,6 +44,7 @@ export interface AgentLogIndex {
   complete: boolean
   truncated: boolean
   updatedAt: string
+  subscriptionWait?: AgentLogSubscriptionWait
 }
 
 interface ParsedLocalLog {
@@ -44,6 +52,8 @@ interface ParsedLocalLog {
   eventSourceBytes: (number | null)[]
   sourceBytes: number
   truncated: boolean
+  /** The latest wait status line in this source; undefined when it has none. */
+  subscriptionWait?: AgentLogSubscriptionWait | null
 }
 
 const encoder = new TextEncoder()
@@ -78,6 +88,24 @@ function parseEvent(value: unknown, requireSchemaVersion = true): AgentLogEvent 
   return { at: record.at, stream: record.stream as AgentLogEvent['stream'], text: record.text }
 }
 
+const timestamp = (value: unknown): value is string => typeof value === 'string' && Number.isFinite(Date.parse(value))
+
+/** The container's quota-wait status line. A null reset ends the wait. */
+function parseWaitStatus(record: Record<string, unknown>): AgentLogSubscriptionWait | null | undefined {
+  if (Object.keys(record).sort().join() !== 'at,kind,provider,resetsAt,schemaVersion'
+    || record.provider !== 'claude' || !timestamp(record.at)
+    || (record.resetsAt !== null && !timestamp(record.resetsAt))) return undefined
+  return record.resetsAt === null ? null : { provider: 'claude', since: record.at, resetsAt: record.resetsAt as string }
+}
+
+function parseWait(value: unknown): AgentLogSubscriptionWait | undefined | false {
+  if (value === undefined) return undefined
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+  const record = value as Record<string, unknown>
+  return Object.keys(record).sort().join() === 'provider,resetsAt,since' && record.provider === 'claude'
+    && timestamp(record.since) && timestamp(record.resetsAt) ? record as unknown as AgentLogSubscriptionWait : false
+}
+
 function splitEvent(event: AgentLogEvent): AgentLogEvent[] {
   if (event.text === '') return [event]
   const events: AgentLogEvent[] = []
@@ -98,6 +126,7 @@ export function parseLocalAgentLog(source: string, complete = false): ParsedLoca
   const eventSourceBytes: (number | null)[] = []
   let consumedBytes = 0
   let truncated = complete && completeSource.length !== source.length
+  let subscriptionWait: AgentLogSubscriptionWait | null | undefined
   for (const line of completeSource.slice(0, -1).split('\n')) {
     consumedBytes += encoder.encode(`${line}\n`).byteLength
     if (line === '') continue
@@ -107,6 +136,14 @@ export function parseLocalAgentLog(source: string, complete = false): ParsedLoca
         && (value as Record<string, unknown>).schemaVersion === 1
         && (value as Record<string, unknown>).kind === 'capture-truncated') {
         truncated = true
+        continue
+      }
+      if (value !== null && typeof value === 'object' && !Array.isArray(value)
+        && (value as Record<string, unknown>).schemaVersion === 1
+        && (value as Record<string, unknown>).kind === 'subscription-wait') {
+        const status = parseWaitStatus(value as Record<string, unknown>)
+        if (status === undefined) truncated = true
+        else subscriptionWait = status
         continue
       }
       const event = parseEvent(value)
@@ -120,7 +157,8 @@ export function parseLocalAgentLog(source: string, complete = false): ParsedLoca
       truncated = true
     }
   }
-  return { events, eventSourceBytes, sourceBytes: encoder.encode(complete ? source : completeSource).byteLength, truncated }
+  return { events, eventSourceBytes, sourceBytes: encoder.encode(complete ? source : completeSource).byteLength, truncated,
+    ...(subscriptionWait === undefined ? {} : { subscriptionWait }) }
 }
 
 function chunkContent(events: readonly AgentLogEvent[]): string {
@@ -160,10 +198,6 @@ function chunkEvents(events: readonly AgentLogEvent[], sourceBytes: readonly (nu
   return chunks
 }
 
-export function chunkAgentLogEvents(events: readonly AgentLogEvent[]): PendingChunk[] {
-  return chunkEvents(events, events.map(() => null))
-}
-
 function parseIndex(value: unknown): AgentLogIndex | null {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
   const record = value as Partial<AgentLogIndex>
@@ -173,36 +207,35 @@ function parseIndex(value: unknown): AgentLogIndex | null {
     || !Number.isSafeInteger(record.sourceBytes) || (record.sourceBytes ?? -1) < 0
     || !Number.isSafeInteger(record.storedBytes) || (record.storedBytes ?? -1) < 0 || (record.storedBytes ?? 0) > agentLogTotalMaxBytes
     || typeof record.complete !== 'boolean' || typeof record.truncated !== 'boolean'
-    || typeof record.updatedAt !== 'string' || !Number.isFinite(Date.parse(record.updatedAt))) return null
+    || typeof record.updatedAt !== 'string' || !Number.isFinite(Date.parse(record.updatedAt))
+    || parseWait(record.subscriptionWait) === false) return null
   return record as AgentLogIndex
+}
+
+async function readIndex(bucket: Pick<R2Bucket, 'get'>, base: string, runId: string,
+  requestDigest: string): Promise<AgentLogIndex | null> {
+  const object = await bucket.get(`${base}index.json`)
+  if (object === null) return null
+  const content = await object.text()
+  const digest = await sha256(content)
+  if (object.customMetadata?.runId !== runId || object.customMetadata?.requestDigest !== requestDigest
+    || object.customMetadata?.objectSha256 !== digest || object.checksums.toJSON().sha256 !== digest) {
+    throw new Error('agent log index provenance mismatch')
+  }
+  const value = parseIndex(JSON.parse(content) as unknown)
+  if (value === null) throw new Error('agent log index content is invalid')
+  return value
+}
+
+/** Monitoring view of one attempt's log index. It never recovers or rewrites it. */
+export async function readAgentLogIndex(bucket: Pick<R2Bucket, 'get'>, input: {
+  runId: string, taskId: string, requestDigest: string,
+}): Promise<AgentLogIndex | null> {
+  return readIndex(bucket, prefix(input.runId, input.taskId, input.requestDigest), input.runId, input.requestDigest)
 }
 
 export class R2AgentExecutionLogStore {
   constructor(private readonly bucket: R2Bucket) {}
-
-  /** Enumerate one task's immutable admitted requests for historical prompt custody. */
-  async listRequests(runId: string, taskId: string): Promise<AgentLogRequest[]> {
-    validRunId(runId)
-    validSegment(taskId, 'task id')
-    const base = `monitor/agent-executions/${runId}/${taskId}/`
-    const listed = await this.bucket.list({ prefix: base, delimiter: '/', limit: 128 })
-    if (listed.truncated || listed.objects.length !== 0 || listed.delimitedPrefixes.length > 64) {
-      throw new Error('historical agent request listing is incomplete or ambiguous')
-    }
-    const requests: AgentLogRequest[] = []
-    const seen = new Set<string>()
-    for (const directory of listed.delimitedPrefixes) {
-      if (!directory.startsWith(base) || !directory.endsWith('/')) throw new Error('historical request path is invalid')
-      const digest = directory.slice(base.length, -1)
-      validDigest(digest, 'request digest')
-      if (seen.has(digest)) throw new Error('historical request appears more than once')
-      seen.add(digest)
-      const request = await this.getRequest(runId, taskId, digest)
-      if (request === null) throw new Error('historical admitted request is missing')
-      requests.push(request)
-    }
-    return requests
-  }
 
   /** Preserve bounded setup diagnostics beside this request's private logs. */
   async putWorkspacePreparationFailure(input: {
@@ -226,45 +259,6 @@ export class R2AgentExecutionLogStore {
     })
     if (stored !== null) return
     await this.assertObject(key, input.runId, input.requestDigest, objectSha256, input.content)
-  }
-
-  async getRequest(runId: string, taskId: string, requestDigest: string): Promise<AgentLogRequest | null> {
-    const key = `${prefix(runId, taskId, requestDigest)}request.json`
-    const object = await this.bucket.get(key)
-    if (object === null) return null
-    const content = await object.text()
-    const objectSha256 = await sha256(content)
-    if (object.customMetadata?.runId !== runId
-      || object.customMetadata?.requestDigest !== requestDigest
-      || object.customMetadata?.objectSha256 !== objectSha256
-      || object.checksums.toJSON().sha256 !== objectSha256) {
-      throw new Error('agent log request provenance mismatch')
-    }
-    const value: unknown = JSON.parse(content)
-    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-      throw new Error('agent log request content is invalid')
-    }
-    const record = value as Partial<AgentLogRequest>
-    const keys = Object.keys(record)
-    const allowed = new Set([
-      'schemaVersion', 'runId', 'stageId', 'waveId', 'taskId', 'requestDigest', 'promptDigest', 'prompt',
-      'model', 'provider', 'attempt', 'startedAt', 'startedAtBasis', 'researcherProtocol',
-    ])
-    if (keys.some(name => !allowed.has(name))
-      || record.schemaVersion !== 1 || record.runId !== runId || record.taskId !== taskId
-      || record.requestDigest !== requestDigest
-      || typeof record.stageId !== 'string' || typeof record.waveId !== 'string'
-      || typeof record.promptDigest !== 'string' || !/^[a-f0-9]{64}$/.test(record.promptDigest)
-      || typeof record.prompt !== 'string' || await sha256(record.prompt) !== record.promptDigest
-      || typeof record.model !== 'string' || record.model.length === 0
-      || typeof record.provider !== 'string' || record.provider.length === 0
-      || !Number.isSafeInteger(record.attempt) || (record.attempt ?? 0) < 1
-      || typeof record.startedAt !== 'string' || !Number.isFinite(Date.parse(record.startedAt))
-      || record.startedAtBasis !== 'execution-admission'
-      || (record.researcherProtocol !== undefined && typeof record.researcherProtocol !== 'string')) {
-      throw new Error('agent log request content is invalid')
-    }
-    return record as AgentLogRequest
   }
 
   async putRequest(request: AgentLogRequest): Promise<void> {
@@ -345,53 +339,23 @@ export class R2AgentExecutionLogStore {
     sourceBytes = Math.max(sourceBytes, input.sourceOffset + parsed.sourceBytes)
     const updatedAt = input.updatedAt ?? new Date().toISOString()
     if (!Number.isFinite(Date.parse(updatedAt))) throw new TypeError('agent log update time is invalid')
+    const complete = index.complete || input.complete
+    // A wait lasts until a later status line ends it or the log completes.
+    const subscriptionWait = complete ? undefined
+      : parsed.subscriptionWait === undefined ? index.subscriptionWait : parsed.subscriptionWait ?? undefined
     const next: AgentLogIndex = {
       schemaVersion: 1,
       chunkCount,
       eventCount,
       sourceBytes,
       storedBytes,
-      complete: index.complete || input.complete,
+      complete,
       truncated,
       updatedAt,
+      ...(subscriptionWait === undefined ? {} : { subscriptionWait }),
     }
     await this.putIndex(base, input.runId, input.requestDigest, next)
     return next
-  }
-
-  /** Freeze available logs for a fenced execution; does not claim native completion. */
-  async custodySnapshot(input: { runId: string, taskId: string, requestDigest: string }): Promise<{
-    requestDigest: string, index: AgentLogIndex, chunkDigests: string[], quotaWait: NativeQuotaWait | null
-  }> {
-    const base = prefix(input.runId, input.taskId, input.requestDigest)
-    const request = await this.getRequest(input.runId, input.taskId, input.requestDigest)
-    const index = await this.getIndex(base, input.runId, input.requestDigest)
-    if (request === null || index === null || index.chunkCount === 0) throw new Error('native log custody is missing')
-    const chunkDigests: string[] = []
-    const stdout: string[] = []
-    let eventCount = 0
-    let storedBytes = 0
-    for (let chunk = 0; chunk < index.chunkCount; chunk++) {
-      const key = `${base}chunk-${String(chunk).padStart(6, '0')}.json`
-      const checked = await this.readChunk(key, input.runId, input.requestDigest)
-      const object = await this.bucket.get(key)
-      if (object === null) throw new Error('native log custody changed')
-      const content = await object.text()
-      const digest = await sha256(content)
-      if (object.customMetadata?.objectSha256 !== digest || object.checksums.toJSON().sha256 !== digest) {
-        throw new Error('native log custody checksum differs')
-      }
-      stdout.push(...(JSON.parse(content).events as AgentLogEvent[]).filter(event => event.stream === 'stdout').map(event => event.text))
-      chunkDigests.push(digest)
-      eventCount += checked.sourceEventsConsumed
-      storedBytes += checked.storedBytes
-    }
-    if (await this.bucket.head(`${base}chunk-${String(index.chunkCount).padStart(6, '0')}.json`) !== null
-      || eventCount !== index.eventCount || storedBytes !== index.storedBytes
-      || canonicalJson(index) !== canonicalJson(await this.getIndex(base, input.runId, input.requestDigest))) {
-      throw new Error('native log custody index changed')
-    }
-    return { requestDigest: await sha256(request), index, chunkDigests, quotaWait: await nativeQuotaWait(stdout.join('')) }
   }
 
   async cursor(input: { runId: string, taskId: string, requestDigest: string }): Promise<{
@@ -420,30 +384,21 @@ export class R2AgentExecutionLogStore {
     if (!cursor.ready) throw new Error('agent log immutable suffix is not fully reconciled')
     const updatedAt = input.updatedAt ?? new Date().toISOString()
     if (!Number.isFinite(Date.parse(updatedAt))) throw new TypeError('agent log update time is invalid')
-    const next = { ...cursor.index, complete: true, truncated: cursor.index.truncated || input.truncated, updatedAt }
+    const next: AgentLogIndex = { ...cursor.index, complete: true, truncated: cursor.index.truncated || input.truncated, updatedAt }
+    delete next.subscriptionWait
     await this.putIndex(base, input.runId, input.requestDigest, next)
     return next
   }
 
   private async getIndex(base: string, runId: string, requestDigest: string): Promise<AgentLogIndex | null> {
-    const object = await this.bucket.get(`${base}index.json`)
-    if (object === null) return null
-    const content = await object.text()
-    const digest = await sha256(content)
-    if (object.customMetadata?.runId !== runId || object.customMetadata?.requestDigest !== requestDigest
-      || object.customMetadata?.objectSha256 !== digest || object.checksums.toJSON().sha256 !== digest) {
-      throw new Error('agent log index provenance mismatch')
-    }
-    const value = parseIndex(JSON.parse(content) as unknown)
-    if (value === null) throw new Error('agent log index content is invalid')
-    return value
+    return readIndex(this.bucket, base, runId, requestDigest)
   }
 
   private async recoverIndex(base: string, runId: string, requestDigest: string): Promise<AgentLogIndex> {
     // Missing-index recovery is deliberately bounded. cursor() reconciles the
     // next immutable suffix in fixed batches on later observation slices.
     const page = await this.bucket.list({ prefix: `${base}chunk-`, limit: 32, include: ['customMetadata'] })
-    const objects = [...page.objects].sort((left, right) => left.key.localeCompare(right.key))
+    const objects = [...page.objects].sort((left, right) => compareText(left.key, right.key))
     let eventCount = 0
     let storedBytes = 0
     let sourceBytes = 0

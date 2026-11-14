@@ -1,3 +1,5 @@
+import { createControlledMachine } from './support/controlled-machine.js'
+import { restoreSelected } from './support/selected-snapshots.js'
 import { describe, expect, it } from 'vitest'
 import type {
   AgentProvider,
@@ -79,7 +81,7 @@ describe('discovery cost admission', () => {
     const definition = structuredClone(audit0Definition)
     definition.limits.maxCostUsd = 10
     const release = await sealReleasePackage({ ...audit0PackageBody, definition })
-    const machine = await RunMachine.create(definition, release.digest, 'projected-cost-stop')
+    const machine = await createControlledMachine(definition, release.digest, 'projected-cost-stop')
     const provider = pricedDiscoveryProvider()
     const artifactStore = new MemoryArtifactStore()
     const input = { definition, machine, provider, artifactStore }
@@ -104,7 +106,7 @@ describe('discovery cost admission', () => {
       wave: discovery.waves[1]!,
     })).resolves.toBeNull()
 
-    const scheduledMachine = await RunMachine.create(definition, release.digest, 'projected-cost-independent')
+    const scheduledMachine = await createControlledMachine(definition, release.digest, 'projected-cost-independent')
     const outcome = await runExperiment({
       definition, machine: scheduledMachine, provider, artifactStore: new MemoryArtifactStore(), policy: createAudit0RunPolicy(),
     })
@@ -114,7 +116,7 @@ describe('discovery cost admission', () => {
     const evidence = stop.evidence as { remainingCostUsd: number, estimates: Array<{ poolId: string, costUsd: number }> }
     expect(new Set(evidence.estimates.map(value => value.poolId))).toEqual(new Set(['luna', 'deepseek']))
     expect(evidence.estimates.every(value => value.costUsd > evidence.remainingCostUsd)).toBe(true)
-    await expect(RunMachine.resume(definition, checkpoint, 'projected-cost-resume')).resolves.toBeDefined()
+    await expect(restoreSelected(scheduledMachine)).resolves.toBeDefined()
 
     expect(outcome.state.status).toBe('completed')
   })
@@ -123,7 +125,7 @@ describe('discovery cost admission', () => {
     const definition = structuredClone(audit0Definition)
     definition.limits.maxCostUsd = 0.5
     const release = await sealReleasePackage({ ...audit0PackageBody, definition })
-    const machine = await RunMachine.create(definition, release.digest, 'wave-zero-cost-stop')
+    const machine = await createControlledMachine(definition, release.digest, 'wave-zero-cost-stop')
     const outcome = await runExperiment({
       definition,
       machine,
@@ -149,7 +151,8 @@ describe('discovery cost admission', () => {
     const definition = structuredClone(audit0Definition)
     definition.limits.maxCostUsd = 6
     const release = await sealReleasePackage({ ...audit0PackageBody, definition })
-    const machine = await RunMachine.create(definition, release.digest, 'projected-cost-integrity')
+    const machine = await createControlledMachine(definition, release.digest, 'projected-cost-integrity', undefined, undefined,
+      { auditId: 'projected-cost-integrity', executionId: 'projected-cost-integrity', epoch: 0, runtimeDigest: await sha256(null) })
     const provider = pricedDiscoveryProvider()
     const artifactStore = new MemoryArtifactStore()
     const input = { definition, machine, provider, artifactStore }
@@ -162,13 +165,10 @@ describe('discovery cost admission', () => {
       remainingCostUsd: 1,
     }
     const tamperedReceipt = { ...receipt, evidence, evidenceDigest: await sha256(evidence) }
-    const body = {
-      ...checkpoint.body,
-      stageEndReceipts: [...checkpoint.body.stageEndReceipts.slice(0, -1), tamperedReceipt],
-    }
-    const tampered = { body, digest: await sha256(body) }
+    const tampered = structuredClone(outcome.state)
+    tampered.stageEndReceipts = tampered.stageEndReceipts.map(value =>
+      value.stageIndex === receipt.stageIndex ? tamperedReceipt : value)
+    await expect(RunMachine.fromState(definition, tampered)).rejects.toThrow()
 
-    await expect(RunMachine.resume(definition, tampered, 'projected-cost-tampered'))
-      .rejects.toThrow('independent discovery budget receipt is invalid')
   })
 })

@@ -9,6 +9,10 @@ FROM docker.io/library/ubuntu:22.04
 ARG DSH_VERSION=0.2.1-rc.2
 ARG CODEX_VERSION=0.165.0
 ARG FOUNDRY_VERSION=1.8.1
+# GitHub CLI for read-only lookups; the SHA-256 values are the release's published checksums.
+ARG GH_VERSION=2.103.3
+ARG GH_SHA256_AMD64=4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d
+ARG GH_SHA256_ARM64=ee32df2323c8847f5fac6cb6b4b69ca75828e9329a8f22f677021f7b3306ce63
 ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/opt/harness/node_modules/.bin:$PATH \
@@ -47,6 +51,18 @@ RUN case "${TARGETARCH}" in \
     && sha256sum --check "${foundry_base}.sha256" \
     && tar -xzf "${foundry_base}.tar.gz" -C /usr/local/bin \
     && rm "${foundry_base}.tar.gz" "${foundry_base}.sha256"
+RUN case "${TARGETARCH}" in \
+      amd64) gh_sha256="${GH_SHA256_AMD64}" ;; \
+      arm64) gh_sha256="${GH_SHA256_ARM64}" ;; \
+      *) echo "unsupported GitHub CLI architecture: ${TARGETARCH}" >&2; exit 2 ;; \
+    esac \
+    && gh_base="gh_${GH_VERSION}_linux_${TARGETARCH}" \
+    && curl -fsSLO "https://github.com/cli/cli/releases/download/v${GH_VERSION}/${gh_base}.tar.gz" \
+    && echo "${gh_sha256}  ${gh_base}.tar.gz" | sha256sum --check - \
+    && tar -xzf "${gh_base}.tar.gz" \
+    && install -m 0755 "${gh_base}/bin/gh" /usr/local/bin/gh \
+    && rm -rf "${gh_base}" "${gh_base}.tar.gz" \
+    && gh --version
 
 COPY container/harness/package.json container/harness/package-lock.json /opt/harness/
 COPY container/harness/patch-dsh-pi.mjs /opt/harness/
@@ -84,8 +100,16 @@ RUN install -d -m 0755 -o 10001 -g 10001 /workspace/home/.local/share
 
 COPY container/agent-runner.mjs /usr/local/bin/ack3-agent-runner
 COPY container/output-files.mjs /usr/local/bin/output-files.mjs
+COPY container/scratch-rules.mjs /usr/local/bin/scratch-rules.mjs
+COPY container/scratch-evidence.mjs /usr/local/bin/scratch-evidence.mjs
+# ack3-submit: the Worker's output checks (bundled from src/submission-check.ts) for agents and the runner.
+COPY container/submission-check.bundle.mjs /usr/local/bin/submission-check.bundle.mjs
+COPY container/submit-check.mjs /usr/local/bin/submit-check.mjs
+COPY container/ack3-submit.mjs /usr/local/bin/ack3-submit
 COPY container/agent-log-writer.mjs /usr/local/bin/agent-log-writer.mjs
+COPY container/credential-json.mjs /usr/local/bin/credential-json.mjs
 COPY container/claude-runner.mjs /usr/local/bin/claude-runner.mjs
+COPY container/claude-accounts.mjs /usr/local/bin/claude-accounts.mjs
 COPY container/claude-usage.mjs /usr/local/bin/claude-usage.mjs
 COPY container/subscription-limits.mjs /usr/local/bin/subscription-limits.mjs
 COPY container/codex-subscription.mjs /usr/local/bin/codex-subscription.mjs
@@ -93,22 +117,29 @@ COPY container/codex-usage.mjs /usr/local/bin/codex-usage.mjs
 COPY container/dsh-usage.mjs /usr/local/bin/dsh-usage.mjs
 COPY container/dsh-cost.mjs /usr/local/bin/dsh-cost.mjs
 COPY container/native-search-evidence.mjs /usr/local/bin/native-search-evidence.mjs
+# The runner's live record of this session's searches; ack3-submit reads it to check search citations.
+COPY container/search-record.mjs /usr/local/bin/search-record.mjs
 COPY container/reasoning-config.mjs /usr/local/bin/reasoning-config.mjs
+COPY container/command-watch.mjs /usr/local/bin/command-watch.mjs
+COPY container/stop-agent-processes.mjs /usr/local/bin/ack3-stop-agent-processes
+COPY container/command-env.sh /usr/local/lib/ack3/command-env.sh
 COPY container/install-codex-auth.sh /usr/local/bin/ack3-install-codex-auth
 COPY container/prepare-source.sh /usr/local/bin/ack3-prepare-source
 COPY container/prepare-workspace.mjs /usr/local/bin/ack3-prepare-workspace
 COPY container/install-os-packages.py /usr/local/bin/ack3-install-os-packages
 COPY container/reset-accepted.sh /usr/local/bin/ack3-reset-accepted
+COPY container/mount-tests.mjs /usr/local/bin/ack3-mount-tests
 COPY container/preflight.sh /usr/local/bin/ack3-preflight
 COPY container/preflight.mjs /usr/local/lib/ack3/preflight.mjs
 RUN mkdir -p /opt/ack3 \
     && chmod 0755 /usr/local/bin/ack3-* \
+    && chmod 0644 /usr/local/lib/ack3/command-env.sh \
     && printf '%s\n' 'ack3agent ALL=(root) NOPASSWD: /usr/local/bin/ack3-install-os-packages' \
       > /etc/sudoers.d/ack3-agent-packages \
     && chmod 0440 /etc/sudoers.d/ack3-agent-packages \
     && printf '%s\n' '#!/bin/sh' 'exit 101' > /usr/sbin/policy-rc.d \
     && chmod 0755 /usr/sbin/policy-rc.d \
-    && { uname -m; node --version; npm --version; forge --version; cast --version; anvil --version; xxd -v 2>&1; } \
+    && { uname -m; node --version; npm --version; forge --version; cast --version; anvil --version; gh --version | head -n 1; xxd -v 2>&1; } \
       > /opt/ack3/TOOL_VERSIONS \
     && sha256sum \
       /opt/harness/package-lock.json \
@@ -116,15 +147,30 @@ RUN mkdir -p /opt/ack3 \
       /opt/ack3/TOOL_VERSIONS \
       /usr/local/bin/ack3-agent-runner \
       /usr/local/bin/output-files.mjs \
+      /usr/local/bin/scratch-rules.mjs \
+      /usr/local/bin/scratch-evidence.mjs \
+      /usr/local/bin/submission-check.bundle.mjs \
+      /usr/local/bin/submit-check.mjs \
+      /usr/local/bin/ack3-submit \
+      /usr/local/bin/ack3-mount-tests \
       /usr/local/bin/agent-log-writer.mjs \
+      /usr/local/bin/credential-json.mjs \
       /usr/local/bin/claude-runner.mjs \
+      /usr/local/bin/claude-accounts.mjs \
       /usr/local/bin/claude-usage.mjs \
       /usr/local/bin/subscription-limits.mjs \
       /usr/local/bin/codex-subscription.mjs \
       /usr/local/bin/dsh-usage.mjs \
       /usr/local/bin/dsh-cost.mjs \
       /usr/local/bin/native-search-evidence.mjs \
+      /usr/local/bin/search-record.mjs \
       /usr/local/bin/reasoning-config.mjs \
+      /usr/local/bin/command-watch.mjs \
+      /usr/local/lib/ack3/command-env.sh \
+      /usr/local/bin/codex-usage.mjs \
+      /usr/local/bin/ack3-install-codex-auth \
+      /usr/local/bin/ack3-reset-accepted \
+      /usr/local/bin/ack3-stop-agent-processes \
       /usr/local/bin/ack3-preflight \
       /usr/local/bin/ack3-prepare-source \
       /usr/local/bin/ack3-prepare-workspace \

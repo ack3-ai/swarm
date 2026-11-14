@@ -1,4 +1,5 @@
 #!/bin/sh
 set -eu
 rm -rf /workspace/accepted
-install -d -m 0750 -o 10001 -g 10001 /workspace/accepted
+# Root-owned: only root writes here (the Worker, ack3-mount-tests); the agent reads.
+install -d -m 0755 -o 0 -g 0 /workspace/accepted

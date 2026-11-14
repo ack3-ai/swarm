@@ -1,88 +1,105 @@
-# Architecture
+# How Swarm works
 
-## Services and ownership
+## Services
 
 ![The API and dashboard route to pinned runtimes; Workflows run agents in containers, R2 stores evidence and D1 indexes runs.](images/services.svg)
 
-The front-door Worker authenticates API requests, serves the dashboard and routes
-controls to the run's pinned runtime. A Durable Object serializes release
-activation and runtime reservations. Private runtime Workers execute Workflows,
-validate outputs and manage container workspaces. R2 stores source and evidence;
-D1 holds indexes and runtime assignments.
+The front-door Worker authenticates API requests, serves the dashboard and
+routes each command to the runtime that owns the run. Its Durable Object
+serializes release activation, runtime reservations and command delivery.
 
-Each run keeps its Worker version and container image. Routine code publication
-does not change active runs. Terraform manages infrastructure resources; deployment
-tools publish code and runtime versions. See [Operations](../cloudflare/engine/README.md).
+A runtime Worker executes audits. Each runtime slot has its own Workflow,
+container image and coordinator; the coordinator reconciles commands and cleans
+up when a run ends. A run keeps the runtime it started on, so publishing code
+never changes a run in progress. Code rotation deploys to an idle slot.
 
-## Configuration and releases
+R2 stores source packages, releases, evidence and checkpoints. D1 holds the run
+index, command revisions, execution ownership and runtime assignments.
+See [engine operations](../cloudflare/engine/README.md).
+
+## Releases
 
 | Concept | Purpose |
 | --- | --- |
-| Audit method | Implements scheduling and output validation. |
-| Prompt file | Supplies user research instructions keyed by stage. |
-| Audit configuration (manifest) | Selects stages, source, models, environment, prompts and limits. |
-| Sealed release | Saves the compiled configuration under a content digest. |
-| Runtime release | Identifies the Worker version, Workflow and container image. |
+| Audit method | Code that schedules stages and validates outputs (`security-audit-v1`). |
+| Prompt file | Research instructions per stage, plus optional replacements for the default agent instructions. |
+| Manifest | Target commit, optional scope, stages, model pools, environment, prompts and limits. |
+| Sealed release | The compiled manifest and prompts under a content digest. |
+| Runtime release | A Worker version, Workflow and container image digest. |
 
-Publishing a configuration creates an immutable release. Activation selects it
-for future starts; it does not modify existing runs. Changes to a prompt file
-do not change already sealed releases.
+Publishing a manifest creates an immutable release. Activation selects it for
+future starts and leaves existing runs alone. Prompt file edits take effect at
+the next publication.
 
-## Evidence and decisions
+## Evidence flow
 
-The [stage overview](../README.md#stages-and-agent-roles) lists selectable stages.
-Preflight and evidence validation are automatic; only selected research stages run.
-Research produces observations with evidence. Synthesis organizes them into
-candidate issues, refutations and unresolved questions. Independent coverage
-agents investigate source without seeing that research.
+Preflight and evidence validation always run; the research stages are
+selected in the manifest ([stages](../README.md#stages)).
 
-Reviewers receive the same saved observations and evidence in separate workspaces.
-Their decisions are retained individually. Verification receives references kept
-at any earlier stage and conflicting review outcomes, even if later reviewers
-agree to refute an earlier candidate. Observations refuted throughout remain in
-the audit record.
+**Recon** (optional) runs one agent before discovery. It searches the public
+web and writes background notes about the target's technologies, dependencies
+and similar attacks, citing at least one successful search. It reports no
+findings; later stages treat the notes as unverified context.
 
-Verification covers each eligible reference–observation
-pair. It records whether the behavior reproduces and whether it is exploitable as two
-separate results.
+**Discovery** produces observations: a statement, the conditions under which it
+holds, its consequence, its evidence and, where search is required, the queries
+made. The supervisor accepts a submission when every observation has those
+parts, every refutation names what was examined, and every search citation
+matches a search made in that session. Otherwise the agent gets a bounded
+number of correction turns in the same conversation.
 
-The reporter maps every eligible pair to a section of `finding-draft.md`.
-The supervisor checks coverage and seals `finding.md` with supporting records.
-These checks establish output completeness, not the correctness of security claims.
-A completed report can include uncertainty; missing required work fails the run.
+**Synthesis** groups observations into candidates, refutations and unresolved
+questions. Every observation keeps its ID and origin.
 
-## Conversations and filesystems
+**Coverage** sends fresh agents through the source without the discovery
+research.
 
-Each task starts a fresh model conversation. Invalid output receives bounded
-correction turns in the same session and workspace. Execution failures have
-separate retry handling.
+**Negative review** gives each reviewer the same saved observations in a
+separate workspace. A reviewer upholds, narrows, overturns or leaves a decision
+unresolved, and each decision is kept. A reference kept at any earlier stage,
+or one reviewers disagree about, goes to verification. Observations refuted at
+every stage stay in the record.
 
-Discovery workspaces are reused by model pool and researcher across waves.
-The first wave receives source only; later waves receive previously accepted
-research as files. Pools progress independently, so equal wave numbers need not
-share start times or inputs. Later stages use fresh workspaces with their assigned
-evidence. Rejected and unfinished outputs are not shared as accepted research.
+**Verification** records two results per eligible observation: whether the
+behavior reproduced and whether exploitation is supported. With
+[`keepPocs`](running-audit.md#keep-poc-tests), it also receives the PoC tests
+written during discovery, as leads to check and rerun.
 
-Source packages contain the pinned commit and submodules, without Git history or
-uncommitted files. Workspace preparation runs before credentials are installed.
-Preflight checks are separate and do not install dependencies in agent workspaces.
-See [workspace preparation](running-audit.md#workspace-preparation).
+**Reporting** maps every eligible observation to a section of the report. The
+supervisor checks completeness and seals `finding.md` with its supporting
+records. The report states where verification was inconclusive.
 
-Agents write reports and `.swarm/submission.json`. Accepted artifacts are immutable;
-observation IDs and references preserve their origin across stages. R2 lock rules
-keep Swarm from deleting releases, source packages, checkpoints and accepted
-artifacts, but a Cloudflare token that can change bucket settings can remove the
-rules, so keep such tokens to account administrators. Conversation IDs do not
-guarantee that workspace files survive a container failure.
+## Workspaces
+
+Every task starts a fresh model conversation; correction turns stay in it.
+Discovery keeps one workspace per model pool and researcher across waves. The
+first wave sees the source and, with recon, its notes; later waves also
+receive, as files, all research accepted so far from every pool. Pools advance independently. Later
+stages use fresh workspaces with the evidence assigned to them. Rejected and
+unfinished outputs are never shared.
+
+A source package is the pinned commit with its submodules, without Git history
+or uncommitted files. [Workspace preparation](running-audit.md#workspace-preparation)
+runs before any credential is installed; preflight runs separately.
+
+Agents write a research document and `.swarm/submission.json`. Accepted
+artifacts are immutable, and R2 lock rules stop Swarm from deleting releases,
+source packages, checkpoints and accepted artifacts. A token that can edit
+bucket settings could remove the rules; such tokens belong to account
+administrators. [Remove one audit's data](remove-audit-data.md) lists where an
+audit's data is and how an administrator removes it.
 
 ## Limits and recovery
 
-Time, usage and wave limits stop new Discovery admissions; saturation stopping
-is configurable. Admitted
-work drains and later stages continue, so a discovery budget is not a total audit
-timeout.
+Discovery stops admitting work at the time, usage or wave limit, or when the
+pools go quiet (saturation stopping, on by default). Admitted tasks finish and
+later stages run. A Claude task that reaches its subscription limit waits for
+the reported reset and then resumes the same session; the wait does not count
+against discovery time, and the dashboard shows it.
 
-Checkpoints preserve accepted evidence, attempts, usage and execution position.
-Recovery creates a child run and preserves its ancestry; it is not a fresh audit.
-Interrupted usage without a receipt remains unknown. See
-[recovery procedures](../cloudflare/engine/README.md#checkpoints-and-recovery).
+Checkpoints save accepted evidence, attempts, usage and execution position. To
+change models, prompts or budgets, publish a new manifest and fork the run from
+a stage, a checkpoint or its frontier. The child keeps the accepted prefix, the
+original clocks and the recorded usage; the parent is unchanged. Usage
+interrupted without a receipt is recorded as unknown.
+See [run controls](audit-controls.md).

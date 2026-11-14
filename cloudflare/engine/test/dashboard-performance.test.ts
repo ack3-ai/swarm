@@ -68,32 +68,47 @@ async function object(runId: string, n: number, requests?: ProviderRequestTeleme
   }
 }
 
-it('reads exact receipts across recovery parents and returns only aggregate operational fields', async () => {
+it('reads only this execution and identifies excluded inherited telemetry', async () => {
   const childObject = await object('child', 2, [sample()]), parentObject = await object('root', 1, [sample()])
   const objects = [childObject, parentObject]
   const bucket = {
     list: vi.fn(async ({ prefix }: { prefix: string }) => ({ objects: objects.filter(o => o.key.startsWith(prefix)), truncated: false })),
     get: vi.fn(async (key: string) => objects.find(o => o.key === key) ?? null),
   } as any
-  const result = await readDashboardPerformance(state('child', 'root'), selection,
-    { getState: async () => state('root') }, bucket)
-  expect(result).toMatchObject({ inspectedReceipts: 2, receiptsWithTelemetry: 2, incomplete: false, inFlightKnown: false })
-  expect(result.groups[0]?.requests).toBe(2)
+  const result = await readDashboardPerformance(state('child', 'root'), selection, bucket)
+  expect(result).toMatchObject({ inspectedReceipts: 1, receiptsWithTelemetry: 1, incomplete: false,
+    inFlightKnown: false, sourceRunId: 'root', inheritedTelemetryExcluded: true })
+  expect(result.groups[0]?.requests).toBe(1)
   expect(JSON.stringify(result)).not.toMatch(/PRIVATE|private-request-id/)
-  expect(bucket.get).toHaveBeenCalledTimes(2)
+  expect(bucket.get).toHaveBeenCalledExactlyOnceWith(childObject.key)
+  expect(bucket.list).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ prefix: expect.stringContaining('child') }))
 })
 
-it('marks unavailable history and refuses corrupted receipts or unrelated recovery parents', async () => {
+it('marks missing telemetry and refuses corrupted receipts without reading a source execution', async () => {
   const saved = await object('root', 1)
   const bucket = { list: async () => ({ objects: [saved], truncated: false }), get: async () => saved } as any
-  expect(await readDashboardPerformance(state('root'), selection, { getState: vi.fn() }, bucket))
-    .toMatchObject({ groups: [], receiptsWithTelemetry: 0, inspectedReceipts: 1 })
+  expect(await readDashboardPerformance(state('root'), selection, bucket))
+    .toMatchObject({ groups: [], receiptsWithTelemetry: 0, inspectedReceipts: 1,
+      sourceRunId: null, inheritedTelemetryExcluded: false })
   saved.customMetadata.objectSha256 = 'b'.repeat(64)
-  await expect(readDashboardPerformance(state('root'), selection, { getState: vi.fn() }, bucket))
+  await expect(readDashboardPerformance(state('root'), selection, bucket))
     .rejects.toThrow('integrity mismatch')
   const list = vi.fn(async () => ({ objects: [], truncated: false }))
-  const result = await readDashboardPerformance(state('child', 'foreign'), selection,
-    { getState: async () => ({ ...state('foreign'), rootRunId: 'unrelated' }) }, { list, get: vi.fn() } as any)
-  expect(result.incomplete).toBe(true)
+  const result = await readDashboardPerformance(state('child', 'foreign'), selection, { list, get: vi.fn() } as any)
+  expect(result).toMatchObject({ incomplete: false, sourceRunId: 'foreign', inheritedTelemetryExcluded: true })
+  expect(list).toHaveBeenCalledOnce()
+})
+
+it('identifies a fork source without reading it or interpreting historical execution records', async () => {
+  const list = vi.fn(async () => ({ objects: [], truncated: false }))
+  const bucket = { list, get: vi.fn() } as any
+  const fork = { ...state('fork'), forkOrigin: { source: { runId: 'source', state: { generation: 7,
+    digest: 'a'.repeat(64) } } } } as RunState
+  expect(await readDashboardPerformance(fork, selection, bucket)).toMatchObject({
+    sourceRunId: 'source', inheritedTelemetryExcluded: true, inspectedReceipts: 0,
+  })
+  expect(list).toHaveBeenCalledOnce()
+  await expect(readDashboardPerformance({ ...fork, configurationHistory: [] } as RunState, selection, bucket))
+    .rejects.toThrow('historical app version')
   expect(list).toHaveBeenCalledOnce()
 })

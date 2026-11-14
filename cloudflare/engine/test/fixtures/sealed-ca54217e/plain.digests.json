@@ -1,0 +1,426 @@
+{
+  "preflight/identity-tools-baseline/preflight": {
+    "first": "f64fe899576fdc972a12d48f493c0837d976230fd7f6883772aa607179c91114",
+    "correction": "e3489c540a5d4c1d46fe61f8123c6fe4e546855ee5244b2ccba2367e4f352f2e"
+  },
+  "discovery/wave-0/core-wave-0-research-1": {
+    "first": "2495013c99fbc9793a116ff0f0b8a064327dce4bd2d189dfd4f87d3c05de60b5",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-0/core-wave-0-research-2": {
+    "first": "d50c1a3d7802f774207d414c9a33b1f964c35ee5d205bd276d05ceaaf387161e",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-0/core-wave-0-research-3": {
+    "first": "678a020b776477584f0f0f48bf86e7620a4e2c54e2dc5725410a3730be90572b",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-0/additive-wave-0-research-1": {
+    "first": "2495013c99fbc9793a116ff0f0b8a064327dce4bd2d189dfd4f87d3c05de60b5",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-0/additive-wave-0-research-2": {
+    "first": "d50c1a3d7802f774207d414c9a33b1f964c35ee5d205bd276d05ceaaf387161e",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-0/additive-wave-0-research-3": {
+    "first": "678a020b776477584f0f0f48bf86e7620a4e2c54e2dc5725410a3730be90572b",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-1/core-wave-1-research-1": {
+    "first": "bb9f30a2a00fe8d2ea91457dba7c8f22433e04b79d6b3c8d5c18431f0a94b8eb",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-1/core-wave-1-research-2": {
+    "first": "fc1fea7fecc7e82e0ca5e4a530e486a1ca01ab9f6cb4844dfa7be441cc514e33",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-1/core-wave-1-research-3": {
+    "first": "5ba90c8aa6f2da6404726834da54404f975fa96f57c6bcc8981e7888ca2ff51c",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-1/additive-wave-1-research-1": {
+    "first": "bb9f30a2a00fe8d2ea91457dba7c8f22433e04b79d6b3c8d5c18431f0a94b8eb",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-1/additive-wave-1-research-2": {
+    "first": "fc1fea7fecc7e82e0ca5e4a530e486a1ca01ab9f6cb4844dfa7be441cc514e33",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-1/additive-wave-1-research-3": {
+    "first": "5ba90c8aa6f2da6404726834da54404f975fa96f57c6bcc8981e7888ca2ff51c",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-2/core-wave-2-research-1": {
+    "first": "c5a0fd395c57704971af462deb3cbb980bf5fdea54c6509c575d14d0831680e7",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-2/core-wave-2-research-2": {
+    "first": "f2e9a8646affd8b41d7f62ea81a1e15ac78d2df9f416d6c1e104a303a7533cdd",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-2/core-wave-2-research-3": {
+    "first": "db4ca3334a60efbef562d402f364f53722331356276108d699856f06a9dafd45",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-2/additive-wave-2-research-1": {
+    "first": "c5a0fd395c57704971af462deb3cbb980bf5fdea54c6509c575d14d0831680e7",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-2/additive-wave-2-research-2": {
+    "first": "f2e9a8646affd8b41d7f62ea81a1e15ac78d2df9f416d6c1e104a303a7533cdd",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-2/additive-wave-2-research-3": {
+    "first": "db4ca3334a60efbef562d402f364f53722331356276108d699856f06a9dafd45",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-3/core-wave-3-research-1": {
+    "first": "323a3f3a7296712f25305c47aedacaf3e028c9f5bfed1af9a6dad3d4d8d76f02",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-3/core-wave-3-research-2": {
+    "first": "ba64577664e44a2cb93214ad41164fada0448912127a9c77b7bdc674ca98da6e",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-3/core-wave-3-research-3": {
+    "first": "50d04997a266633edcbbb58d8d692a5ecd0347a997de87b1a6891227885ba664",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-3/additive-wave-3-research-1": {
+    "first": "323a3f3a7296712f25305c47aedacaf3e028c9f5bfed1af9a6dad3d4d8d76f02",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-3/additive-wave-3-research-2": {
+    "first": "ba64577664e44a2cb93214ad41164fada0448912127a9c77b7bdc674ca98da6e",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-3/additive-wave-3-research-3": {
+    "first": "50d04997a266633edcbbb58d8d692a5ecd0347a997de87b1a6891227885ba664",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-4/core-wave-4-research-1": {
+    "first": "b2a291f3d9b731bddd8c299703babce018b926450828039d90f4c33324929084",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-4/core-wave-4-research-2": {
+    "first": "d54b0ff481819959728b56af2bf8ccd50076ee417c9351ace87a5e8c1c7e24e8",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-4/core-wave-4-research-3": {
+    "first": "48d3f9fc5eda9d9df79fb2f3f83a827a101a4602ca8de200afaee2863b9d4e64",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-4/additive-wave-4-research-1": {
+    "first": "b2a291f3d9b731bddd8c299703babce018b926450828039d90f4c33324929084",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-4/additive-wave-4-research-2": {
+    "first": "d54b0ff481819959728b56af2bf8ccd50076ee417c9351ace87a5e8c1c7e24e8",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-4/additive-wave-4-research-3": {
+    "first": "48d3f9fc5eda9d9df79fb2f3f83a827a101a4602ca8de200afaee2863b9d4e64",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-5/core-wave-5-research-1": {
+    "first": "9ccd9d2dde09d80e745c9be7de95c26e9a3cc89581b99d8932af57d35de66fb8",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-5/core-wave-5-research-2": {
+    "first": "104bf2813e5f7f7dcad5659d3a1fcbc073a5288bbe5898b7e3a6f5f739cd7e0b",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-5/core-wave-5-research-3": {
+    "first": "c3104f420a5959d56263afb517ec1d1a48e24fbb6fe40ec4036d3c6e5a58d414",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-5/additive-wave-5-research-1": {
+    "first": "9ccd9d2dde09d80e745c9be7de95c26e9a3cc89581b99d8932af57d35de66fb8",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-5/additive-wave-5-research-2": {
+    "first": "104bf2813e5f7f7dcad5659d3a1fcbc073a5288bbe5898b7e3a6f5f739cd7e0b",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-5/additive-wave-5-research-3": {
+    "first": "c3104f420a5959d56263afb517ec1d1a48e24fbb6fe40ec4036d3c6e5a58d414",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-6/core-wave-6-research-1": {
+    "first": "530924309a4908ff01a6387ca56d8d4de827cc4dc6bdc9366ae7e47d07f40470",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-6/core-wave-6-research-2": {
+    "first": "679c176069b0c7fddf6d19e9b5351f648739598e095090a5ac997a7218a52a5c",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-6/core-wave-6-research-3": {
+    "first": "a1f44bdfe4c1ebf57649e30e09ea772657554efb8b9f91ea4a5d47b692404ab8",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-6/additive-wave-6-research-1": {
+    "first": "530924309a4908ff01a6387ca56d8d4de827cc4dc6bdc9366ae7e47d07f40470",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-6/additive-wave-6-research-2": {
+    "first": "679c176069b0c7fddf6d19e9b5351f648739598e095090a5ac997a7218a52a5c",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-6/additive-wave-6-research-3": {
+    "first": "a1f44bdfe4c1ebf57649e30e09ea772657554efb8b9f91ea4a5d47b692404ab8",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-7/core-wave-7-research-1": {
+    "first": "28c445a4cd5afa9658f8e5e20977fdb6d0ef82b910348f968b93b53bd074536c",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-7/core-wave-7-research-2": {
+    "first": "574cbdfb53cce18174a7d7da231217713bc2f1d427895c3dff7d07e8c69b7834",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-7/core-wave-7-research-3": {
+    "first": "6f183e0ef6ab6473028c59bdf3f2f209adb08de309cf7401347a981e105814aa",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-7/additive-wave-7-research-1": {
+    "first": "28c445a4cd5afa9658f8e5e20977fdb6d0ef82b910348f968b93b53bd074536c",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-7/additive-wave-7-research-2": {
+    "first": "574cbdfb53cce18174a7d7da231217713bc2f1d427895c3dff7d07e8c69b7834",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-7/additive-wave-7-research-3": {
+    "first": "6f183e0ef6ab6473028c59bdf3f2f209adb08de309cf7401347a981e105814aa",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-8/core-wave-8-research-1": {
+    "first": "e809347be5211a47017d3218cc42b3d96e158d03fb3e22f03a5eff46f70032df",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-8/core-wave-8-research-2": {
+    "first": "6be76a7ae53ac9686b208ce6cc5aefd2f9487347518d0b860b24cd3985185a90",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-8/core-wave-8-research-3": {
+    "first": "25aca3b3a3aa077eab79764c743e2184eb6ff4e7afd0d8268e6f64c47b2f8f02",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-8/additive-wave-8-research-1": {
+    "first": "e809347be5211a47017d3218cc42b3d96e158d03fb3e22f03a5eff46f70032df",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-8/additive-wave-8-research-2": {
+    "first": "6be76a7ae53ac9686b208ce6cc5aefd2f9487347518d0b860b24cd3985185a90",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-8/additive-wave-8-research-3": {
+    "first": "25aca3b3a3aa077eab79764c743e2184eb6ff4e7afd0d8268e6f64c47b2f8f02",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-9/core-wave-9-research-1": {
+    "first": "bdc28ccfe9d5c8fd4acb9e9265fbbb71e88be2c01034373cce3c8e5b8839983c",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-9/core-wave-9-research-2": {
+    "first": "f27cbc1b94b4f0fbd46deb9736e48caae54804d1c3ae191ab7984a4bbb1ba428",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-9/core-wave-9-research-3": {
+    "first": "c63cc25e2ae1013326f7eb1c5df551c5dd7cae1518fc06f8f64c5bddd5d68396",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-9/additive-wave-9-research-1": {
+    "first": "bdc28ccfe9d5c8fd4acb9e9265fbbb71e88be2c01034373cce3c8e5b8839983c",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-9/additive-wave-9-research-2": {
+    "first": "f27cbc1b94b4f0fbd46deb9736e48caae54804d1c3ae191ab7984a4bbb1ba428",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-9/additive-wave-9-research-3": {
+    "first": "c63cc25e2ae1013326f7eb1c5df551c5dd7cae1518fc06f8f64c5bddd5d68396",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-10/core-wave-10-research-1": {
+    "first": "92d437ed93fe9c187d7606355471fc1db90a1b8240b7a5cd8c35869f9e7e2731",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-10/core-wave-10-research-2": {
+    "first": "280c4bf8777949bfe4ae66d18190efadffccf91ca3fa00bba6d4080b564f21e4",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-10/core-wave-10-research-3": {
+    "first": "a070310e113686485f46a60d72c33c9b3e2f46d74871b3e699f5c057031b471c",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-10/additive-wave-10-research-1": {
+    "first": "92d437ed93fe9c187d7606355471fc1db90a1b8240b7a5cd8c35869f9e7e2731",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-10/additive-wave-10-research-2": {
+    "first": "280c4bf8777949bfe4ae66d18190efadffccf91ca3fa00bba6d4080b564f21e4",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-10/additive-wave-10-research-3": {
+    "first": "a070310e113686485f46a60d72c33c9b3e2f46d74871b3e699f5c057031b471c",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-11/core-wave-11-research-1": {
+    "first": "6a073ed1c42d71dffebe5080d3c421b266df6cdc2c66514d0c6029e9a10f717d",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-11/core-wave-11-research-2": {
+    "first": "55251f05f6b23244000159b4c81e1df3047cc707efc8a1f556a96b35ae5dd842",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-11/core-wave-11-research-3": {
+    "first": "3140c36a6ce86344468ac527b6dcc71fb3d15159ddc651a60cf4a30d349c7f73",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-11/additive-wave-11-research-1": {
+    "first": "6a073ed1c42d71dffebe5080d3c421b266df6cdc2c66514d0c6029e9a10f717d",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-11/additive-wave-11-research-2": {
+    "first": "55251f05f6b23244000159b4c81e1df3047cc707efc8a1f556a96b35ae5dd842",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-11/additive-wave-11-research-3": {
+    "first": "3140c36a6ce86344468ac527b6dcc71fb3d15159ddc651a60cf4a30d349c7f73",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-12/core-wave-12-research-1": {
+    "first": "1759a74d5acb600bd63de1d508defd33d706a28624f52dc3599e622ed88e4a87",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-12/core-wave-12-research-2": {
+    "first": "7aa9a899c5aa5ebca7da9f02a60ddd7efe5c8193924f7c112e7099dcb4a25a66",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-12/core-wave-12-research-3": {
+    "first": "6da5be43c849d73c9a4834ebd86aab5d1339a9ded9a481f672a1b5727ae4670e",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-12/additive-wave-12-research-1": {
+    "first": "1759a74d5acb600bd63de1d508defd33d706a28624f52dc3599e622ed88e4a87",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-12/additive-wave-12-research-2": {
+    "first": "7aa9a899c5aa5ebca7da9f02a60ddd7efe5c8193924f7c112e7099dcb4a25a66",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-12/additive-wave-12-research-3": {
+    "first": "6da5be43c849d73c9a4834ebd86aab5d1339a9ded9a481f672a1b5727ae4670e",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-13/core-wave-13-research-1": {
+    "first": "c63f9c58ab0276390e7bbbff783bd0a8d7dcd661d4f5a62db460f98524f120d2",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-13/core-wave-13-research-2": {
+    "first": "6c8c7aae2cd98c3f16c63f2b0a25c9b7a711f3c0d16dc64b943cb7eb45178f16",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-13/core-wave-13-research-3": {
+    "first": "1f894fcc24fb7fb41876c0696bc4489be3c8482287eb5efe46bb8fb01160a1fe",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-13/additive-wave-13-research-1": {
+    "first": "c63f9c58ab0276390e7bbbff783bd0a8d7dcd661d4f5a62db460f98524f120d2",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-13/additive-wave-13-research-2": {
+    "first": "6c8c7aae2cd98c3f16c63f2b0a25c9b7a711f3c0d16dc64b943cb7eb45178f16",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-13/additive-wave-13-research-3": {
+    "first": "1f894fcc24fb7fb41876c0696bc4489be3c8482287eb5efe46bb8fb01160a1fe",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-14/core-wave-14-research-1": {
+    "first": "1c2eddd2de18d49443de63bee439eb7b151d9ccecaa3f9a3596452826b6d7844",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-14/core-wave-14-research-2": {
+    "first": "eed36fc8fef082f2bac8025f94e0d2a12bd7b6ddde86871b294d6e4507ff5556",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-14/core-wave-14-research-3": {
+    "first": "0909a0c2c7aa9f5cffeaf990bdeac28f34609c85c0aa3e3f26751442f3ee50a9",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-14/additive-wave-14-research-1": {
+    "first": "1c2eddd2de18d49443de63bee439eb7b151d9ccecaa3f9a3596452826b6d7844",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-14/additive-wave-14-research-2": {
+    "first": "eed36fc8fef082f2bac8025f94e0d2a12bd7b6ddde86871b294d6e4507ff5556",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-14/additive-wave-14-research-3": {
+    "first": "0909a0c2c7aa9f5cffeaf990bdeac28f34609c85c0aa3e3f26751442f3ee50a9",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-15/core-wave-15-research-1": {
+    "first": "39d124b27d74ec9d89fcf607de07345ed653f9e49bbda22ba2fe97f538e0fcb4",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-15/core-wave-15-research-2": {
+    "first": "c33d999ee4353c992467986911804b0ac1a055bc25b9c0238a885a8f41be4894",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-15/core-wave-15-research-3": {
+    "first": "eb4d4a593fa130997c5290a60c38d8b6a88066893b4a2fb6bf41817f46a55fca",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-15/additive-wave-15-research-1": {
+    "first": "39d124b27d74ec9d89fcf607de07345ed653f9e49bbda22ba2fe97f538e0fcb4",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-15/additive-wave-15-research-2": {
+    "first": "c33d999ee4353c992467986911804b0ac1a055bc25b9c0238a885a8f41be4894",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "discovery/wave-15/additive-wave-15-research-3": {
+    "first": "eb4d4a593fa130997c5290a60c38d8b6a88066893b4a2fb6bf41817f46a55fca",
+    "correction": "59527a681142dbbfa35066b9ed990aa830100f27ee1f1ff5fb376606bf6490ea"
+  },
+  "synthesis/synthesis/synthesizer": {
+    "first": "b2368934434e2c141f4cee9fb65d813113f3d84ac0e5a5f98f0c97fd3167b60e",
+    "correction": "79d1a5043ae20839257fc75ad198497c426c450cbfe469ce80fd5eaacb86b0b7"
+  },
+  "coverage/independent-coverage/challenge-open-adversarial": {
+    "first": "d97571ec7f8e86d31a51a32bc7ce6a26a016882ad8d299b98311f8a924bf6fee",
+    "correction": "1928c311c733a4c776620536fe28d8207380b9b36c9743ef528b07f1aeb6091d"
+  },
+  "coverage/coverage-union/coverage-union": {
+    "first": "d5e6c3ee23f14d712db3b86a673fe66ca4f744ec37a0e9a7d0015cabab9ed670",
+    "correction": "e3489c540a5d4c1d46fe61f8123c6fe4e546855ee5244b2ccba2367e4f352f2e"
+  },
+  "negative-review/disposition-review/negative-review-primary": {
+    "first": "d383bb3f8db6e14781f8be081ccff67d776e9e24cc1a189223e8b1b1cd5bdcad",
+    "correction": "3577c4c275e61d4ba36748b788c87f3f4b7ef5e7c0861ddb0639325e6ba5787d"
+  },
+  "negative-review/disposition-review/negative-review-replica": {
+    "first": "7eb4911c3a98ddb39baa68cf64ee6842880a0e84da32734cf311cce40580af7d",
+    "correction": "3577c4c275e61d4ba36748b788c87f3f4b7ef5e7c0861ddb0639325e6ba5787d"
+  },
+  "negative-review/dissent-preserving-review-union/negative-review-union": {
+    "first": "4460c1a4d11d0347ac85507e5c1c78948843c1ff6107d2b6a385f973b4cf6553",
+    "correction": "e3489c540a5d4c1d46fe61f8123c6fe4e546855ee5244b2ccba2367e4f352f2e"
+  },
+  "verification/all-eligible-references/verifier": {
+    "first": "217f092e6b75289eaec3950ca98c92efa364547b4ae860e1fccb10635f65b3fa",
+    "correction": "f569ccc5378fe7fc2d3a5de3cfa79df5f9e4211d1fb236f57fe7f3093136ca0f"
+  },
+  "reporting/final-report/reporter": {
+    "first": "c55307ef43a0d760d6c7fb38e3aa178f349df4c367b7483e544443bd1b1bde31",
+    "correction": "c8502076bbc98bb99e6c382473f32882e16a1a5729c329549dd37fc07a397dee"
+  },
+  "reporting/deterministic-final-seal/seal-final": {
+    "first": "d242b4d80106548a4bf1223405a61efc96f10aef09234cd577c8064c26bd0bdc",
+    "correction": "e3489c540a5d4c1d46fe61f8123c6fe4e546855ee5244b2ccba2367e4f352f2e"
+  }
+}

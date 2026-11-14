@@ -57,6 +57,22 @@ export function validSubscriptionWaits(value) {
     && Date.parse(wait.resumedAt) >= Date.parse(wait.resetsAt)))
 }
 
+/** The quota waits one attempt may report: from the root runner's start to the end of its
+ * last CLI launch. With Claude account rotation the root runner itself waits between
+ * launches, so the window spans every launch, never one alone. A wait outside it is
+ * dropped, so a stale or forged wait cannot move the discovery deadline. */
+export function attemptWaitWindow(now = Date.now) {
+  const startedAt = now()
+  let endedAt = startedAt
+  return {
+    launchEnded() { endedAt = now() },
+    within(waits) {
+      const kept = waits?.filter(wait => Date.parse(wait.startedAt) >= startedAt && Date.parse(wait.resumedAt) <= endedAt)
+      return kept === undefined || kept.length === 0 ? undefined : kept
+    },
+  }
+}
+
 export function subscriptionWaits(stdout) {
   const waits = []
   for (const line of stdout.split('\n')) {
@@ -65,4 +81,50 @@ export function subscriptionWaits(stdout) {
     if (event.type === 'subscription_wait' && validSubscriptionWaits([event.wait])) waits.push(event.wait)
   }
   return waits.length === 0 ? undefined : waits
+}
+
+/** Immediate Claude account switches after a quota rejection: binding names only, never token values. */
+export function validSubscriptionSwitches(value) {
+  return value === undefined || (Array.isArray(value) && value.every(item => item !== null
+    && typeof item === 'object' && Object.keys(item).length === 6 && item.provider === 'claude'
+    && typeof item.sessionId === 'string' && /^[a-zA-Z0-9._:-]{8,200}$/.test(item.sessionId)
+    && ['from', 'to'].every(key => typeof item[key] === 'string' && /^CLAUDE_[A-Z0-9_]*OAUTH_TOKEN$/.test(item[key]))
+    && item.from !== item.to
+    && ['at', 'resetsAt'].every(key => typeof item[key] === 'string' && Number.isFinite(Date.parse(item[key])))))
+}
+
+export function subscriptionSwitches(stdout) {
+  const switches = []
+  for (const line of stdout.split('\n')) {
+    let event
+    try { event = JSON.parse(line) } catch { continue }
+    if (event.type === 'subscription_switch' && validSubscriptionSwitches([event.switch])) switches.push(event.switch)
+  }
+  return switches
+}
+
+/** Live Claude quota-wait status from runner stdout. A line longer than the
+ * bound is skipped rather than buffered. A null reset means the wait ended. */
+export function subscriptionWaitStatusReader(maxLineCharacters = 64 * 1024) {
+  let pending = ''
+  let skipping = false
+  return text => {
+    const lines = (pending + text).split('\n')
+    pending = lines.pop() ?? ''
+    if (skipping && lines.length > 0) { lines.shift(); skipping = false }
+    if (pending.length > maxLineCharacters) { pending = ''; skipping = true }
+    const statuses = []
+    for (const line of lines) {
+      if (!line.includes('"subscription_wait')) continue
+      let event
+      try { event = JSON.parse(line) } catch { continue }
+      if (event?.type === 'subscription_wait_started' && event.provider === 'claude'
+        && typeof event.resetsAt === 'string' && Number.isFinite(Date.parse(event.resetsAt))) {
+        statuses.push({ provider: 'claude', resetsAt: event.resetsAt })
+      } else if (event?.type === 'subscription_wait' && event.wait?.provider === 'claude') {
+        statuses.push({ provider: 'claude', resetsAt: null })
+      }
+    }
+    return statuses
+  }
 }

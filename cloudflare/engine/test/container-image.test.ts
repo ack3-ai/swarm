@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import dockerfile from '../Dockerfile?raw'
+import resetAccepted from '../container/reset-accepted.sh?raw'
+import stopAgentProcessesScript from '../container/stop-agent-processes.mjs?raw'
 import harnessLock from '../container/harness/package-lock.json'
 import harnessPackage from '../container/harness/package.json'
 
@@ -46,10 +48,54 @@ describe('container image', () => {
     expect(dockerfile).toContain('COPY container/agent-runner.mjs /usr/local/bin/ack3-agent-runner')
     expect(dockerfile).toContain('COPY container/output-files.mjs /usr/local/bin/output-files.mjs')
     expect(dockerfile).toContain('/usr/local/bin/output-files.mjs \\')
+    for (const [source, target] of [['scratch-rules.mjs', 'scratch-rules.mjs'], ['scratch-evidence.mjs', 'scratch-evidence.mjs'],
+      ['mount-tests.mjs', 'ack3-mount-tests'], ['submission-check.bundle.mjs', 'submission-check.bundle.mjs'],
+      ['submit-check.mjs', 'submit-check.mjs'], ['ack3-submit.mjs', 'ack3-submit'], ['search-record.mjs', 'search-record.mjs'],
+      ['credential-json.mjs', 'credential-json.mjs']]) {
+      expect(dockerfile).toContain(`COPY container/${source} /usr/local/bin/${target}`)
+      expect(dockerfile).toContain(`      /usr/local/bin/${target} \\`)
+    }
     expect(dockerfile).toContain('COPY container/agent-log-writer.mjs /usr/local/bin/agent-log-writer.mjs')
     expect(dockerfile).toContain('COPY container/codex-usage.mjs /usr/local/bin/codex-usage.mjs')
     expect(dockerfile).toContain('COPY container/dsh-cost.mjs /usr/local/bin/dsh-cost.mjs')
     expect(dockerfile).toContain('COPY container/native-search-evidence.mjs /usr/local/bin/native-search-evidence.mjs')
+  })
+
+  it('fingerprints every script it installs, so a changed script always changes BUILD_FINGERPRINT', () => {
+    const fingerprinted = dockerfile.slice(dockerfile.indexOf('&& sha256sum \\'), dockerfile.indexOf('> /opt/ack3/BUILD_FINGERPRINT'))
+    const installed = [...dockerfile.matchAll(/^COPY container\/\S+ (\/usr\/local\/\S+)$/gm)].map(match => match[1]!)
+    expect(installed.length).toBeGreaterThan(20)
+    for (const path of installed) expect(fingerprinted, path).toContain(`      ${path} \\`)
+  })
+
+  it('recreates /workspace/accepted root-owned and readable, so the agent cannot plant links where root writes (T1)', () => {
+    // Only root writes there (the Worker after this reset, and ack3-mount-tests); agents only read.
+    expect(resetAccepted).toContain('install -d -m 0755 -o 0 -g 0 /workspace/accepted')
+    expect(resetAccepted).not.toContain('10001')
+  })
+
+  it('installs the root sweep the Worker runs before a new launch, and fingerprints it (T2)', () => {
+    expect(dockerfile).toContain('COPY container/stop-agent-processes.mjs /usr/local/bin/ack3-stop-agent-processes')
+    expect(dockerfile).toContain('      /usr/local/bin/ack3-stop-agent-processes \\')
+    // The same stop loop the runner uses at the end of an attempt, for the agent user only.
+    expect(stopAgentProcessesScript).toContain("from './command-watch.mjs'")
+    expect(stopAgentProcessesScript).toContain('stopAgentProcesses({ uid: 10001 })')
+  })
+
+  it('installs the command watcher and the OOM shell hook, and fingerprints both', () => {
+    expect(dockerfile).toContain('COPY container/command-watch.mjs /usr/local/bin/command-watch.mjs')
+    expect(dockerfile).toContain('COPY container/command-env.sh /usr/local/lib/ack3/command-env.sh')
+    expect(dockerfile).toContain('chmod 0644 /usr/local/lib/ack3/command-env.sh')
+    expect(dockerfile).toContain('      /usr/local/bin/command-watch.mjs \\\n      /usr/local/lib/ack3/command-env.sh \\')
+  })
+
+  it('installs a pinned GitHub CLI after verifying its published checksum', () => {
+    expect(dockerfile).toMatch(/^ARG GH_VERSION=\d+\.\d+\.\d+$/m)
+    expect(dockerfile).toMatch(/^ARG GH_SHA256_AMD64=[0-9a-f]{64}$/m)
+    expect(dockerfile).toMatch(/^ARG GH_SHA256_ARM64=[0-9a-f]{64}$/m)
+    expect(dockerfile).toContain('echo "${gh_sha256}  ${gh_base}.tar.gz" | sha256sum --check -')
+    expect(dockerfile).toContain('install -m 0755 "${gh_base}/bin/gh" /usr/local/bin/gh')
+    expect(dockerfile).toContain('gh --version | head -n 1')
   })
 
   it('exposes only a fixed privileged OS-package helper to the agent', () => {

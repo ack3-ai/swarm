@@ -1,6 +1,6 @@
 import { sha256 } from '../../src/canonical.js'
 import type {
-  AgentProvider, ArtifactRecord, ArtifactStore, ExperimentDefinition, RunOutcome, SealedCheckpoint,
+  AgentProvider, ArtifactRecord, ArtifactReference, ArtifactStore, ExperimentDefinition, RunOutcome, SealedCheckpoint,
 } from '../../src/contracts.js'
 import type { RunMachine } from '../../src/machine.js'
 import { PermanentRunFailure } from '../../src/run-errors.js'
@@ -8,18 +8,30 @@ import { advanceExperimentOneWave, type RunPolicy } from '../../src/runner.js'
 
 // In-memory artifact custody and a whole-run driver for deterministic tests.
 export class MemoryArtifactStore implements ArtifactStore {
+  constructor(private readonly namespace = '') {}
   readonly contents = new Map<string, string>()
+  readonly executionInputs = new Map<string, readonly ArtifactReference[]>()
+  async putExecutionInputs(inputs: readonly ArtifactReference[]): Promise<string> {
+    const digest = await sha256(inputs)
+    this.executionInputs.set(digest, structuredClone(inputs))
+    return digest
+  }
+  async readExecutionInputs(digest: string): Promise<readonly ArtifactReference[]> {
+    const refs = this.executionInputs.get(digest)
+    if (refs === undefined || await sha256(refs) !== digest) throw new Error('execution input manifest is missing or changed')
+    return structuredClone(refs)
+  }
   readonly rejectedMetadata = new Map<string, { contentDigest: string, taskId: string }>()
 
   async put(record: Omit<ArtifactRecord, 'uri'>, content: string): Promise<ArtifactRecord> {
-    const uri = `memory://artifacts/${encodeURIComponent(record.id)}`
+    const uri = `memory://artifacts/${this.namespace === '' ? '' : `${encodeURIComponent(this.namespace)}/`}${encodeURIComponent(record.id)}`
     this.contents.set(uri, content)
     return { ...record, uri }
   }
 
   async putRejected(record: { id: string, taskId: string, contentDigest: string }, content: string): Promise<string> {
     if (await sha256(content) !== record.contentDigest) throw new Error(`rejected artifact digest mismatch: ${record.id}`)
-    const uri = `memory://quarantine/${encodeURIComponent(record.id)}`
+    const uri = `memory://quarantine/${this.namespace === '' ? '' : `${encodeURIComponent(this.namespace)}/`}${encodeURIComponent(record.id)}`
     this.contents.set(uri, content)
     this.rejectedMetadata.set(uri, { contentDigest: record.contentDigest, taskId: record.taskId })
     return uri

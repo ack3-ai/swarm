@@ -12,7 +12,7 @@ import type {
   TaskDefinition,
   VerificationOutcome,
 } from './contracts.js'
-import { createNegativeReviewInput, verificationAssignments, verificationReferences } from './protocol-transforms.js'
+import { createNegativeReviewInput, FINAL_CUSTODY_MARKER, verificationAssignments, verificationReferences } from './protocol-transforms.js'
 import { researchObservationPrefix } from './research-scheduler.js'
 
 const markdown = new MarkdownIt({ html: false, linkify: false })
@@ -20,6 +20,7 @@ const markdown = new MarkdownIt({ html: false, linkify: false })
 export const SUBMISSION_PATH = '.swarm/submission.json'
 
 const modelSubmissionKinds = new Set<TaskDefinition['promptKind']>([
+  'recon',
   'research',
   'synthesis',
   'coverage-challenge',
@@ -244,6 +245,12 @@ export async function readSubmission(
   const envelope = parseEnvelope(files[SUBMISSION_PATH], issues)
   if (envelope === null) return { protocol: {}, issues }
 
+  if (task.promptKind === 'recon') {
+    const value = completed(envelope, ['researchQueries'], issues)
+    const researchQueries = strings(value?.researchQueries, 'submission.researchQueries', issues, false)
+    return { protocol: researchQueries.length === 0 ? {} : { recon: { researchQueries } }, issues }
+  }
+
   if (task.promptKind === 'research') {
     const checksLeads = task.output.schema === 'ack3.research-delta.policy-v3'
     const hasNextExperiment = Object.prototype.hasOwnProperty.call(envelope, 'nextExperiment')
@@ -281,7 +288,7 @@ export async function readSubmission(
 
   if (task.promptKind === 'synthesis') {
     const value = completed(envelope, ['dispositions', 'retainedReferences'], issues)
-    const expected = visibleArtifacts.flatMap(artifact => artifact.protocol.research?.observations.map(item => item.id) ?? [])
+    const expected = synthesisInputIds(visibleArtifacts)
     const values = array(value?.dispositions, 'submission.dispositions', issues, expected.length)
     const dispositions = values.map((item, index) => disposition(item, `submission.dispositions[${index}]`, issues))
       .filter((item): item is DispositionRecord => item !== null)
@@ -484,12 +491,12 @@ export async function readSubmission(
   const scopedReport = task.output.schema === 'ack3.finding.policy-v4'
   const value = completed(envelope, ['retainedReferences', ...(scopedReport ? ['reportSections'] : [])], issues)
   const retainedReferences = strings(value?.retainedReferences, 'submission.retainedReferences', issues)
-  const expected = [...new Set(visibleArtifacts.flatMap(artifact => [
-    ...(artifact.protocol.dispositionReferences ?? []),
-    ...(artifact.protocol.retainedReferences ?? []),
-    ...(artifact.protocol.decisionDissentObservationIds ?? []),
-  ]))].toSorted()
+  const expected = reportRetainedReferences(visibleArtifacts)
   exactSet(retainedReferences, expected, 'report retained references', issues)
+  // The final seal refuses this line; catch it here, where the reporter can still fix it.
+  if ((files['finding-draft.md'] ?? '').includes(FINAL_CUSTODY_MARKER)) {
+    issues.push(`finding-draft.md must not contain the reserved line ${FINAL_CUSTODY_MARKER}; remove it`)
+  }
   const reportSections: ReportSectionLink[] = []
   if (scopedReport) {
     const assignments = verificationAssignments(visibleArtifacts)
@@ -527,15 +534,59 @@ export async function readSubmission(
     ...(scopedReport ? { reportSections } : {}) }, issues }
 }
 
-export function submissionTemplate(task: TaskDefinition): string | null {
+/** The observations synthesis must disposition, each exactly once. */
+function synthesisInputIds(visibleArtifacts: readonly ArtifactRecord[]): string[] {
+  return visibleArtifacts.flatMap(artifact => artifact.protocol.research?.observations.map(item => item.id) ?? [])
+}
+
+/** The exact retainedReferences a reporter must return. */
+function reportRetainedReferences(visibleArtifacts: readonly ArtifactRecord[]): string[] {
+  return [...new Set(visibleArtifacts.flatMap(artifact => [
+    ...(artifact.protocol.dispositionReferences ?? []),
+    ...(artifact.protocol.retainedReferences ?? []),
+    ...(artifact.protocol.decisionDissentObservationIds ?? []),
+  ]))].toSorted()
+}
+
+/**
+ * The handoff the workspace starts with. Later stages get one entry per ID the Worker
+ * expects, with what the Worker already knows filled in (IDs, frozen primary fields,
+ * the reporter's retained references). Decision fields stay empty strings, which
+ * validation rejects, so an entry left unchanged still needs the model's decision.
+ */
+export async function submissionTemplate(task: TaskDefinition, visibleArtifacts: readonly ArtifactRecord[] = []): Promise<string | null> {
   if (!requiresSubmission(task)) return null
   const body: Record<string, unknown> = { complete: false }
-  if (task.promptKind === 'research') Object.assign(body, { materialHighCriticalDelta: false, observations: [] })
-  if (task.promptKind === 'synthesis') Object.assign(body, { dispositions: [], retainedReferences: [] })
+  if (task.promptKind === 'recon') Object.assign(body, { researchQueries: [] })
+  if (task.promptKind === 'research') Object.assign(body, { materialHighCriticalDelta: false, observations: [],
+    ...(task.output.schema === 'ack3.research-delta.policy-v3' ? { leadChecks: [] } : {}) })
+  if (task.promptKind === 'synthesis') Object.assign(body, {
+    dispositions: synthesisInputIds(visibleArtifacts).map(id => ({ id, disposition: '', reference: '', rationale: '' })),
+    retainedReferences: [],
+  })
   if (task.promptKind === 'coverage-challenge') Object.assign(body, { observations: [] })
-  if (task.promptKind === 'negative-review') Object.assign(body, { decisions: [] })
-  if (task.promptKind === 'verification') Object.assign(body, { outcomes: [] })
-  if (task.promptKind === 'reporting') Object.assign(body, { retainedReferences: [],
-    ...(task.output.schema === 'ack3.finding.policy-v4' ? { reportSections: [] } : {}) })
+  if (task.promptKind === 'negative-review') {
+    const reviewsPrimary = task.output.schema === 'ack3.negative-review.policy-v3'
+    const packet = await createNegativeReviewInput(visibleArtifacts)
+    Object.assign(body, { decisions: packet.entries.map(entry => ({
+      observationId: entry.observationId,
+      ...(reviewsPrimary ? {
+        reviewedPrimaryDisposition: entry.primaryDisposition.disposition,
+        reviewedPrimaryReference: entry.primaryDisposition.reference,
+      } : {}),
+      action: '', finalDisposition: '', finalReference: '', rationale: '',
+    })) })
+  }
+  if (task.promptKind === 'verification') {
+    const outcome = { behavior: '', exploitability: '', evidenceMethod: '', evidence: '' }
+    Object.assign(body, { outcomes: task.output.schema === 'ack3.verification.policy-v4'
+      ? verificationAssignments(visibleArtifacts).map(({ reference, observationIds }) => ({ reference, observationIds, ...outcome }))
+      : verificationReferences(visibleArtifacts).map(reference => ({ reference, ...outcome })) })
+  }
+  if (task.promptKind === 'reporting') Object.assign(body, { retainedReferences: reportRetainedReferences(visibleArtifacts),
+    ...(task.output.schema === 'ack3.finding.policy-v4' ? {
+      reportSections: verificationAssignments(visibleArtifacts).flatMap(({ reference, observationIds }) =>
+        observationIds.map(observationId => ({ observationId, reference, section: '' }))),
+    } : {}) })
   return `${JSON.stringify(body, null, 2)}\n`
 }

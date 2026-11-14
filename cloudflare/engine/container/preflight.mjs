@@ -20,7 +20,9 @@ if (!existsSync(`${privateDirectory}/source-tree-${tree}`)) throw new Error('ver
 
 const requiredEnvironmentVariables = parseArray('ACK3_TARGET_REQUIRED_ENVIRONMENT_JSON')
 const commands = parseArray('ACK3_TARGET_PREFLIGHT_COMMANDS_JSON')
-if (commands.length === 0) throw new Error('target preflight command list is empty')
+// With an optional build, a failed or empty baseline is recorded and the audit continues.
+const buildRequired = process.env.ACK3_TARGET_BUILD_REQUIRED !== 'false'
+if (commands.length === 0 && buildRequired) throw new Error('target preflight command list is empty')
 for (const name of requiredEnvironmentVariables) {
   if (!/^[A-Z][A-Z0-9_]{0,127}$/.test(name) || !process.env[name]) {
     throw new Error(`required target environment variable is missing: ${name}`)
@@ -53,6 +55,7 @@ const tools = {
   forge: version('forge'),
 }
 const baselines = []
+let buildPassed = true
 for (const [index, command] of commands.entries()) {
   const started = performance.now()
   const result = execute('/bin/bash', ['-c', command], 600_000)
@@ -69,7 +72,9 @@ for (const [index, command] of commands.entries()) {
   baselines.push(baseline)
   if (baseline.exitCode !== 0 || baseline.signal !== null || result.error !== undefined) {
     process.stderr.write(`${JSON.stringify(baseline)}\n`)
-    process.exit(1)
+    if (buildRequired) process.exit(1)
+    buildPassed = false
+    break // later commands usually depend on this one
   }
 }
 
@@ -80,4 +85,5 @@ process.stdout.write(`${JSON.stringify({
   tools,
   requiredEnvironmentVariables,
   baselines,
+  ...(buildRequired ? {} : { buildRequired: false, buildPassed: buildPassed && commands.length > 0 }),
 })}\n`)

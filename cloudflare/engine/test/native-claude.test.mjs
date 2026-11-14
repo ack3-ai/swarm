@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
-import { claudeOptions, runClaude } from '../container/claude-runner.mjs'
+import { claudeOptions, continuationPrompt, runClaude } from '../container/claude-runner.mjs'
 import { subscriptionWaits } from '../container/subscription-limits.mjs'
 import { claudeUsage } from '../container/claude-usage.mjs'
 import { claudeNativeSearchEvidence } from '../container/native-search-evidence.mjs'
@@ -17,6 +17,18 @@ const env = { PATH: process.env.PATH, HOME: '/workspace/home', CLAUDE_CODE_OAUTH
   CLAUDE_CODE_USE_BEDROCK: '1', CLAUDE_CODE_EXTRA_BODY: '{"thinking":"wrong"}' }
 const result = { type: 'result', subtype: 'success', is_error: false, session_id: 'native-session',
   usage: { input_tokens: 10, cache_read_input_tokens: 100, cache_creation_input_tokens: 20, output_tokens: 5 } }
+
+test('Claude caps foreground commands at the sealed command time limit and keeps the OOM hook', () => {
+  const hooked = { ...env, BASH_ENV: '/usr/local/lib/ack3/command-env.sh' }
+  const plain = claudeOptions(request, hooked)
+  assert.equal(plain.env.BASH_ENV, '/usr/local/lib/ack3/command-env.sh')
+  assert.equal(plain.env.BASH_MAX_TIMEOUT_MS, undefined)
+  assert.equal(plain.env.BASH_DEFAULT_TIMEOUT_MS, undefined)
+  const limited = claudeOptions({ ...request, commandTimeoutMs: 30 * 60_000 }, hooked)
+  assert.equal(limited.env.BASH_MAX_TIMEOUT_MS, '1800000')
+  assert.equal(limited.env.BASH_DEFAULT_TIMEOUT_MS, '120000')
+  assert.equal(claudeOptions({ ...request, commandTimeoutMs: 60_000 }, hooked).env.BASH_DEFAULT_TIMEOUT_MS, '60000')
+})
 
 test('Claude uses only the configured subscription and native session, without local hooks or extra tools', () => {
   const options = claudeOptions({ ...request, continuationMode: 'resume', sessionId: 'retained-session' }, env)
@@ -114,7 +126,11 @@ test('quota waits cross step slices and five hours, then resume the exact sessio
     return {
       async *[Symbol.asyncIterator]() {
         yield { type: 'system', subtype: 'init', session_id: 'quota-session' }
-        if (index === 0) actions++ // persisted tool result in this native session
+        if (index === 0) { // the model answered: a persisted tool result in this native session
+          actions++
+          yield { type: 'assistant', session_id: 'quota-session', message: { role: 'assistant',
+            content: [{ type: 'tool_use', id: 'read-1', name: 'Read', input: { file_path: 'proof.txt' } }] } }
+        }
         if (index < 2) {
           yield { type: 'rate_limit_event', session_id: 'quota-session',
             rate_limit_info: { status: 'rejected', utilization: 1.01, rateLimitType: 'five_hour', resetsAt: resetAt / 1000 } }
@@ -169,6 +185,64 @@ test('quota recovery refuses changed native identity and unrelated SDK errors', 
     failure === 'changed-session' ? /identity changed/ : failure === 'unrelated-close' ? /disk failure/
       : failure === 'unrelated-iterator' ? /transport failure/ : /returned an error result/)
   }
+})
+
+/** Fake SDK for the single-account wait: query N is rejected when N is in `rejected` (with the
+ * SDK's own `rate_limit` assistant message) and answers first when N is in `answered`. */
+function quotaScript(rejected, answered, queries, resetAt) {
+  return ({ prompt, options }) => {
+    const index = queries.length
+    queries.push({ prompt, resume: options.resume })
+    return {
+      async *[Symbol.asyncIterator]() {
+        yield { type: 'system', subtype: 'init', session_id: 'quota-session' }
+        if (answered.includes(index)) yield { type: 'assistant', session_id: 'quota-session',
+          message: { role: 'assistant', content: [{ type: 'text', text: 'Reading proof.txt.' }] } }
+        if (!rejected.includes(index)) { yield { ...result, session_id: 'quota-session' }; return }
+        yield { type: 'rate_limit_event', session_id: 'quota-session',
+          rate_limit_info: { status: 'rejected', utilization: 1, rateLimitType: 'five_hour', resetsAt: resetAt / 1000 } }
+        yield { type: 'assistant', error: 'rate_limit', session_id: 'quota-session',
+          message: { role: 'assistant', content: [{ type: 'text', text: 'You have hit your limit.' }] } }
+        yield { ...result, session_id: 'quota-session', is_error: true }
+        throw Object.assign(new Error('Claude Code returned an error result: limit'), { errorClass: 'error_result' })
+      }, close() {},
+    }
+  }
+}
+
+async function waitAndResume(input, rejected, answered) {
+  let clock = Date.parse('2026-01-01T00:00:00Z')
+  const resetAt = clock + 5 * 60 * 60_000
+  const queries = [], events = []
+  const code = await runClaude(input, env, quotaScript(rejected, answered, queries, resetAt),
+    event => events.push(event), () => {}, { now: () => clock, sleep: async ms => { clock += ms } })
+  return { code, queries, events, stdout: events.map(JSON.stringify).join('\n') }
+}
+
+test('one account rejected before the model answered resumes the same session with the task text after the wait (E12)', async () => {
+  const first = await waitAndResume(request, [0], [])
+  assert.equal(first.code, 0)
+  assert.deepEqual(first.queries, [{ prompt: request.prompt, resume: undefined },
+    { prompt: request.prompt, resume: 'quota-session' }])
+  // Query numbering, wait events and usage are unchanged.
+  assert.deepEqual(first.events.filter(event => event.type === 'claude_query_started').map(event => event.queryIndex), [0, 1])
+  assert.equal(first.events.filter(event => event.type === 'subscription_wait_started').length, 1)
+  assert.equal(subscriptionWaits(first.stdout).length, 1)
+  assert.equal(claudeUsage(first.stdout).rawInputTokens, 260)
+  assert.equal(claudeUsage(first.stdout).actorId, 'quota-session')
+  // Rejected again before any answer: the task text again.
+  assert.deepEqual((await waitAndResume(request, [0, 1], [])).queries.map(query => query.prompt),
+    [request.prompt, request.prompt, request.prompt])
+  // A correction turn rejected at once keeps its correction text.
+  const correction = { ...request, continuationMode: 'resume', sessionId: 'quota-session', prompt: 'Fix the output format.' }
+  const corrected = await waitAndResume(correction, [0], [])
+  assert.deepEqual(corrected.queries, [{ prompt: correction.prompt, resume: 'quota-session' },
+    { prompt: correction.prompt, resume: 'quota-session' }])
+  // Once the model has answered in this attempt, every later resume continues the session.
+  assert.deepEqual((await waitAndResume(request, [0, 1], [0])).queries.map(query => query.prompt),
+    [request.prompt, continuationPrompt, continuationPrompt])
+  assert.deepEqual((await waitAndResume(request, [0, 1], [1])).queries.map(query => query.prompt),
+    [request.prompt, request.prompt, continuationPrompt])
 })
 
 test('Claude query accounting retains known usage when a later query has no usage', () => {
@@ -252,7 +326,8 @@ for (const sdkError of [false, true]) test(`installed SDK quota result waits and
       assert.equal(args.options.resume, index === 0 ? undefined : 'retained-session')
       if (index > 0) {
         assert.ok(clock >= resetAt + 1000)
-        assert.notEqual(args.prompt, request.prompt)
+        // The rejected query got no model answer, so the resume sends the task text again.
+        assert.equal(args.prompt, request.prompt)
       }
       const native = sdk.query({ ...args, options: { ...args.options, cwd: dir,
         env: { ...args.options.env, HOME: dir, TEST_QUERY_INDEX: String(index) }, pathToClaudeCodeExecutable: cli } })

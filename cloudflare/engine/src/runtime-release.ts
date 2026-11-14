@@ -1,5 +1,4 @@
-import type { CheckpointBody, RunState, RuntimeRelease, RuntimeTransitionEvidence } from './contracts.js'
-import { sha256 } from './canonical.js'
+import type { RuntimeRelease } from './contracts.js'
 
 const runtimeIdPattern = /^[a-z0-9][a-z0-9-]{2,62}$/
 const bindingPattern = /^RUNTIME_[A-Z0-9_]{1,110}$/
@@ -88,39 +87,6 @@ export function sameRuntimeRelease(left: RuntimeRelease, right: RuntimeRelease):
     && left.containerImageDigest === right.containerImageDigest
 }
 
-export function assertRuntimeTransition(value: unknown): asserts value is RuntimeTransitionEvidence {
-  if (!record(value)) throw new TypeError('runtime transition must be an object')
-  exactKeys(value, ['sourceRunId', 'sourceStateGeneration', 'sourceStateDigest', 'checkpointDigest',
-    'sourceRuntimeRelease', 'targetRuntimeRelease', 'inheritedRecoveryDigest'], 'runtime transition')
-  assertRuntimeRelease(value.sourceRuntimeRelease)
-  assertRuntimeRelease(value.targetRuntimeRelease)
-  if (typeof value.sourceRunId !== 'string' || !/^[a-z0-9][a-z0-9._-]{0,99}$/.test(value.sourceRunId)
-    || !Number.isSafeInteger(value.sourceStateGeneration) || (value.sourceStateGeneration as number) < 1
-    || ['sourceStateDigest', 'checkpointDigest', 'inheritedRecoveryDigest'].some(key => (
-      typeof value[key] !== 'string' || !/^[0-9a-f]{64}$/.test(value[key])
-    )) || sameRuntimeRelease(value.sourceRuntimeRelease, value.targetRuntimeRelease)) {
-    throw new TypeError('runtime transition evidence is invalid')
-  }
-}
-
-export function inheritedRecoveryDigest(value: Pick<RunState | CheckpointBody,
-  'failedWaveRecovery' | 'terminalCompletionRecovery' | 'promotedExecutionProofs'>): Promise<string> {
-  return sha256({ failedWaveRecovery: value.failedWaveRecovery ?? null,
-    terminalCompletionRecovery: value.terminalCompletionRecovery ?? null,
-    promotedExecutionProofs: value.promotedExecutionProofs ?? [] })
-}
-
-export async function assertInheritedRuntimeTransition(value: Pick<RunState | CheckpointBody,
-  'runtimeRelease' | 'runtimeTransition' | 'failedWaveRecovery' | 'terminalCompletionRecovery' | 'promotedExecutionProofs'>): Promise<void> {
-  if (value.runtimeTransition === undefined) return
-  assertRuntimeTransition(value.runtimeTransition)
-  if (value.runtimeRelease === undefined
-    || !sameRuntimeRelease(value.runtimeRelease, value.runtimeTransition.targetRuntimeRelease)
-    || await inheritedRecoveryDigest(value) !== value.runtimeTransition.inheritedRecoveryDigest) {
-    throw new Error('runtime transition inherited evidence mismatch')
-  }
-}
-
 export function parseRuntimeCatalog(serialized: string | undefined): RuntimeCatalog {
   if (serialized === undefined || serialized === '') throw new TypeError('RUNTIME_CATALOG_JSON is required')
   const value: unknown = JSON.parse(serialized)
@@ -203,6 +169,10 @@ function fetcher(env: RuntimeEnv, entry: RuntimeCatalogEntry): Fetcher {
   return candidate as unknown as Fetcher
 }
 
+/** A successful identity observation disagreed with its immutable declaration.
+ * Transport and unavailable-slot errors deliberately remain ordinary errors. */
+export class RuntimeIdentityMismatch extends Error {}
+
 function assertCatalogMatch(entry: RuntimeCatalogEntry, release: RuntimeRelease): void {
   if (entry.schemaVersion !== release.schemaVersion
     || entry.id !== release.id
@@ -210,14 +180,14 @@ function assertCatalogMatch(entry: RuntimeCatalogEntry, release: RuntimeRelease)
     || entry.workerService !== release.workerService
     || entry.workflowName !== release.workflowName
     || entry.containerImageDigest !== release.containerImageDigest) {
-    throw new Error(`runtime release identity differs from its catalog: ${entry.id}`)
+    throw new RuntimeIdentityMismatch(`runtime release identity differs from its catalog: ${entry.id}`)
   }
 }
 
 function assertStableSlotMatch(entry: RuntimeCatalogEntry, release: RuntimeRelease): void {
   if (entry.id !== release.id || entry.workerService !== release.workerService
     || entry.workflowName !== release.workflowName) {
-    throw new Error(`runtime slot identity differs from its catalog: ${entry.id}`)
+    throw new RuntimeIdentityMismatch(`runtime slot identity differs from its catalog: ${entry.id}`)
   }
 }
 
@@ -268,7 +238,7 @@ export class RuntimeRouter {
     const entry = this.catalog.releases[id]!
     if (this.rotatingPool) {
       if (!sameRuntimeRelease(await this.slotRelease(id), release)) {
-        throw new Error(`runtime slot version differs from its current release: ${id}`)
+        throw new RuntimeIdentityMismatch(`runtime slot version differs from its current release: ${id}`)
       }
     } else {
       assertCatalogMatch(entry, release)
@@ -285,7 +255,7 @@ export class RuntimeRouter {
     const release: unknown = await response.json()
     assertRuntimeRelease(release)
     if (response.headers.get('x-ack3-runtime-worker-version') !== release.workerVersionId) {
-      throw new Error(`runtime release identity header differs: ${id}`)
+      throw new RuntimeIdentityMismatch(`runtime release identity header differs: ${id}`)
     }
     assertStableSlotMatch(entry, release)
     return release
@@ -334,4 +304,12 @@ export async function resolveRuntimeSelector(
   if (selector.mode === 'latest') return router.latest()
   if (!runtimeIdPattern.test(selector.id)) throw new TypeError('runtime selector id is invalid')
   return router.resolve(selector.id)
+}
+
+export function assertLocalRuntime(env: RuntimeEnv, expected: RuntimeRelease): RuntimeRelease {
+  const local = localRuntimeRelease(env)
+  if (!sameRuntimeRelease(local, expected)) {
+    throw new Error(`runtime release destination mismatch: expected ${expected.id}/${expected.workerVersionId}, got ${local.id}/${local.workerVersionId}`)
+  }
+  return local
 }

@@ -243,7 +243,8 @@ describe('experiment config compiler', () => {
   })
 
   it('expands the compact audit manifest into the exact executable topology', () => {
-    const body = compileExperimentConfig(document)
+    // The shared fixture keeps 16 waves so requests stay small; this checks the 64-wave maximum.
+    const body = compileExperimentConfig({ ...document, maxDiscoveryWaves: 64 })
     const discovery = body.definition.stages.find(stage => stage.kind === 'discovery')!
     expect(discovery.waves).toHaveLength(64)
     expect(body.definition.discoverySafetyCeiling).toBe(64)

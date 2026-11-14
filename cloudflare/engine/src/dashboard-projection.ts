@@ -1,3 +1,8 @@
+import { admissionPaused } from './run-control-state.js'
+import { providerBackoffUntil } from './provider-backoff.js'
+import { sumRecordedUsage as sumDashboardUsage, recordedUsageMatches } from './recorded-usage.js'
+export { sumRecordedUsage as sumDashboardUsage } from './recorded-usage.js'
+import { localUsageEvidence, type UsageEvidence } from './usage-evidence.js'
 import { dashboardContext } from './dashboard-context.js'
 import type { ArtifactRecord, ProviderUsage, RunState, TaskDefinition } from './contracts.js'
 import type { DashboardDefinition } from './dashboard-release.js'
@@ -7,6 +12,8 @@ import type {
 import { providerIdentity } from './provider-identity.js'
 import { dashboardThroughput, dashboardTiming } from './dashboard-timing.js'
 import { dashboardTaskBoundary, dashboardWaveViews, type DashboardRunState } from './dashboard-waves.js'
+import { blockedTasks } from './execution-failures.js'
+import { compareText } from './text-order.js'
 
 type Disposition = DashboardFinding['disposition']
 type Location = { task: TaskDefinition, stageId: string, waveId: string, stageIndex: number, waveIndex: number }
@@ -18,30 +25,7 @@ const taskKey = (stageId: string, waveId: string, taskId: string): string => JSO
 const referenceKey = (value: string): string | null => value.trim() === '' || value.trim().toLowerCase() === 'none'
   ? null : value.trim().toUpperCase()
 const providerFor = (task: TaskDefinition): string => providerIdentity(task)
-const numberEqual = (left: number, right: number): boolean => Math.abs(left - right) <= 1e-10
 
-/** Adds receipt counters without converting missing cache evidence into an attested cache miss. */
-export function sumDashboardUsage(items: readonly ProviderUsage[]): ProviderUsage {
-  const usage: ProviderUsage = { modelCalls: 0, inputTokens: 0, outputTokens: 0, costUsd: 0,
-    rawInputTokens: 0, cachedInputTokens: 0, cacheAccountingComplete: true,
-    costAccountingComplete: true }
-  for (const item of items) {
-    usage.modelCalls += item.modelCalls
-    usage.inputTokens += item.inputTokens
-    usage.outputTokens += item.outputTokens
-    usage.costUsd += item.costUsd
-    usage.rawInputTokens = (usage.rawInputTokens ?? 0) + (item.rawInputTokens ?? item.inputTokens)
-    usage.cachedInputTokens = (usage.cachedInputTokens ?? 0) + (item.cachedInputTokens ?? 0)
-    if ((item.modelCalls > 0 || item.inputTokens > 0 || item.outputTokens > 0)
-      && item.cacheAccountingComplete !== true) usage.cacheAccountingComplete = false
-    if (item.costAccountingComplete === false
-      || ((item.modelCalls > 0 || item.inputTokens > 0 || item.outputTokens > 0
-        || item.costUsd > 0 || (item.rawInputTokens ?? 0) > 0 || (item.cachedInputTokens ?? 0) > 0)
-        && item.costAccountingComplete !== true)) usage.costAccountingComplete = false
-  }
-  usage.costUsd = Number(usage.costUsd.toFixed(12))
-  return usage
-}
 
 export function buildDashboardSnapshot(
   state: DashboardRunState,
@@ -49,6 +33,7 @@ export function buildDashboardSnapshot(
   live: { entries: LiveCompletion[], legacyCount: number, truncated: boolean },
   generatedAt = new Date().toISOString(),
   inheritedReceipts: readonly DashboardCompletion[] = [],
+  usageEvidence: UsageEvidence = localUsageEvidence(state),
 ): DashboardSnapshot {
   const views = dashboardWaveViews(state, definition)
   const limitations = new Set([
@@ -60,7 +45,7 @@ export function buildDashboardSnapshot(
     'Verification is shown only when explicit structured outcomes exist; behavior and exploitability remain separate. Outcomes without observation IDs are archived group assessments and do not establish individual observation coverage. Missing verification, severity and distinct finding titles are not inferred from prose.',
     'Final custody includes unretained observations. Custody links remain visible, but only explicitly retained report references contribute to report-item metrics.',
     'Recorded provider cost is an estimate, not an invoice. Subscription tasks record zero incremental cost; native DSH counters cover recorded agent steps and may omit provider-side summary traffic.',
-    'This snapshot includes inherited checkpoint usage once. Adding parent and child run totals would count shared work again; revalidation can carry historical usage without a new provider call.',
+    'This snapshot includes inherited checkpoint usage once. Adding parent and child run totals would count shared work again. A continuation retains recorded usage for inherited work.',
     'Agent times measure elapsed time from wave admission to result receipt, including startup, queueing, retries and receipt delivery; they are not model execution durations. Awaiting-result clocks do not prove process activity. Stage spans include pauses. Missing historical or inherited receipt times remain unknown.',
     'Throughput is recorded input (including recorded cache hits) plus output per elapsed wall-clock second, with output shown separately. Parallel agents share the wave/stage span. Active or incomplete snapshots are partial; unvalidated receipts are provisional. This is an end-to-end average, not live model generation speed. Missing time or usage is unavailable, not zero.',
   ])
@@ -90,8 +75,15 @@ export function buildDashboardSnapshot(
     }
   }
   for (const agent of agentMap.values()) agent.role = text([...agentRoles.get(agent.id) ?? []].join(', '))
-  const locationFor = (item: { stageId: string, waveId: string, taskId: string }): Location | undefined =>
-    locations.get(taskKey(item.stageId, item.waveId, item.taskId))
+  const locationFor = (item: { stageId: string, waveId: string, taskId: string; execution?: ArtifactRecord['execution'] }): Location | undefined => {
+    const current = locations.get(taskKey(item.stageId, item.waveId, item.taskId))
+    const original = item.execution && definition.releases?.get(item.execution.releaseDigest)
+    const task = original?.stages.find(stage => stage.id === item.stageId)?.waves
+      .find(wave => wave.id === item.waveId)?.tasks.find(task => task.id === item.taskId)
+    if (task === undefined) return current
+    return { task, stageId: item.stageId, waveId: current?.waveId ?? item.waveId,
+      stageIndex: current?.stageIndex ?? -1, waveIndex: current?.waveIndex ?? -1 }
+  }
   const usageRows = [...state.artifacts.map(item => ({ ...item, kind: 'artifact' as const })),
     ...state.rejectedAttempts.map(item => ({ ...item, kind: 'rejection' as const }))]
   const activity = new Map<string, DashboardSnapshot['activity'][number]>()
@@ -101,7 +93,16 @@ export function buildDashboardSnapshot(
       limitations.add('Some recorded tasks are absent from the supplied definition; their usage remains in run totals and source attribution is unknown.')
       continue
     }
-    const agent = agentMap.get(location.task.workspaceKey)!
+    let agent = agentMap.get(location.task.workspaceKey)
+    if (agent === undefined) {
+      agent = { id: location.task.workspaceKey, model: location.task.model, provider: providerFor(location.task),
+        role: location.task.logicalRole, usage: sumDashboardUsage([]), acceptedTasks: 0, rejectedAttempts: 0,
+        observations: 0, linkedReportItems: 0, firstRecordedItems: 0 }
+      agentMap.set(agent.id, agent)
+    } else if (agent.model !== location.task.model || agent.provider !== providerFor(location.task)) {
+      agent.model = agent.model === location.task.model ? agent.model : 'mixed'
+      agent.provider = agent.provider === providerFor(location.task) ? agent.provider : 'mixed'
+    }
     agent.usage = sumDashboardUsage([agent.usage, row.usage])
     const key = taskKey(row.stageId, location.waveId, agent.id)
     const group = activity.get(key) ?? { stageId: row.stageId, waveId: location.waveId, agentId: agent.id, usage: sumDashboardUsage([]) }
@@ -111,13 +112,22 @@ export function buildDashboardSnapshot(
     else if (row.kind === 'artifact' && row.status === 'accepted') agent.acceptedTasks += 1
   }
   const reconstructedUsage = sumDashboardUsage(usageRows.map(row => row.usage))
-  const accountingMatches = (['modelCalls', 'inputTokens', 'outputTokens', 'costUsd'] as const)
-    .every(key => numberEqual(reconstructedUsage[key], state.budget[key]))
+  const accountingMatches = recordedUsageMatches(reconstructedUsage, state.budget)
   if (!accountingMatches) {
     limitations.add('Receipt sums differ from the authoritative state budget; run totals use the recorded budget and grouped totals use available receipts.')
   }
   const recordedUsage = accountingMatches ? { ...reconstructedUsage, ...state.budget }
     : { ...state.budget, cacheAccountingComplete: false, costAccountingComplete: false }
+  if (!usageEvidence.costAccountingComplete) recordedUsage.costAccountingComplete = false
+  if (!usageEvidence.cacheAccountingComplete) recordedUsage.cacheAccountingComplete = false
+  if (!usageEvidence.costAccountingComplete || !usageEvidence.cacheAccountingComplete) {
+    limitations.add('Some recorded or inherited receipts have incomplete pricing or cache accounting. Selecting an earlier checkpoint does not remove that uncertainty from inherited usage.')
+  }
+  if (!usageEvidence.historyComplete || usageEvidence.interruptions.length > 0) {
+    recordedUsage.costAccountingComplete = false
+    recordedUsage.cacheAccountingComplete = false
+    limitations.add('Interrupted or unavailable inherited work may have unreported model usage. Recorded token and cost totals are incomplete; successful continuation and physical cleanup do not settle missing usage.')
+  }
 
   const terminalTasks = new Set(state.artifacts.map(item => taskKey(item.stageId, item.waveId, item.taskId)))
   const rejectedKeys = new Set(state.rejectedAttempts.filter(item => item.outputDigest !== null).map(item => JSON.stringify([
@@ -130,7 +140,7 @@ export function buildDashboardSnapshot(
   const provisionalCompletions = [...uniqueLive.values()]
     .filter(entry => !terminalTasks.has(taskKey(entry.stageId, entry.waveId, entry.taskId))
     && !rejectedKeys.has(JSON.stringify([entry.stageId, entry.waveId, entry.taskId, entry.promptDigest, entry.attempt, entry.outputDigest])))
-    .sort((left, right) => left.recordedAt.localeCompare(right.recordedAt) || left.requestDigest.localeCompare(right.requestDigest))
+    .sort((left, right) => compareText(left.recordedAt, right.recordedAt) || compareText(left.requestDigest, right.requestDigest))
     .map(entry => ({ ...entry, usage: { ...entry.usage } }))
   if (live.legacyCount > 0) limitations.add('Legacy execution receipts lack dashboard metadata; their provisional usage and task attribution are unavailable.')
   if (live.truncated) limitations.add('Execution receipt listing is truncated. Provisional totals cover only the listed receipts.')
@@ -412,7 +422,7 @@ export function buildDashboardSnapshot(
       confirmation: verification.length === 0 ? 'not-recorded' : 'axes-recorded', verification, severity: 'not-recorded', earliestWave,
       firstContributors: [...firstContributors].sort(), contributors: [...contributors].sort(), observationIds,
       nodeIds: [...finding.nodeIds].sort(), dissent: finding.dissent }
-  }).sort((left, right) => left.id.localeCompare(right.id))
+  }).sort((left, right) => compareText(left.id, right.id))
   const endedStages = new Set(state.stageEndReceipts.map(receipt => receipt.stageIndex))
   const stages: DashboardSnapshot['stages'] = definition.stages.map((stage, stageIndex) => ({
     id: stage.id, kind: stage.kind, label: text(stage.objective || stage.id),
@@ -427,6 +437,19 @@ export function buildDashboardSnapshot(
   const rejectionsByTask = new Map<string, RunState['rejectedAttempts'][number][]>()
   const liveByTask = new Map<string, LiveCompletion[]>()
   const allReceiptsByTask = new Map<string, DashboardCompletion[]>()
+  const blocked = new Map(blockedTasks(state as RunState).map(item => [item.taskId, item]))
+  const admittedTasks = new Map<string, TaskDefinition>()
+  for (const admission of [...(state.discoveryScheduler?.admissions ?? []),
+    ...(state.waveAdmission == null ? [] : [state.waveAdmission]), ...state.waveReceipts]) {
+    for (const occurrence of 'taskOccurrences' in admission ? admission.taskOccurrences ?? [] : []) {
+      const releaseDigest = occurrence.configuration?.releaseDigest
+      const release = definition.releases?.get(releaseDigest)
+        ?? (releaseDigest === state.releaseDigest ? definition : undefined)
+      const pinned = release?.stages.find(stage => stage.id === admission.stageId)?.waves
+        .find(wave => wave.id === admission.waveId)?.tasks.find(task => task.id === occurrence.taskId)
+      if (pinned !== undefined) admittedTasks.set(taskKey(admission.stageId, admission.waveId, occurrence.taskId), pinned)
+    }
+  }
   for (const item of [...uniqueLive.values(), ...inheritedReceipts]) {
     const key = taskKey(item.stageId, item.waveId, item.taskId)
     const group = allReceiptsByTask.get(key) ?? []
@@ -447,12 +470,14 @@ export function buildDashboardSnapshot(
   }
   function taskProgress(stageId: string, waveId: string, task: TaskDefinition, waveStatus: DashboardSnapshot['waves'][number]['status'], startedAt: string | null, completedAt: string | null, singleTaskReceipt?: RunState['waveReceipts'][number]): DashboardWaveTask {
     const key = taskKey(stageId, waveId, task.id)
+    const selectedTask = admittedTasks.get(key) ?? task
     const artifact = artifactsByTask.get(key)
     const rejections = rejectionsByTask.get(key) ?? []
     // Recovery carries old usage/rejections but restarts attempt numbering. Only
     // evidence from this wave admission may decide the current execution status.
-    const currentRejections = rejections.filter(item => startedAt === null || Date.parse(item.rejectedAt) >= Date.parse(startedAt))
-    const completions = (liveByTask.get(key) ?? []).filter(item => startedAt === null || Date.parse(item.recordedAt) >= Date.parse(startedAt))
+    const currentStart = startedAt
+    const currentRejections = rejections.filter(item => currentStart === null || currentStart === undefined || Date.parse(item.rejectedAt) >= Date.parse(currentStart))
+    const completions = (liveByTask.get(key) ?? []).filter(item => currentStart === null || currentStart === undefined || Date.parse(item.recordedAt) >= Date.parse(currentStart))
     const inFlight = state.inFlightAgentAttempts?.find(item => taskKey(item.stageId, item.waveId, item.taskId) === key)
     const latest = completions.at(-1)
     const lastRejectedAttempt = Math.max(0, ...currentRejections.map(item => item.attempt))
@@ -463,8 +488,10 @@ export function buildDashboardSnapshot(
     else if (waveStatus === 'current' && inFlight && inFlight.attempt > lastObservedAttempt) {
       status = state.status === 'running' ? 'awaiting-result' : 'interrupted'
     }
+    else if (blocked.has(task.id) && waveStatus === 'current') status = 'blocked'
     else if (completions.some(item => item.attempt >= lastRejectedAttempt)) status = 'returned'
     else if (currentRejections.length > 0) status = 'rejected'
+    else if (waveStatus === 'current' && admissionPaused(state, stageId, [selectedTask])) status = 'paused'
     else if (waveStatus === 'not-run') status = 'not-run'
     else if (waveStatus === 'complete') status = 'unknown'
     else if (waveStatus === 'current' && state.status === 'running') status = 'awaiting-result'
@@ -472,25 +499,28 @@ export function buildDashboardSnapshot(
     else if (state.status === 'failed' || state.status === 'stopped') status = 'not-run'
     else status = 'pending'
     // Accepted receipt timing survives accounting deduplication. Do not use another
-    // attempt's return time, a later wave in the same workspace, or a child's revalidation.
+    // attempt's return time, a later wave in the same workspace, or a child's inherited work.
     const matchingReceipts = (allReceiptsByTask.get(key) ?? []).filter(item => (
-      item.model === task.model && item.provider === providerFor(task)
+      item.model === (artifact?.model ?? selectedTask.model) && item.provider === (artifact?.provider ?? providerFor(selectedTask))
       && Date.parse(item.recordedAt) >= Date.parse(item.originTiming?.startedAt ?? startedAt ?? '')
       && Date.parse(item.recordedAt) <= Date.parse(item.originTiming?.endedAt ?? completedAt ?? generatedAt)
       && (artifact === undefined || (item.outputDigest === artifact.contentDigest && item.promptDigest === artifact.promptDigest && item.actorId === artifact.actorId))
-    )).sort((a, b) => b.attempt - a.attempt || a.recordedAt.localeCompare(b.recordedAt))
+    )).sort((a, b) => b.attempt - a.attempt || compareText(a.recordedAt, b.recordedAt))
     const returnedAt = artifact?.status === 'additive-unavailable' ? null : matchingReceipts[0]?.recordedAt ?? null
     const rejectedAt = [...currentRejections].sort((a, b) => b.attempt - a.attempt)[0]?.rejectedAt ?? null
+    // A provider-side failure: the next launch waits (P2-06).
+    const backoffUntil = status === 'rejected' ? providerBackoffUntil(currentRejections) : null
+    const backoffSignature = [...currentRejections].sort((a, b) => b.attempt - a.attempt)[0]?.providerBackoff?.signature
     // Supervisor steps have no provider receipt. A sealed, single-task wave gives
     // their measured boundary (including persistence), not model execution time.
-    const supervisorReceipt = task.providerClass === 'deterministic' && status === 'accepted' && returnedAt === null
+    const supervisorReceipt = selectedTask.providerClass === 'deterministic' && status === 'accepted' && returnedAt === null
       && artifact && singleTaskReceipt?.artifactDigests.includes(artifact.contentDigest) ? singleTaskReceipt : undefined
-    const rejectionTiming = status === 'rejected' || (status === 'unavailable' && rejectedAt !== null)
+    const rejectionTiming = status === 'rejected' || status === 'blocked' || (status === 'unavailable' && rejectedAt !== null)
     const finishedAt = status === 'accepted' || status === 'returned' ? returnedAt
       : rejectionTiming ? rejectedAt : status === 'interrupted' ? state.updatedAt : null
     const measuredStart = status === 'accepted' && matchingReceipts[0]?.originTiming
       ? matchingReceipts[0].originTiming.startedAt
-      : rejectionTiming || ['accepted', 'returned', 'awaiting-result', 'interrupted'].includes(status) ? startedAt : null
+      : rejectionTiming || ['accepted', 'returned', 'awaiting-result', 'interrupted'].includes(status) ? currentStart : null
     const timing = supervisorReceipt
       ? dashboardTiming(supervisorReceipt.startedAt, supervisorReceipt.completedAt, false, generatedAt, 'single-task-wave')
       : dashboardTiming(measuredStart, finishedAt, status === 'awaiting-result', generatedAt,
@@ -499,15 +529,20 @@ export function buildDashboardSnapshot(
     const usage = sumDashboardUsage([...rejections.map(item => item.usage), ...(artifact ? [artifact.usage] : [])])
     const provisionalUsage = sumDashboardUsage(completions.map(item => item.usage))
     return {
-      taskId: task.id, agentId: task.workspaceKey, model: task.model, provider: providerFor(task),
-      ...(typeof task.modelPool === 'string' ? { modelPool: task.modelPool } : {}),
-      ...(Number.isSafeInteger(task.research?.wave) ? { localWave: task.research!.wave } : {}),
-      promptKind: task.promptKind, providerClass: task.providerClass,
-      ...(Number.isSafeInteger(task.research?.researcher) ? { researcher: task.research!.researcher } : {}),
-      role: text(task.research?.role ?? task.logicalRole), status,
-      workspace: task.providerClass === 'deterministic' ? undefined : { key: task.workspaceKey, policy: task.workspaceMode },
+      taskId: task.id, agentId: task.workspaceKey,
+      model: artifact?.model ?? selectedTask.model, provider: artifact?.provider ?? providerFor(selectedTask),
+      required: selectedTask.optional !== true,
+      ...(typeof selectedTask.modelPool === 'string' ? { modelPool: selectedTask.modelPool } : {}),
+      ...(Number.isSafeInteger(selectedTask.research?.wave) ? { localWave: selectedTask.research!.wave } : {}),
+      promptKind: selectedTask.promptKind, providerClass: selectedTask.providerClass,
+      ...(Number.isSafeInteger(selectedTask.research?.researcher) ? { researcher: selectedTask.research!.researcher } : {}),
+      role: text(selectedTask.research?.role ?? selectedTask.logicalRole), status,
+      ...(status === 'blocked' ? { statusDetail: blocked.get(task.id)!.message } : {}),
+      ...(backoffUntil !== null && backoffUntil > Date.parse(generatedAt)
+        ? { statusDetail: `Provider backoff until ${new Date(backoffUntil).toISOString()} (${backoffSignature})` } : {}),
+      workspace: selectedTask.providerClass === 'deterministic' ? undefined : { key: selectedTask.workspaceKey, policy: selectedTask.workspaceMode },
       lastAttempt: (Math.max(latestAttempt, matchingReceipts[0]?.attempt ?? 0) || null), lastReceiptAt: returnedAt ?? latest?.recordedAt ?? null,
-      context: task.providerClass === 'deterministic' ? undefined : dashboardContext(matchingReceipts[0]?.originTiming && matchingReceipts[0].originTiming.runId !== state.runId ? { journal: [] } : state, {
+      context: selectedTask.providerClass === 'deterministic' ? undefined : dashboardContext(matchingReceipts[0]?.originTiming && matchingReceipts[0].originTiming.runId !== state.runId ? { journal: [] } : state, {
         stageId, waveId, taskId: task.id, attempt: (Math.max(latestAttempt, matchingReceipts[0]?.attempt ?? 0) || undefined),
         promptDigest: inFlight?.promptDigest ?? artifact?.promptDigest ?? latest?.promptDigest,
         actorId: artifact?.actorId ?? (inFlight ? undefined : latest?.actorId),
@@ -575,8 +610,23 @@ export function buildDashboardSnapshot(
     run: { id: state.runId, experimentId: state.experimentId, status: state.status, phase: state.phase,
       rootRunId: state.rootRunId, parentRunId: state.parentRunId, recoveryEpoch: state.recoveryEpoch,
       stateGeneration: state.stateGeneration, updatedAt: state.updatedAt, createdAt: state.createdAt,
-      terminalReason: state.terminalReason },
-    recordedUsage, provisionalUsage: sumDashboardUsage(provisionalCompletions.map(entry => entry.usage)), stages, waves,
+      terminalReason: state.terminalReason,
+      ...(state.forkOrigin === undefined ? {} : { fork: { sourceRunId: state.forkOrigin.source.runId,
+        sourceGeneration: state.forkOrigin.source.state.generation,
+        sourceDigest: state.forkOrigin.source.state.digest,
+        ...('savedWorkDigest' in state.forkOrigin && typeof state.forkOrigin.savedWorkDigest === 'string'
+          ? { savedWorkDigest: state.forkOrigin.savedWorkDigest } : {}),
+        boundary: 'sourceFrontier' in state.forkOrigin && state.forkOrigin.sourceFrontier === true ? 'saved source frontier'
+          : state.forkOrigin.stageId !== undefined ? `from ${state.forkOrigin.stageId}`
+            : `checkpoint ${state.forkOrigin.checkpointDigest}` } }) },
+    control: { revision: state.controls?.revision ?? 0, pauses: state.controls?.pauses ?? [],
+      lastOutcome: state.controls === undefined ? null : { commandId: state.controls.lastReceipt.commandId,
+        status: state.controls.lastReceipt.outcome.status,
+        ...(state.controls.lastReceipt.outcome.status === 'applied' ? {}
+          : { detail: state.controls.lastReceipt.outcome.detail.message }) },
+      blockedTasks: [...blocked.values()] },
+    recordedUsage, accountingUncertain: !usageEvidence.historyComplete || usageEvidence.interruptions.length > 0,
+    provisionalUsage: sumDashboardUsage(provisionalCompletions.map(entry => entry.usage)), stages, waves,
     agents: [...agentMap.values()], activity: [...activity.values()], findings: projectedFindings, nodes: [...nodes.values()], edges: [...edges.values()], provisionalCompletions,
     freshness: { recordedAt: state.updatedAt, liveReceipts: uniqueLive.size, legacyReceipts: live.legacyCount,
       receiptsTruncated: live.truncated, inFlightTokensKnown: false }, limitations: [...limitations] }

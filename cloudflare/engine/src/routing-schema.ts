@@ -1,3 +1,5 @@
+import { STATE_SELECTION_SQL } from './state-selection.js'
+
 // Created on demand by the store and emitted by tools/runtime-slot-seed.ts, which
 // bootstraps the slot pool before the front door has served a routed request.
 // Routing checks the run index, so a fresh database gets it here too.
@@ -72,16 +74,6 @@ export const ROUTING_SCHEMA_SQL: readonly string[] = [
     proof_digest TEXT NOT NULL,
     retired_at TEXT NOT NULL
   )`,
-  `CREATE TABLE IF NOT EXISTS retained_native_workspace_claims (
-    source_run_id TEXT NOT NULL,
-    workspace_key TEXT NOT NULL,
-    child_run_id TEXT NOT NULL,
-    source_state_digest TEXT NOT NULL,
-    snapshot_digest TEXT NOT NULL,
-    sandbox_object_id TEXT NOT NULL,
-    claimed_at TEXT NOT NULL,
-    PRIMARY KEY(source_run_id, workspace_key)
-  )`,
   `CREATE TABLE IF NOT EXISTS audit_execution_authority (
     audit_id TEXT NOT NULL,
     epoch INTEGER NOT NULL CHECK(epoch >= 0),
@@ -116,5 +108,9 @@ export const ROUTING_SCHEMA_SQL: readonly string[] = [
     operation_digest TEXT NOT NULL,
     PRIMARY KEY(audit_id, command_id, version),
     UNIQUE(audit_id, revision, version)
+  )`,
+  ...STATE_SELECTION_SQL,
+  `CREATE TABLE IF NOT EXISTS execution_bootstrap (
+    run_id TEXT PRIMARY KEY, authority_json TEXT NOT NULL, state_key TEXT NOT NULL
   )`,
 ]

@@ -38,7 +38,11 @@ describe('audit0 protocol contracts', () => {
     expect(audit0Definition.stages.map(stage => stage.kind)).toEqual([
       'preflight', 'discovery', 'synthesis', 'coverage', 'negative-review', 'verification', 'reporting',
     ])
-    const discovery = audit0Definition.stages[1]!
+    expect(audit0Definition.stages[1]!.waves).toHaveLength(16)
+    // The shared fixture keeps 16 waves so requests stay small; check every wave at the 64-wave maximum.
+    const maximum = compileExperimentConfig({ ...document, maxDiscoveryWaves: 64 }).definition
+    validateExperiment(maximum)
+    const discovery = maximum.stages[1]!
     expect(discovery.waves).toHaveLength(64)
     for (const [waveNumber, wave] of discovery.waves.entries()) {
       expect(wave.tasks.filter(task => task.providerClass === 'core')).toHaveLength(3)
@@ -47,7 +51,7 @@ describe('audit0 protocol contracts', () => {
       expect(replicas.map(task => task.research?.researcher)).toEqual([1, 2, 3])
       for (let researcher = 1; researcher <= 3; researcher += 1) {
         expect(wave.tasks.find(task => task.research?.researcher === researcher && task.providerClass === 'core')?.research)
-          .toMatchObject(expectedResearchAssignment(waveNumber, researcher))
+          .toMatchObject(expectedResearchAssignment(waveNumber, researcher, maximum))
       }
     }
     expect(audit0Definition.stages.flatMap(stage => stage.waves).flatMap(wave => wave.tasks)

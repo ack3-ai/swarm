@@ -4,7 +4,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 // @ts-expect-error The operator entry point is intentionally plain Node.js.
-import { assertCodexIdentity, assertUnpublishedRuntimeVersions } from '../tools/deploy-runtime.mjs'
+import { assertCodexIdentity, assertUnpublishedRuntimeVersions, assertRuntimeCoordinatorBinding } from '../tools/deploy-runtime.mjs'
+
+const terminalBindings = {
+  durable_objects: { bindings: [{ name: 'COORDINATORS', class_name: 'ExperimentCoordinator' }] },
+  migrations: [{ tag: 'v3', new_sqlite_classes: ['ExperimentCoordinator'] }],
+}
 
 const workspaceId = '11111111-2222-3333-4444-555555555555'
 const accountEmail = 'codex-service@example.com'
@@ -32,6 +37,15 @@ describe('immutable runtime deployment guard', () => {
     ]) expect(() => assertCodexIdentity(invalid, workspaceId, accountEmail)).toThrow('must belong to the configured account')
   })
 
+  it('rejects stale, missing or cross-worker coordinator configs', () => {
+    expect(() => assertRuntimeCoordinatorBinding(terminalBindings)).not.toThrow()
+    for (const invalid of [{}, { ...terminalBindings, migrations: [] },
+      { ...terminalBindings, durable_objects: { bindings: [] } },
+      { ...terminalBindings, durable_objects: { bindings: [{ name: 'COORDINATORS', class_name: 'ExperimentCoordinator', script_name: 'front-door' }] } },
+      { ...terminalBindings, durable_objects: { bindings: [...terminalBindings.durable_objects.bindings, ...terminalBindings.durable_objects.bindings] } },
+    ]) expect(() => assertRuntimeCoordinatorBinding(invalid)).toThrow('local coordinator binding and v3 migration')
+  })
+
   it('allows only a Worker identity with no published versions', () => {
     expect(() => assertUnpublishedRuntimeVersions([])).not.toThrow()
     expect(() => assertUnpublishedRuntimeVersions([{ id: 'existing-version' }]))
@@ -53,7 +67,7 @@ describe('immutable runtime deployment guard', () => {
     ].map(([binding, secret_name]) => ({ binding, secret_name, store_id: storeId }))
     try {
       writeFileSync(join(engine, config), JSON.stringify({
-        name: 'swarm-test-cloud-store', vars: { ENGINE_ROLE: 'runtime', ACK3_CODEX_WORKSPACE_ID: workspaceId },
+        ...terminalBindings, name: 'swarm-test-cloud-store', vars: { ENGINE_ROLE: 'runtime', ACK3_CODEX_WORKSPACE_ID: workspaceId },
         secrets: { required: [] }, secrets_store_secrets: bindings,
       }))
       writeFileSync(join(root, 'pnpm'), `#!/usr/bin/env node
@@ -75,6 +89,12 @@ if (process.argv.includes('versions')) process.stdout.write('[]')
       expect(existsSync(capture)).toBe(false)
       expect(() => run(JSON.stringify(auth()), '')).toThrow()
       expect(existsSync(capture)).toBe(false)
+      const validConfig = readFileSync(join(engine, config), 'utf8')
+      const staleConfig = JSON.parse(validConfig); delete staleConfig.durable_objects
+      writeFileSync(join(engine, config), JSON.stringify(staleConfig))
+      expect(() => run(JSON.stringify(auth()))).toThrow('local coordinator binding and v3 migration')
+      expect(existsSync(capture)).toBe(false)
+      writeFileSync(join(engine, config), validConfig)
       run(JSON.stringify(auth()))
       const calls = readFileSync(capture, 'utf8').trim().split('\n').map(line => JSON.parse(line) as string[])
       const deploy = calls.find(call => call.includes('deploy'))!
@@ -90,7 +110,7 @@ process.stdout.write('[{"id":"already-published"}]')
       rmSync(capture)
       for (const invalidBindings of [[], bindings.slice(1), bindings.map(b => ({ ...b, store_id: '' }))]) {
         writeFileSync(join(engine, config), JSON.stringify({
-          name: 'swarm-test-cloud-store', vars: { ENGINE_ROLE: 'runtime', ACK3_CODEX_WORKSPACE_ID: workspaceId },
+          ...terminalBindings, name: 'swarm-test-cloud-store', vars: { ENGINE_ROLE: 'runtime', ACK3_CODEX_WORKSPACE_ID: workspaceId },
           secrets_store_secrets: invalidBindings,
         }))
         expect(() => run(JSON.stringify(auth()))).toThrow()
@@ -106,7 +126,7 @@ require('node:fs').appendFileSync(process.env.ACK3_TEST_CAPTURE, JSON.stringify(
 if (process.argv.includes('versions')) process.stdout.write('[]')
 `)
       const withoutCodex = (secrets: typeof bindings) => writeFileSync(join(engine, config), JSON.stringify({
-        name: 'swarm-test-cloud-store', vars: { ENGINE_ROLE: 'runtime', ACK3_CODEX_WORKSPACE_ID: '' },
+        ...terminalBindings, name: 'swarm-test-cloud-store', vars: { ENGINE_ROLE: 'runtime', ACK3_CODEX_WORKSPACE_ID: '' },
         secrets: { required: [] }, secrets_store_secrets: secrets,
       }))
       withoutCodex(bindings)

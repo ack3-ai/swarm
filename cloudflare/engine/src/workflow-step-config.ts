@@ -4,12 +4,6 @@ export const workflowAttemptTimeoutMs = 30 * 60_000
 // the admitted process and exact paid-request receipt remain authoritative.
 export const agentProcessWaitSliceMs = 2 * 60_000
 
-export function workflowBootstrapProgress<T>(result: T | ({ progress: T } & Record<string, unknown>)): T {
-  return result !== null && typeof result === 'object' && 'progress' in result
-    ? result.progress
-    : result
-}
-
 export function waveStepConfig() {
   return {
     // These retries cover only transient transport failures in one bounded
