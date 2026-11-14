@@ -1,15 +1,19 @@
+import { admittedProviderRequest } from './support/admitted-provider-request.js'
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, realpathSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, renameSync, writeFileSync, existsSync, rmSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
-import { afterEach, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { canonicalJson, sha256 } from '../src/canonical.js'
 import { compileExperimentConfig } from './support/compile-config.js'
 import { SandboxAgentProvider } from '../src/sandbox-provider.js'
 import manifest from './fixtures/audit0-hello-vault.json' with { type: 'json' }
 
 vi.mock('../src/agent-sandbox-client.js', () => ({ getAgentSandbox: vi.fn() }))
+
+const closeDatabases: (() => void)[] = []
+afterEach(() => closeDatabases.splice(0).forEach(close => close()))
 
 const script = new URL('../container/prepare-workspace.mjs', import.meta.url)
 const roots: string[] = []
@@ -72,6 +76,17 @@ it('prepares once without passing provider credentials and preserves continuatio
     .toContain('archive without Git history')
 })
 
+it('notes an optional baseline build in the workspace facts', async () => {
+  const optional = fixture(['true'])
+  expect((await run(optional, { ACK3_BUILD_REQUIRED: 'false' })).status).toBe(0)
+  expect(readFileSync(resolve(optional.root, 'control', 'workspace-environment.md'), 'utf8'))
+    .toContain('The baseline build is optional for this audit')
+  const required = fixture(['true'])
+  expect((await run(required)).status).toBe(0)
+  expect(readFileSync(resolve(required.root, 'control', 'workspace-environment.md'), 'utf8'))
+    .not.toContain('baseline build is optional')
+})
+
 it('never marks a failed command ready and rejects profile or source mutation', async () => {
   const failed = fixture(['false'])
   expect((await run(failed)).status).not.toBe(0)
@@ -85,6 +100,19 @@ it('never marks a failed command ready and rejects profile or source mutation', 
   changed.profile.commands[0] = 'echo ready > prepared.log'
   writeFileSync(resolve(changed.root, 'source', 'package-lock.json'), '{"lockfileVersion":2}\n')
   expect((await run(changed)).status).not.toBe(0)
+})
+
+it('runs again in place after a failed try whose failure file was set aside (E10)', async () => {
+  // A flaky command: fails once, then succeeds, like a registry timeout.
+  const flaky = fixture(['if [ -f retried.flag ]; then echo ok; else touch retried.flag; exit 1; fi'])
+  const failure = resolve(flaky.root, 'private', `workspace-preparation-failure-${'c'.repeat(64)}.json`)
+  expect((await run(flaky)).status).not.toBe(0)
+  expect(JSON.parse(readFileSync(failure, 'utf8'))).toMatchObject({ status: 'failed', code: 'exit-1' })
+  renameSync(failure, failure.replace(/\.json$/, '.try-1.json'))
+  expect((await run(flaky)).status).toBe(0)
+  expect(existsSync(failure)).toBe(false)
+  expect(JSON.parse(readFileSync(resolve(flaky.root, 'private', 'workspace-prepared.json'), 'utf8')))
+    .toMatchObject({ status: 'prepared' })
 })
 
 it('terminates background setup work after an output-limit failure', async () => {
@@ -268,6 +296,8 @@ it('persists a failed setup receipt before reporting a terminal preflight failur
   Object.assign(provider, {
     runs: { getRelease: async () => ({ body: { definition } }) },
     executionLogs: { putWorkspacePreparationFailure },
+    // A failed command is retried in place twice first (E10); no real waits here.
+    preparationSleep: async () => {},
   })
   const receipt = { schemaVersion: 1, status: 'failed', commit: definition.target.commit,
     tree: definition.target.tree, profileDigest, requestDigest: 'b'.repeat(64),
@@ -319,6 +349,7 @@ it('reattaches to a failed pre-process claim and saves diagnostics after an R2 o
       claimStart: async () => ({ acquired: ++claims === 1, claimedAt: new Date().toISOString() }),
     },
     executionLogs: { putWorkspacePreparationFailure },
+    preparationSleep: async () => {},
   })
   const startProcess = vi.fn(async () => { throw new Error('must not start model') })
   const sandbox = {
@@ -340,18 +371,121 @@ it('reattaches to a failed pre-process claim and saves diagnostics after an R2 o
       return { success: true }
     },
   }
-  const prompt = 'Synthetic task with no model launch'
-  const request = { runId: 'synthetic-setup', experimentId: 'synthetic-setup', releaseDigest: 'a'.repeat(64),
-    stage: { id: 'discovery' }, wave: { id: 'wave-0' },
-    task: { id: 'research-1', workspaceKey: 'lane-1', providerClass: 'core', promptKind: 'research',
-      model: 'fixture', reasoning: 'none', output: { requiredFiles: ['result.txt'] } },
-    prompt, promptDigest: await sha256(prompt), attempt: 1, visibleArtifacts: [],
-    repairFiles: {}, diagnostics: [], freshContext: true, continuationMode: 'new', sessionId: null }
+  const request = await admittedProviderRequest(provider, close => closeDatabases.push(close), 'research', {
+    configure: body => { body.definition.target.runtime.workspacePreparation = profile },
+  })
   await expect((provider as any).runInSandbox(sandbox, request))
     .rejects.toMatchObject({ name: 'TransientRunFailure' })
   await expect((provider as any).runInSandbox(sandbox, request))
     .rejects.toMatchObject({ category: 'preflight-failed' })
-  expect(preparations).toBe(1)
+  // Three tries in the first launch step (E10); the reattach never prepares again.
+  expect(preparations).toBe(3)
   expect(putWorkspacePreparationFailure).toHaveBeenCalledTimes(2)
   expect(startProcess).not.toHaveBeenCalled()
+})
+
+describe('a failed preparation command is retried in place (E10)', () => {
+  const digestB = 'b'.repeat(64)
+  const failurePath = `/workspace/private/workspace-preparation-failure-${digestB}.json`
+  async function retrySetup(outcomes: boolean[]) {
+    const definition = compileExperimentConfig(manifest).definition
+    const profile = { schemaVersion: 1 as const, workingDirectory: '.', commands: ['npm ci --ignore-scripts'],
+      integrityFiles: [{ path: 'package-lock.json', sha256: 'a'.repeat(64) }] }
+    definition.target.runtime.workspacePreparation = profile
+    const profileDigest = await sha256(canonicalJson(profile))
+    const putWorkspacePreparationFailure = vi.fn(async (_input: { content: string }) => {})
+    const waits: number[] = []
+    const provider = new SandboxAgentProvider({ ACK3_CODEX_AUTH_JSON: 'synthetic-secret' } as any)
+    Object.assign(provider, {
+      runs: { getRelease: async () => ({ body: { definition } }) },
+      executionLogs: { putWorkspacePreparationFailure },
+      preparationSleep: async (ms: number) => { waits.push(ms) },
+    })
+    const files = new Map<string, string>()
+    const commands: string[] = []
+    let tries = 0
+    const sandbox = {
+      mkdir: async () => {}, writeFile: async () => {},
+      exists: async (path: string) => ({ success: true, exists: path.includes('/source-tree-') || files.has(path) }),
+      readFile: async (path: string) => ({ content: files.get(path)! }),
+      exec: async (command: string) => {
+        commands.push(command)
+        if (command.includes('ack3-prepare-workspace')) {
+          const success = outcomes[tries] ?? false
+          tries += 1
+          if (!success) files.set(failurePath, JSON.stringify({ schemaVersion: 1, status: 'failed', commit: definition.target.commit,
+            tree: definition.target.tree, profileDigest, requestDigest: digestB, results: [{ index: 1, command: 'npm ci', exitCode: 1 }],
+            code: 'exit-1', stdout: '', stderr: `registry timeout on try ${tries}` }))
+          return { success, stderr: success ? '' : 'workspace preparation: command 1 failed (exit-1)' }
+        }
+        const moved = command.match(/^mv -f -- '([^']+)' '([^']+)'$/)
+        if (moved !== null) { files.set(moved[2]!, files.get(moved[1]!)!); files.delete(moved[1]!) }
+        return { success: true, stdout: '', stderr: '' }
+      },
+    }
+    const request = { runId: 'synthetic-run', releaseDigest: 'a'.repeat(64), attempt: 1,
+      task: { id: 'research-1', providerClass: 'core', promptKind: 'research' } }
+    return { provider, sandbox, request, files, commands, waits, putWorkspacePreparationFailure, tries: () => tries }
+  }
+
+  it('tries twice more after 30 and 60 seconds, keeping each failure file, and then goes on', async () => {
+    const setup = await retrySetup([false, false, true])
+    const lines: string[] = []
+    const logs = vi.spyOn(console, 'log').mockImplementation(line => { lines.push(String(line)) })
+    try {
+      await (setup.provider as any).prepareSandbox(setup.sandbox, setup.request, digestB)
+    } finally { logs.mockRestore() }
+    expect(setup.tries()).toBe(3)
+    expect(setup.waits).toEqual([30_000, 60_000])
+    expect([...setup.files.keys()].toSorted()).toEqual([1, 2].map(n =>
+      `/workspace/private/workspace-preparation-failure-${digestB}.try-${n}.json`))
+    expect(setup.files.get(`/workspace/private/workspace-preparation-failure-${digestB}.try-2.json`)).toContain('try 2')
+    expect(setup.putWorkspacePreparationFailure).not.toHaveBeenCalled()
+    const retries = lines.map(line => JSON.parse(line)).filter(line => line.event === 'workspace-preparation-retry')
+    expect(retries).toEqual([1, 2].map(n => expect.objectContaining({ runId: 'synthetic-run', taskId: 'research-1',
+      requestDigest: digestB, try: n, code: 'exit-1', command: 1 })))
+    // The log line carries no command output.
+    expect(JSON.stringify(retries)).not.toContain('registry timeout')
+  })
+
+  it('reports the last failure after three tries, as before', async () => {
+    const setup = await retrySetup([false, false, false])
+    const logs = vi.spyOn(console, 'log').mockImplementation(() => {})
+    try {
+      await expect((setup.provider as any).prepareSandbox(setup.sandbox, setup.request, digestB))
+        .rejects.toMatchObject({ category: 'preflight-failed' })
+    } finally { logs.mockRestore() }
+    expect(setup.tries()).toBe(3)
+    expect(setup.putWorkspacePreparationFailure).toHaveBeenCalledOnce()
+    expect(setup.putWorkspacePreparationFailure.mock.calls[0]?.[0].content).toContain('registry timeout on try 3')
+    expect(setup.files.has(failurePath)).toBe(true)
+    expect(setup.files.has(`/workspace/private/workspace-preparation-failure-${digestB}.try-2.json`)).toBe(true)
+  })
+
+  it('does not retry a failure without a failure file, or once the first try began over 10 minutes ago', async () => {
+    const plain = await retrySetup([false])
+    plain.sandbox.exec = async (command: string) => ({ success: !command.includes('ack3-prepare-workspace'),
+      stdout: '', stderr: 'workspace preparation: source integrity mismatch: package-lock.json' })
+    await expect((plain.provider as any).prepareSandbox(plain.sandbox, plain.request, digestB))
+      .rejects.toMatchObject({ category: 'preflight-failed' })
+    expect(plain.waits).toEqual([])
+
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      vi.setSystemTime(new Date('2030-01-01T00:00:00.000Z'))
+      const slow = await retrySetup([false, false, false])
+      const exec = slow.sandbox.exec
+      slow.sandbox.exec = async (command: string) => {
+        // The first try ends after 9.6 minutes: a 30-second wait would start the next one after 10.
+        if (command.includes('ack3-prepare-workspace')) vi.setSystemTime(Date.now() + 9.6 * 60_000)
+        return exec(command)
+      }
+      const logs = vi.spyOn(console, 'log').mockImplementation(() => {})
+      try {
+        await expect((slow.provider as any).prepareSandbox(slow.sandbox, slow.request, digestB))
+          .rejects.toMatchObject({ category: 'preflight-failed' })
+      } finally { logs.mockRestore() }
+      expect(slow.tries()).toBe(1)
+    } finally { vi.useRealTimers() }
+  })
 })

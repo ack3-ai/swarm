@@ -1,8 +1,11 @@
+import { createControlledMachine } from './support/controlled-machine.js'
+import { restoreSelected } from './support/selected-snapshots.js'
+import { verifiedJournalPrefix } from '../src/execution-journal.js'
 /// <reference types="node" />
 import { describe, expect, it } from 'vitest'
 import type { AgentProvider, AgentRequest, AgentResult, ArtifactRecord } from '../src/contracts.js'
 import {
-  RunMachine, audit0RunPolicy, advanceExperimentOneWave, createAudit0RunPolicy, expiredResumeClockAmendment, sealReleasePackage, sha256,
+  RunMachine, audit0RunPolicy, advanceExperimentOneWave, createAudit0RunPolicy, sealReleasePackage, sha256,
 } from '../src/index.js'
 import { audit0Definition, audit0PackageBody } from './support/audit0-config.js'
 import { DeterministicAuditProvider } from './support/deterministic-audit-provider.js'
@@ -13,11 +16,13 @@ import { OUTPUT_FILE_MAX_BYTES } from '../src/output-limits.js'
 import { sealFinalFinding } from '../src/protocol-transforms.js'
 import { MemoryArtifactStore, runExperiment } from './support/memory-runner.js'
 import { instruction } from './support/instructions.js'
+import { expectSameOrder, textValues } from './support/text-order.js'
 
-async function execute(runId: string, provider: AgentProvider = new DeterministicAuditProvider()) {
+async function execute(runId: string, provider: AgentProvider = new DeterministicAuditProvider(), controlled = false) {
   const startedAt = '2026-09-18T20:00:00.000Z'
   const pkg = await sealReleasePackage(audit0PackageBody)
-  const machine = await RunMachine.create(audit0Definition, pkg.digest, runId, startedAt)
+  const machine = await createControlledMachine(audit0Definition, pkg.digest, runId, startedAt, undefined,
+    controlled ? { auditId: runId, executionId: runId, epoch: 0, runtimeDigest: await sha256(null) } : undefined)
   const store = new MemoryArtifactStore()
   const outcome = await runExperiment({
     definition: audit0Definition,
@@ -96,10 +101,10 @@ describe('Cloudflare audit0 acceptance flow', () => {
       .toEqual(['coverage-challenge.md'])
   })
 
-  it('runs the zero-provider audit0 protocol and resumes representative sealed checkpoints as fresh children', async () => {
+  it('runs the zero-provider audit0 protocol to completion', async () => {
     const pkg = await sealReleasePackage(audit0PackageBody)
     const startedAt = '2026-09-18T20:00:00.000Z'
-    const parentMachine = await RunMachine.create(audit0Definition, pkg.digest, 'audit0-parent', startedAt)
+    const parentMachine = await createControlledMachine(audit0Definition, pkg.digest, 'audit0-parent', startedAt)
     const parent = await runExperiment({
       definition: audit0Definition,
       machine: parentMachine,
@@ -115,86 +120,45 @@ describe('Cloudflare audit0 acceptance flow', () => {
     expect([...new Set(parent.state.artifacts.filter(value => value.stageId === 'discovery').map(value => value.waveId))])
       .toEqual(expect.arrayContaining(['wave-0', 'wave-1', 'wave-2', 'wave-3']))
     expect(parent.state.artifacts.map(artifact => artifact.taskId)).toContain('reporter')
+    // C1: the shared text order sorts every key and id of a completed state as before.
+    expectSameOrder(textValues(parent.state))
 
-    const immutableParent = structuredClone(parent.state)
-    const afterDiscovery = parent.checkpoints.find(checkpoint => checkpoint.body.cursor.stageIndex === 2 && checkpoint.body.cursor.waveIndex === 0)
-    const beforeReporting = parent.checkpoints.findLast(checkpoint => checkpoint.body.cursor.stageIndex === 6)
-    expect(afterDiscovery).toBeDefined()
-    expect(beforeReporting).toBeDefined()
+    await expect(restoreSelected(parentMachine)).resolves.toBeDefined()
 
-    for (const [checkpoint, childRunId] of [
-      [afterDiscovery!, 'audit0-resume-discovery'],
-      [beforeReporting!, 'audit0-resume-reporting'],
-    ] as const) {
-      const resumeStarted = performance.now()
-      const childMachine = await RunMachine.resume(
-        audit0Definition,
-        checkpoint,
-        childRunId,
-        new Set([parent.state.runId]),
-        '2026-09-18T20:10:00.000Z',
-      )
-      expect(performance.now() - resumeStarted).toBeLessThan(1_000)
-      const child = await runExperiment({
-        definition: audit0Definition,
-        machine: childMachine,
-        provider: new DeterministicAuditProvider(),
-        artifactStore: new MemoryArtifactStore(),
-        policy: audit0RunPolicy,
-      })
-      expect(child.state).toMatchObject({
-        status: 'completed', parentRunId: parent.state.runId,
-        parentCheckpointDigest: checkpoint.digest, recoveryEpoch: 1,
-        rootRunId: parent.state.runId, runId: childRunId,
-        rootCreatedAt: startedAt,
-      })
-      const inheritedTaskIds = new Set(checkpoint.body.acceptedArtifacts.map(value => value.taskId))
-      const newAccepted = child.state.journal
-        .filter(event => event.type === 'task.accepted')
-        .map(event => (event.payload as { artifact: { taskId: string } }).artifact.taskId)
-      expect(newAccepted.every(taskId => !inheritedTaskIds.has(taskId))).toBe(true)
-    }
-    expect(parentMachine.snapshot()).toEqual(immutableParent)
   })
 
-  it('refuses tampered checkpoints and duplicate child identities', async () => {
-    const { outcome } = await execute('tamper-parent')
+  it('refuses tampered historical checkpoint bytes', async () => {
+    const { outcome, machine } = await execute('tamper-parent', undefined, true)
     const checkpoint = outcome.checkpoints[2]!
     const tampered = structuredClone(checkpoint)
     tampered.body.cursor = { stageIndex: 5, waveIndex: 0 }
-    await expect(RunMachine.resume(audit0Definition, tampered, 'tamper-child')).rejects.toThrow('digest mismatch')
-    await expect(RunMachine.resume(audit0Definition, checkpoint, 'existing-child', new Set(['existing-child'])))
-      .rejects.toThrow('already exists')
+    await expect(machine.verifyCheckpoint(tampered)).rejects.toThrow('digest differs')
   })
 
-  it('stops only after a sealed wave and resumes that checkpoint as a fresh child', async () => {
-    const pkg = await sealReleasePackage(audit0PackageBody)
-    const parent = await RunMachine.create(audit0Definition, pkg.digest, 'stop-parent', '2026-09-18T20:00:00.000Z')
-    await advanceExperimentOneWave({
-      definition: audit0Definition,
-      machine: parent,
-      provider: new DeterministicAuditProvider(),
-      artifactStore: new MemoryArtifactStore(),
-    })
-    const checkpoint = parent.snapshot().checkpoints.at(-1)
-    expect(checkpoint).toBeDefined()
-    await parent.stop('operator-requested-stop-at-sealed-wave-boundary')
-    expect(parent.snapshot()).toMatchObject({
-      status: 'stopped',
-      cursor: checkpoint!.body.cursor,
-      terminalReason: 'operator-requested-stop-at-sealed-wave-boundary',
-    })
-    const child = await RunMachine.resume(audit0Definition, checkpoint!, 'stop-child', new Set(['stop-parent']))
-    expect(child.snapshot()).toMatchObject({
-      status: 'created', parentRunId: 'stop-parent', parentCheckpointDigest: checkpoint!.digest,
-      runId: 'stop-child', recoveryEpoch: 1,
-      rootCreatedAt: '2026-09-18T20:00:00.000Z',
-    })
+  it('preserves the sealed frontier when the cancellation command settles', async () => {
+    const { createExecutorSourceFixture, proof } = await import('./support/successor-fixture.js')
+    const closes: Array<() => void> = []
+    try {
+      const f = await createExecutorSourceFixture(close => closes.push(close))
+      const parent = f.machine, before = parent.snapshot(), checkpoint = before.checkpoints.at(-1)!
+      const command = { id: 'cancel-sealed-audit', action: 'cancel' as const,
+        scope: { kind: 'audit' as const }, expectedRevision: 0, reason: 'operator cancellation' }
+      const admitted = await f.journal.admit(command, f.authority)
+      const started = await f.journal.beginEffect(command.id, admitted.version, before)
+      const operation = await f.journal.beginNativeEffect(command.id, started.version, proof.inventoryDigest)
+      // Deterministic machine boundary; native shutdown evidence is exercised by command-custody tests.
+      await parent.cancelAudit(operation, proof)
+      expect(parent.snapshot()).toMatchObject({ status: 'stopped', cursor: checkpoint.body.cursor,
+        terminalReason: command.reason, artifacts: before.artifacts, checkpoints: before.checkpoints,
+        controls: { lastReceipt: { commandId: command.id, outcome: { status: 'applied' } } } })
+      const restored = await restoreSelected(parent)
+      expect(restored.snapshot()).toEqual(parent.snapshot())
+    } finally { closes.forEach(close => close()) }
   })
 
   it('does not seal an incomplete required Codex wave', async () => {
     const pkg = await sealReleasePackage(audit0PackageBody)
-    const machine = await RunMachine.create(audit0Definition, pkg.digest, 'failed-wave', '2026-09-18T20:00:00.000Z')
+    const machine = await createControlledMachine(audit0Definition, pkg.digest, 'failed-wave', '2026-09-18T20:00:00.000Z')
     await expect(runExperiment({
       definition: audit0Definition,
       machine,
@@ -208,24 +172,6 @@ describe('Cloudflare audit0 acceptance flow', () => {
     expect(state.cursor).toEqual({ stageIndex: 1, waveIndex: 0 })
   })
 
-  it('records a time amendment when delayed checkpoint recovery rebases the current phase clock', async () => {
-    const pkg = await sealReleasePackage(audit0PackageBody)
-    const parent = await RunMachine.create(audit0Definition, pkg.digest, 'amend-parent', '2026-09-19T08:00:00.000Z')
-    await advanceExperimentOneWave({
-      definition: audit0Definition,
-      machine: parent,
-      provider: new DeterministicAuditProvider(),
-      artifactStore: new MemoryArtifactStore(),
-    })
-    const checkpoint = parent.snapshot().checkpoints.at(-1)!
-    const previousModelStartedAt = checkpoint.body.modelStartedAt!
-    const amendedAt = new Date(Date.parse(previousModelStartedAt)
-      + (audit0Definition.limits.phaseMinutes.discovery + 1) * 60_000).toISOString()
-    const amendment = expiredResumeClockAmendment(audit0Definition, checkpoint, amendedAt)!
-    const child = await RunMachine.resume(audit0Definition, checkpoint, 'amend-child', new Set(), amendedAt, amendment)
-    expect(child.snapshot()).toMatchObject({ modelStartedAt: amendedAt, parentCheckpointDigest: checkpoint.digest })
-    expect(child.snapshot().journal.find(event => event.type === 'run.time-amended')?.payload).toEqual(amendment)
-  })
 
   it('continues after specifically attested additive unavailability without falling back to Codex', async () => {
     const base = new DeterministicAuditProvider()
@@ -249,7 +195,7 @@ describe('Cloudflare audit0 acceptance flow', () => {
     expect(outcome.state.artifacts.some(value => value.taskId.startsWith('additive-') && value.model === 'gpt-codex-a')).toBe(false)
   })
 
-  it('rejects a final structured handoff that drops a retained reference', async () => {
+  it.each([false, true])('rejects a final structured handoff that drops a retained reference (controlled=%s)', async controlled => {
     const base = new DeterministicAuditProvider()
     const provider: AgentProvider = {
       async run(request: AgentRequest): Promise<AgentResult> {
@@ -262,43 +208,19 @@ describe('Cloudflare audit0 acceptance flow', () => {
         }
       },
     }
-    await expect(execute('dropped-reference', provider)).rejects.toThrow('output correction exhausted after 10 turns')
+    await expect(execute('dropped-reference', provider, controlled)).rejects.toThrow('output correction exhausted after 10 turns')
   })
 
-  it('resumes a second generation from its immediate sealed parent without replaying inherited work', async () => {
-    const parent = await execute('nested-parent')
-    const afterDiscovery = parent.outcome.checkpoints.find(checkpoint => checkpoint.body.cursor.stageIndex === 2 && checkpoint.body.cursor.waveIndex === 0)!
-    const childMachine = await RunMachine.resume(audit0Definition, afterDiscovery, 'nested-child')
-    const child = await runExperiment({
-      definition: audit0Definition, machine: childMachine,
-      provider: new DeterministicAuditProvider(), artifactStore: new MemoryArtifactStore(), policy: audit0RunPolicy,
-    })
-    const beforeReporting = child.checkpoints.findLast(checkpoint => checkpoint.body.cursor.stageIndex === 6)!
-    const grandchildMachine = await RunMachine.resume(audit0Definition, beforeReporting, 'nested-grandchild')
-    expect(grandchildMachine.snapshot()).toMatchObject({
-      rootRunId: 'nested-parent', parentRunId: 'nested-child', recoveryEpoch: 2,
-      parentCheckpointDigest: beforeReporting.digest,
-    })
-    const inherited = new Set(beforeReporting.body.acceptedArtifacts.map(value => value.taskId))
-    const grandchild = await runExperiment({
-      definition: audit0Definition, machine: grandchildMachine,
-      provider: new DeterministicAuditProvider(), artifactStore: new MemoryArtifactStore(), policy: audit0RunPolicy,
-    })
-    const newlyAccepted = grandchild.state.journal.filter(event => event.type === 'task.accepted')
-      .map(event => (event.payload as { artifact: ArtifactRecord }).artifact.taskId)
-    expect(newlyAccepted).toEqual(['seal-final'])
-    expect(newlyAccepted.every(taskId => !inherited.has(taskId))).toBe(true)
-  })
 
   it('rejects internally rehashed checkpoint frontier changes and journal mutations', async () => {
-    const { outcome } = await execute('semantic-tamper-parent')
+    const { outcome, machine } = await execute('semantic-tamper-parent', undefined, true)
     const checkpoint = outcome.checkpoints.find(value => value.body.cursor.stageIndex === 2 && value.body.cursor.waveIndex === 0)!
     const rehashed = structuredClone(checkpoint)
     const removed = rehashed.body.acceptedArtifacts.find(value => value.taskId === 'core-wave-0-research-1')!
     rehashed.body.acceptedArtifacts = rehashed.body.acceptedArtifacts.filter(value => value !== removed)
     rehashed.digest = await sha256(rehashed.body)
-    await expect(RunMachine.resume(audit0Definition, rehashed, 'semantic-tamper-child'))
-      .rejects.toThrow('discovery cohort discovery/wave-0/luna has an invalid terminal set')
+    await expect(machine.verifyCheckpoint(rehashed))
+      .rejects.toThrow('not registered')
 
     const changedReceipt = structuredClone(checkpoint)
     const receipt = changedReceipt.body.stageEndReceipts.find(value => value.reason === 'two-distinct-complete-saturation-cohorts')!
@@ -306,8 +228,8 @@ describe('Cloudflare audit0 acceptance flow', () => {
     evidence.pools[0]!.quietCohorts += 1
     receipt.evidenceDigest = await sha256(receipt.evidence)
     changedReceipt.digest = await sha256(changedReceipt.body)
-    await expect(RunMachine.resume(audit0Definition, changedReceipt, 'receipt-tamper-child'))
-      .rejects.toThrow('independent discovery saturation receipt is invalid')
+    await expect(machine.verifyCheckpoint(changedReceipt))
+      .rejects.toThrow('not registered')
 
     const changedSaturation = structuredClone(checkpoint)
     changedSaturation.body.acceptedArtifacts.find(value => (
@@ -315,31 +237,32 @@ describe('Cloudflare audit0 acceptance flow', () => {
     ))!
       .protocol.research!.materialHighCriticalDelta = true
     changedSaturation.digest = await sha256(changedSaturation.body)
-    await expect(RunMachine.resume(audit0Definition, changedSaturation, 'saturation-tamper-child'))
-      .rejects.toThrow('checkpoint wave timing receipt is invalid')
+    await expect(machine.verifyCheckpoint(changedSaturation))
+      .rejects.toThrow('not registered')
 
     const changedBudget = structuredClone(checkpoint)
     changedBudget.body.budget.inputTokens += 1
     changedBudget.digest = await sha256(changedBudget.body)
-    await expect(RunMachine.resume(audit0Definition, changedBudget, 'budget-tamper-child'))
-      .rejects.toThrow('checkpoint budget does not match its accepted and rejected attempt evidence')
+    await expect(machine.verifyCheckpoint(changedBudget))
+      .rejects.toThrow('not registered')
 
     const changedProvider = structuredClone(checkpoint)
     changedProvider.body.acceptedArtifacts[0]!.provider = 'unattested-provider'
     changedProvider.digest = await sha256(changedProvider.body)
-    await expect(RunMachine.resume(audit0Definition, changedProvider, 'provider-tamper-child'))
-      .rejects.toThrow('checkpoint artifact identity is invalid')
+    await expect(machine.verifyCheckpoint(changedProvider))
+      .rejects.toThrow('not registered')
 
     const reportingCheckpoint = outcome.checkpoints.findLast(value => value.body.cursor.stageIndex === 6)!
     const changedReviewInput = structuredClone(reportingCheckpoint)
     changedReviewInput.body.acceptedArtifacts.find(value => value.taskId === 'negative-review-primary')!
       .protocol.reviewInputDigest = 'd'.repeat(64)
     changedReviewInput.digest = await sha256(changedReviewInput.body)
-    await expect(RunMachine.resume(audit0Definition, changedReviewInput, 'review-input-tamper-child'))
-      .rejects.toThrow('checkpoint review does not bind the reconstructed frozen input')
+    await expect(machine.verifyCheckpoint(changedReviewInput))
+      .rejects.toThrow('not registered')
 
     const state = structuredClone(outcome.state)
     state.journal[1]!.previousDigest = 'f'.repeat(64)
-    await expect(RunMachine.fromState(audit0Definition, state)).rejects.toThrow('run journal chain is invalid')
+    await expect(verifiedJournalPrefix(state.journal)).rejects.toThrow('run journal chain is invalid')
+    await expect(restoreSelected(machine, state)).rejects.toThrow('snapshot has no matching state selection receipt')
   })
 })

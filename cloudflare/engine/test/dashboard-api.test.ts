@@ -1,7 +1,21 @@
+import { createControlledMachine } from './support/controlled-machine.js'
+import { localUsageEvidence } from '../src/usage-evidence.js'
+import type { SavedWork } from '../src/saved-work.js'
+import { RunMachine } from '../src/machine.js'
+import type { RunState } from '../src/contracts.js'
+import { appendExecutionEvent } from '../src/execution-journal.js'
+import { sha256 } from '../src/canonical.js'
+import { R2AgentObservationHealthStore } from '../src/agent-observation-health.js'
+import { R2AgentExecutionLogStore } from '../src/agent-execution-log.js'
+import { audit0Definition } from './support/audit0-config.js'
 import { describe, expect, it, vi } from 'vitest'
 import { monitoringRoute } from '../src/dashboard-api.js'
+import { dashboardHistory } from '../src/dashboard-history.js'
 import { buildDashboardSnapshot } from '../src/dashboard-projection.js'
 import { readDashboardDefinition } from '../src/dashboard-release.js'
+import { CloudflareRunStore } from '../src/cloudflare-storage.js'
+import { ROUTING_SCHEMA_SQL } from '../src/routing-schema.js'
+import { sqliteD1 } from './support/sqlite-d1.js'
 
 vi.mock('../src/dashboard-projection.js', () => ({ buildDashboardSnapshot: vi.fn(state => ({
   schemaVersion: 1, run: { status: state.status }, stages: [], waves: [], limitations: [],
@@ -10,7 +24,11 @@ vi.mock('../src/dashboard-release.js', () => ({ readDashboardDefinition: vi.fn(a
 const digest = 'a'.repeat(64)
 function setup(status = 'completed') {
   const store = {
-    getState: vi.fn().mockResolvedValue({ runId: 'run-a', releaseDigest: digest, status,
+    ensureRoutingSchema: vi.fn(async () => {}),
+    getStateAt: vi.fn(),
+    readSavedWork: vi.fn(),
+    executionSources() { return Object.assign(this.getStateAt, { readSavedWork: this.readSavedWork }) },
+    getState: vi.fn().mockResolvedValue({ runId: 'run-a', rootRunId: 'run-a', releaseDigest: digest, status,
       artifacts: [{ id: 'accepted', status: 'accepted', contentDigest: digest }] }),
   }
   const bucket = { get: vi.fn(), list: vi.fn().mockResolvedValue({ objects: [], truncated: false }) }
@@ -19,18 +37,127 @@ function setup(status = 'completed') {
     { run_id: 'run-b', experiment_id: 'example', status: 'running', updated_at: '2026-09-22T12:00:00Z' },
     { run_id: 'run-a', experiment_id: 'example', status: 'completed', updated_at: '2026-09-22T12:00:00Z' },
   ] })
+  const first = vi.fn()
   const statement: D1PreparedStatement = { bind: vi.fn(() => statement), all,
-    first: vi.fn(), run: vi.fn(), raw: vi.fn() }
+    first, run: vi.fn(), raw: vi.fn() }
   const bind = statement.bind
   const index = { prepare: vi.fn(() => statement) }
   const reader = { read: vi.fn().mockResolvedValue({ 'report.md': '<script>untrusted document</script>' }) }
   const workflowStatus = vi.fn().mockResolvedValue({ status: 'terminated' })
   const request = (path: string, method = 'GET') => monitoringRoute(new Request(`https://monitor.invalid${path}`, { method }),
     store, bucket, index, reader, packages, workflowStatus)
-  return { request, store, bucket, index, bind, reader, packages, workflowStatus }
+  return { request, store, bucket, index, first, bind, reader, packages, workflowStatus }
+}
+
+async function commandRow(auditId: string, revision: number, id: string, action: string, status: string,
+  extra: Record<string, unknown> = {}) {
+  const command = { id, action, ...extra }
+  const operation = { auditId, revision, version: 1, command, commandDigest: await sha256(command), status }
+  return { audit_id: auditId, revision, command_id: id, version: 1,
+    operation_json: JSON.stringify(operation), operation_digest: await sha256(operation) }
 }
 
 describe('authorized read-only monitoring routes', () => {
+  it('shows a command after saved selection until native acknowledgement finishes', async () => {
+    const test = setup('running')
+    test.store.getState.mockResolvedValue({ runId: 'run-a', rootRunId: 'audit-a', releaseDigest: digest,
+      status: 'running', executionAuthority: {}, controls: { revision: 2,
+        lastReceipt: { commandId: 'change-reviewer', outcome: { status: 'applied' } } }, artifacts: [] })
+    test.first.mockResolvedValueOnce(await commandRow('audit-a', 2, 'change-reviewer', 'amend', 'applying'))
+    const response = await test.request('/v1/monitor/runs/run-a')
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ commandStatus: { kind: 'recorded',
+      commandId: 'change-reviewer', action: 'amend', status: 'applying', revision: 2 } })
+    expect(test.bind).toHaveBeenCalledWith('audit-a')
+    test.first.mockRejectedValueOnce(new Error('temporary index failure'))
+    expect(await (await test.request('/v1/monitor/runs/run-a')).json()).toMatchObject({
+      commandStatus: { kind: 'unavailable' }, run: { status: 'running' },
+    })
+    test.first.mockResolvedValueOnce(await commandRow('audit-a', 2, 'change-reviewer', 'amend', 'failed'))
+    expect(await (await test.request('/v1/monitor/runs/run-a')).json()).toMatchObject({
+      commandStatus: { kind: 'recorded', commandId: 'change-reviewer', status: 'failed' },
+    })
+  })
+
+  it('shows the next queued command after the saved decision is acknowledged', async () => {
+    const test = setup('running')
+    test.store.getState.mockResolvedValue({ runId: 'run-a', rootRunId: 'audit-a', releaseDigest: digest,
+      status: 'running', executionAuthority: {}, controls: { revision: 1,
+        lastReceipt: { commandId: 'prior', outcome: { status: 'applied' } } }, artifacts: [] })
+    test.first.mockResolvedValueOnce(await commandRow('audit-a', 2, 'next', 'pause', 'waiting'))
+    expect(await (await test.request('/v1/monitor/runs/run-a')).json()).toMatchObject({
+      commandStatus: { kind: 'recorded', commandId: 'next', status: 'waiting', revision: 2 },
+    })
+    test.first.mockResolvedValueOnce(await commandRow('audit-a', 1, 'prior', 'pause', 'applied'))
+    expect(await (await test.request('/v1/monitor/runs/run-a')).json()).toMatchObject({ commandStatus: null })
+  })
+
+  it('labels a missing saved command row unavailable', async () => {
+    const test = setup('running')
+    test.store.getState.mockResolvedValue({ runId: 'run-a', rootRunId: 'audit-a', releaseDigest: digest,
+      status: 'running', executionAuthority: {}, controls: { revision: 1,
+        lastReceipt: { commandId: 'saved', outcome: { status: 'applied' } } }, artifacts: [] })
+    test.first.mockResolvedValueOnce(null)
+    expect(await (await test.request('/v1/monitor/runs/run-a')).json()).toMatchObject({
+      commandStatus: { kind: 'unavailable' },
+    })
+  })
+  it('does not display stale or corrupted command rows as absent', async () => {
+    const test = setup('running')
+    test.store.getState.mockResolvedValue({ runId: 'run-a', rootRunId: 'audit-a', releaseDigest: digest,
+      status: 'running', executionAuthority: {}, controls: { revision: 2,
+        lastReceipt: { commandId: 'saved', outcome: { status: 'applied' } } }, artifacts: [] })
+    test.first.mockResolvedValueOnce(await commandRow('audit-a', 1, 'prior', 'pause', 'applied'))
+    expect(await (await test.request('/v1/monitor/runs/run-a')).json()).toMatchObject({
+      commandStatus: { kind: 'unavailable' },
+    })
+    const corrupted = await commandRow('audit-a', 2, 'saved', 'pause', 'applied')
+    corrupted.operation_digest = digest
+    test.first.mockResolvedValueOnce(corrupted)
+    expect(await (await test.request('/v1/monitor/runs/run-a')).json()).toMatchObject({
+      commandStatus: { kind: 'unavailable' },
+    })
+  })
+  it('passes immutable inherited accounting evidence to the dashboard and does not cache missing history across reads', async () => {
+    const test = setup()
+    const initial = (await createControlledMachine(audit0Definition, digest, 'source-a')).snapshot()
+    const source = await appendExecutionEvent(initial, 'run.cancelled', { proofDigest: digest }, initial.updatedAt)
+    const ref = { runId: source.runId, state: { generation: source.stateGeneration, digest: await sha256(source) } }
+    const exported = { sourceReference: ref, accounting: localUsageEvidence(source) } as SavedWork
+    const forkOrigin = { savedWorkDigest: await sha256(exported), source: ref, stageId: 'negative-review' }
+    const root = (await createControlledMachine(audit0Definition, digest, 'run-a')).snapshot()
+    const child = await appendExecutionEvent({ ...root, journal: [], stateGeneration: 0, forkOrigin }, 'run.created', {
+      ...(root.journal[0]!.payload as object), forkOrigin,
+    }, root.updatedAt)
+    test.store.getState.mockResolvedValue(child)
+    test.store.getStateAt.mockRejectedValue(new Error('historical source unavailable'))
+    test.store.readSavedWork.mockResolvedValue(exported)
+    expect((await test.request('/v1/monitor/runs/run-a')).status).toBe(200)
+    expect(test.store.getStateAt).not.toHaveBeenCalled()
+    expect(test.store.readSavedWork).toHaveBeenCalledExactlyOnceWith(forkOrigin.savedWorkDigest)
+    expect(buildDashboardSnapshot).toHaveBeenLastCalledWith(child, expect.anything(), expect.anything(), undefined, [],
+      { costAccountingComplete: true, cacheAccountingComplete: true, historyComplete: true, interruptions: [digest] })
+    test.store.readSavedWork.mockRejectedValue(new Error('export unavailable'))
+    expect((await test.request('/v1/monitor/runs/run-a')).status).toBe(200)
+    expect(buildDashboardSnapshot).toHaveBeenLastCalledWith(child, expect.anything(), expect.anything(), undefined, [],
+      { costAccountingComplete: true, cacheAccountingComplete: true, historyComplete: false, interruptions: [] })
+  })
+
+  it('does not parse a historical fork source in the current dashboard', async () => {
+    const test = setup()
+    const source = (await createControlledMachine(audit0Definition, digest, 'source-a')).snapshot()
+    const ref = { runId: source.runId, state: { generation: source.stateGeneration, digest: await sha256(source) } }
+    const root = (await createControlledMachine(audit0Definition, digest, 'new-audit')).snapshot()
+    const fork = { ...root, forkOrigin: { source: ref } } as RunState
+    test.store.getStateAt.mockResolvedValue(source)
+    vi.mocked(readDashboardDefinition).mockClear()
+    const history = await dashboardHistory(fork, test.bucket)
+    expect(history.incomplete).toBe(false)
+    expect(history.runs.map(item => item.state.runId)).toEqual(['new-audit'])
+    expect(history.sourceReference).toEqual(ref)
+    expect(test.store.getStateAt).not.toHaveBeenCalled()
+    expect(readDashboardDefinition).not.toHaveBeenCalled()
+  })
   it('serves handovers without log, model or Workflow reads and rejects writes', async () => {
     const test = setup()
     test.store.getState.mockResolvedValue({ runId: 'run-a', stateGeneration: 4, artifacts: [] })
@@ -94,7 +221,7 @@ describe('authorized read-only monitoring routes', () => {
     expect(await response.json()).toMatchObject({ executionStatus: 'completed', run: { status: 'completed' } })
     expect(test.store.getState).toHaveBeenCalledTimes(2)
     expect(buildDashboardSnapshot).toHaveBeenLastCalledWith(expect.objectContaining({ stateGeneration: 2 }),
-      expect.anything(), expect.anything(), undefined, [])
+      expect.anything(), expect.anything(), undefined, [], { costAccountingComplete: false, cacheAccountingComplete: false, historyComplete: false, interruptions: [] })
   })
 
   it('rejects unknown agent scope and malformed log cursors without touching log objects', async () => {
@@ -133,6 +260,52 @@ describe('authorized read-only monitoring routes', () => {
     expect(test.bucket.list).not.toHaveBeenCalled()
   })
 
+  it('shows a live quota wait from the attempt log index and treats an unreadable index as none', async () => {
+    const test = setup('running')
+    const objects = new Map<string, { content: string, options: R2PutOptions, etag: string }>()
+    let revision = 0
+    const bucket = {
+      async put(key: string, content: string, options: R2PutOptions) {
+        const existing = objects.get(key), condition = options.onlyIf as R2Conditional | undefined
+        if (condition?.etagMatches !== undefined && existing?.etag !== condition.etagMatches
+          || condition?.etagDoesNotMatch === '*' && existing !== undefined) return null
+        const etag = String(++revision)
+        objects.set(key, { content, options, etag })
+        return { etag }
+      },
+      async get(key: string) {
+        const object = objects.get(key)
+        return object === undefined ? null : { text: async () => object.content, etag: object.etag,
+          size: object.content.length, customMetadata: object.options.customMetadata,
+          checksums: { toJSON: () => ({ sha256: object.options.sha256 }) } }
+      },
+      async head(key: string) { return objects.has(key) ? {} : null },
+      async list() { return { objects: [], delimitedPrefixes: [], truncated: false } },
+    } as unknown as R2Bucket
+    // The runtime's identity includes the task execution; the in-flight attempt carries it in execution.
+    const identity = { runId: 'run-a', stageId: 'discovery', waveId: 'wave-0', taskExecutionId: 'task-exec-1',
+      taskId: 'research-1', attempt: 1, promptDigest: digest }
+    const requestDigest = 'b'.repeat(64)
+    test.store.getState.mockResolvedValue({ runId: 'run-a', rootRunId: 'run-a', releaseDigest: digest,
+      status: 'running', artifacts: [], inFlightAgentAttempts: [{ stageId: 'discovery', waveId: 'wave-0',
+        taskId: 'research-1', attempt: 1, promptDigest: digest, execution: { taskExecutionId: 'task-exec-1' } }] })
+    await new R2AgentObservationHealthStore(bucket).recordProcessSuccess(identity, requestDigest,
+      new Date('2026-11-06T09:02:00.000Z'))
+    await new R2AgentExecutionLogStore(bucket).sync({ runId: 'run-a', taskId: 'research-1', requestDigest,
+      sourceOffset: 0, complete: false, source: `${JSON.stringify({ schemaVersion: 1, kind: 'subscription-wait',
+        at: '2026-11-06T09:01:00.000Z', provider: 'claude', resetsAt: '2026-11-10T08:00:00.000Z' })}\n` })
+    const read = async () => {
+      const response = await monitoringRoute(new Request('https://monitor.invalid/v1/monitor/runs/run-a'),
+        test.store, bucket, test.index, test.reader, test.packages, test.workflowStatus)
+      expect(response.status).toBe(200)
+      return (await response.json() as { observationHealth: Record<string, unknown>[] }).observationHealth
+    }
+    expect(await read()).toEqual([expect.objectContaining({ taskId: 'research-1', status: 'observing',
+      subscriptionWait: { provider: 'claude', since: '2026-11-06T09:01:00.000Z', resetsAt: '2026-11-10T08:00:00.000Z' } })])
+    objects.get(`monitor/agent-executions/run-a/research-1/${requestDigest}/index.json`)!.content += ' '
+    expect(await read()).toEqual([expect.objectContaining({ status: 'observing', subscriptionWait: null })])
+  })
+
   it('pages equal timestamps deterministically using bound parameters and no-store responses', async () => {
     const test = setup()
     const response = await test.request('/v1/monitor/runs?limit=1')
@@ -144,6 +317,31 @@ describe('authorized read-only monitoring routes', () => {
     expect(test.bind).toHaveBeenLastCalledWith('2026-09-22T12:00:00Z', 'run-b', 2)
     expect(test.store.getState).not.toHaveBeenCalled()
     expect(test.bucket.list).not.toHaveBeenCalled()
+  })
+
+  it('lists only owned executions, creating the ownership table on an upgraded index', async () => {
+    const { sqlite, d1 } = sqliteD1()
+    // An index written before execution ownership has runs but no ownership table.
+    sqlite.exec(ROUTING_SCHEMA_SQL[0]!)
+    const run = (id: string, at: string) => sqlite.prepare(`INSERT INTO experiment_runs
+      (run_id, experiment_id, status, state_key, state_generation, updated_at)
+      VALUES (?, 'example', 'completed', ?, 1, ?)`).run(id, `state/${id}`, at)
+    run('run-old', '2026-11-01T00:00:00Z')
+    const store = new CloudflareRunStore({} as R2Bucket, {} as R2Bucket, d1)
+    const list = async () => {
+      const response = await monitoringRoute(new Request('https://monitor.invalid/v1/monitor/runs'),
+        store, {} as R2Bucket, d1, { read: vi.fn() }, {} as R2Bucket)
+      return (await response.json() as { runs: { id: string }[] }).runs.map(item => item.id)
+    }
+    expect(await list()).toEqual([])
+    const owner = sqlite.prepare(`INSERT INTO audit_execution_authority
+      (audit_id, epoch, execution_id, authority_json, command_digest, status, activated_at)
+      VALUES ('audit-new', ?, ?, ?, ?, 'retired', '2026-11-05T00:00:00Z')`)
+    owner.run(0, 'audit-new', '{"epoch":0}', digest)
+    run('audit-new', '2026-11-05T00:00:00Z')
+    owner.run(1, 'fork-new', '{"epoch":1}', digest)
+    run('fork-new', '2026-11-06T00:00:00Z')
+    expect(await list()).toEqual(['fork-new', 'audit-new'])
   })
 
   it('rejects writes, malformed cursors and unbounded limits before touching storage', async () => {
@@ -189,7 +387,7 @@ describe('authorized read-only monitoring routes', () => {
     running.bucket.list.mockRejectedValueOnce(new Error('fixture read failure'))
     expect((await running.request('/v1/monitor/runs/run-a')).status).toBe(200)
     expect(buildDashboardSnapshot).toHaveBeenLastCalledWith(expect.anything(), { stages: [] },
-      { entries: [], legacyCount: 0, truncated: true }, undefined, [])
+      { entries: [], legacyCount: 0, truncated: true }, undefined, [], { costAccountingComplete: false, cacheAccountingComplete: false, historyComplete: false, interruptions: [] })
   })
 
   it('formats Markdown only after accepted artifact ownership is checked and preserves source text', async () => {

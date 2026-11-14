@@ -1,4 +1,8 @@
-import { describe, expect, it } from 'vitest'
+import { createControlledMachine } from './support/controlled-machine.js'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { sqliteD1 } from './support/sqlite-d1.js'
+import type { RunState } from '../src/contracts.js'
+import type { RunStatePointer } from '../src/run-state-pointer.js'
 import { CloudflareRunStore, RunMachine, canonicalJson, sealReleasePackage, sha256 } from '../src/index.js'
 import { audit0Definition, audit0PackageBody } from './support/audit0-config.js'
 
@@ -39,64 +43,24 @@ class FakeR2Bucket {
   }
 }
 
-class FakeD1 {
-  readonly states = new Map<string, { state_key: string, state_generation: number, status: string }>()
-  readonly runRoutes = new Map<string, { experiment_id: string, runtime_release_json: string }>()
-  readonly checkpointRoutes = new Map<string, { runtime_release_json: string }>()
-  readonly slotLeases = new Map<string, {
-    experiment_id: string, slot_id: string, runtime_release_json: string,
-    admission_pool_enabled: number
-  }>()
-
-  prepare(sql: string) {
-    return {
-      bind: (...values: unknown[]) => ({
-        run: async () => {
-          if (sql.includes('INSERT INTO experiment_runs')) {
-            const runId = String(values[0])
-            const stateKey = String(values[3])
-            const generation = Number(values[4])
-            const current = this.states.get(runId)
-            if (current === undefined || current.status === 'running' && generation > current.state_generation) {
-              this.states.set(runId, { state_key: stateKey, state_generation: generation, status: String(values[2]) })
-            }
-          } else if (sql.includes('INSERT INTO runtime_slot_run_leases')) {
-            const runId = String(values[0])
-            if (!this.slotLeases.has(runId)) this.slotLeases.set(runId, {
-              experiment_id: String(values[1]), slot_id: String(values[2]),
-              runtime_release_json: String(values[3]), admission_pool_enabled: 0,
-            })
-          } else if (sql.includes('INSERT INTO run_runtime_routes')) {
-            const runId = String(values[0])
-            if (this.runRoutes.has(runId) && !sql.includes('DO NOTHING')) throw new Error(`duplicate route: ${runId}`)
-            if (!this.runRoutes.has(runId)) this.runRoutes.set(runId, {
-              experiment_id: String(values[1]), runtime_release_json: String(values[2]),
-            })
-          } else if (sql.includes('INSERT INTO checkpoint_runtime_routes')) {
-            const digest = String(values[0])
-            if (!this.checkpointRoutes.has(digest)) {
-              this.checkpointRoutes.set(digest, { runtime_release_json: String(values[2]) })
-            }
-          }
-          return { success: true }
-        },
-        first: async () => {
-          const key = String(values[0])
-          if (sql.includes('FROM run_runtime_routes')) return this.runRoutes.get(key) ?? null
-          if (sql.includes('FROM runtime_slot_run_leases')) return this.slotLeases.get(key) ?? null
-          if (sql.includes('FROM checkpoint_runtime_routes')) return this.checkpointRoutes.get(key) ?? null
-          if (sql.includes('SELECT run_id FROM experiment_runs')) {
-            return this.states.has(key) ? { run_id: key } : null
-          }
-          return this.states.get(key) ?? null
-        },
-      }),
-    }
+const databases: ReturnType<typeof sqliteD1>[] = []
+afterEach(() => databases.splice(0).forEach(db => db.sqlite.close()))
+class TestD1 {
+  readonly db = sqliteD1()
+  constructor() { databases.push(this.db) }
+  prepare = this.db.d1.prepare.bind(this.db.d1)
+  batch = this.db.d1.batch.bind(this.db.d1)
+  readonly states = {
+    get: (id: string) => this.db.sqlite.prepare('SELECT state_key, state_generation, status FROM experiment_runs WHERE run_id=?').get(id) as
+      { state_key: string; state_generation: number; status: string } | undefined,
+    has: (id: string) => this.states.get(id) !== undefined,
   }
+}
 
-  async batch(statements: unknown[]) {
-    return statements.map(() => ({ success: true }))
-  }
+async function publish(store: CloudflareRunStore, state: RunState, expected: RunStatePointer | null = null) {
+  const authority = await store.activateRootExecution(state.runId, state.runtimeRelease, { test: 'storage-integrity', runId: state.runId })
+  expect(authority).toEqual(state.executionAuthority)
+  return store.putState(state, expected)
 }
 
 describe('Cloudflare content-addressed checkpoint storage', () => {
@@ -105,7 +69,7 @@ describe('Cloudflare content-addressed checkpoint storage', () => {
     const store = new CloudflareRunStore(
       bucket as unknown as R2Bucket,
       bucket as unknown as R2Bucket,
-      new FakeD1() as unknown as D1Database,
+      new TestD1() as unknown as D1Database,
     )
     const delegated = { ...audit0PackageBody, definition: { ...audit0Definition,
       pools: audit0Definition.pools.map((pool, index) => index === 0
@@ -123,6 +87,24 @@ describe('Cloudflare content-addressed checkpoint storage', () => {
       forceSearch: { enabled: false, promptSet: 'unknown-set' },
     } })).rejects.toThrow('forceSearch.promptSet must be native-exa-v1')
     await expect(store.putRelease(audit0PackageBody)).resolves.toBeDefined()
+  })
+
+  it.each(['committed', 'absent', 'corrupted'] as const)('reconciles a release publication with %s readback after a lost ACK', async result => {
+    const bucket = new FakeR2Bucket(), store = new CloudflareRunStore(bucket as unknown as R2Bucket,
+      bucket as unknown as R2Bucket, new TestD1() as unknown as D1Database)
+    const put = bucket.put.bind(bucket)
+    const writes = vi.spyOn(bucket, 'put').mockImplementation(async (key, content, options) => {
+      if (result !== 'absent') await put(key, content, options)
+      if (result === 'corrupted') bucket.objects.get(key)!.content = '{}'
+      throw new Error('lost publication ACK')
+    })
+    if (result === 'committed') {
+      const release = await store.putRelease(audit0PackageBody)
+      expect(await store.getRelease(release.digest)).toEqual(release)
+      expect(await store.putRelease(audit0PackageBody)).toEqual(release)
+    } else await expect(store.putRelease(audit0PackageBody)).rejects.toThrow(
+      result === 'absent' ? 'storage unavailable' : 'digest mismatch')
+    expect(writes).toHaveBeenCalledTimes(1)
   })
 
   it('initializes D1 with complete prepared statements instead of line-split exec SQL', async () => {
@@ -144,7 +126,8 @@ describe('Cloudflare content-addressed checkpoint storage', () => {
 
     await store.ensureSchema()
 
-    expect(prepared).toHaveLength(14)
+    expect(prepared).toHaveLength(20)
+    expect(prepared.at(-1)).toContain('CREATE TABLE IF NOT EXISTS execution_bootstrap')
     expect(prepared[0]).toContain('CREATE TABLE IF NOT EXISTS experiment_runs')
     expect(prepared[0]).toContain('terminal_reason TEXT\n  )')
     expect(prepared[1]).toContain('CREATE INDEX IF NOT EXISTS experiment_runs_by_experiment_updated')
@@ -155,16 +138,16 @@ describe('Cloudflare content-addressed checkpoint storage', () => {
     expect(prepared[6]).toContain('CREATE TABLE IF NOT EXISTS runtime_slot_run_leases')
     expect(prepared[8]).toContain('CREATE TABLE IF NOT EXISTS retired_runtime_runs')
     expect(prepared[9]).toContain('CREATE TABLE IF NOT EXISTS retired_unmaterialized_routes')
-    expect(prepared[10]).toContain('CREATE TABLE IF NOT EXISTS retained_native_workspace_claims')
-    expect(prepared[10]).toContain('PRIMARY KEY(source_run_id, workspace_key)')
-    expect(prepared[11]).toContain('CREATE TABLE IF NOT EXISTS audit_execution_authority')
-    expect(prepared[12]).toContain('CREATE TABLE IF NOT EXISTS audit_execution_launches')
-    expect(prepared[13]).toContain('CREATE TABLE IF NOT EXISTS audit_run_commands')
+    expect(prepared.join('\n')).not.toContain('retained_native_workspace_claims')
+    expect(prepared[10]).toContain('CREATE TABLE IF NOT EXISTS audit_execution_authority')
+    expect(prepared[11]).toContain('CREATE TABLE IF NOT EXISTS audit_execution_launches')
+    expect(prepared.join('\n')).toContain('CREATE TABLE IF NOT EXISTS run_state_selections')
+    expect(prepared.filter(sql => sql.includes('CREATE TRIGGER'))).toHaveLength(5)
   })
 
   it('persists small run and checkpoint routing envelopes independently of full state parsing', async () => {
     const bucket = new FakeR2Bucket()
-    const index = new FakeD1()
+    const index = new TestD1()
     const store = new CloudflareRunStore(
       bucket as unknown as R2Bucket,
       bucket as unknown as R2Bucket,
@@ -186,7 +169,7 @@ describe('Cloudflare content-addressed checkpoint storage', () => {
       .rejects.toThrow('run already exists with different routing')
 
     const release = await sealReleasePackage(audit0PackageBody)
-    const machine = await RunMachine.create(
+    const machine = await createControlledMachine(
       audit0Definition, release.digest, 'runtime-route-run', new Date().toISOString(), runtimeRelease,
     )
     await machine.start()
@@ -200,10 +183,10 @@ describe('Cloudflare content-addressed checkpoint storage', () => {
     const store = new CloudflareRunStore(
       bucket as unknown as R2Bucket,
       bucket as unknown as R2Bucket,
-      new FakeD1() as unknown as D1Database,
+      new TestD1() as unknown as D1Database,
     )
     const release = await sealReleasePackage(audit0PackageBody)
-    const machine = await RunMachine.create(audit0Definition, release.digest, 'storage-parent')
+    const machine = await createControlledMachine(audit0Definition, release.digest, 'storage-parent')
     await machine.start()
     const checkpoint = await machine.seal()
     await store.putCheckpoint(checkpoint)
@@ -232,7 +215,7 @@ describe('Cloudflare content-addressed checkpoint storage', () => {
     const store = new CloudflareRunStore(
       bucket as unknown as R2Bucket,
       bucket as unknown as R2Bucket,
-      new FakeD1() as unknown as D1Database,
+      new TestD1() as unknown as D1Database,
     )
     const release = await store.putRelease(audit0PackageBody)
     expect(await store.getRelease(release.digest)).toEqual(release)
@@ -241,16 +224,54 @@ describe('Cloudflare content-addressed checkpoint storage', () => {
     storedRelease.content = `${storedRelease.content} `
     await expect(store.getRelease(release.digest)).rejects.toThrow('release package object digest mismatch')
 
-    const machine = await RunMachine.create(audit0Definition, release.digest, 'stored-state')
+    const machine = await createControlledMachine(audit0Definition, release.digest, 'stored-state')
     await machine.start()
-    const state = machine.snapshot()
+    const state = machine.view()
     expect(await store.getStateIfPresent(state.runId)).toBeNull()
-    await store.putState(state)
+    await publish(store, state)
     expect(await store.getState(state.runId)).toEqual(state)
     expect(await store.getStateIfPresent(state.runId)).toEqual(state)
     const storedState = [...bucket.objects.entries()].find(([key]) => key.startsWith(`runs/${state.runId}/states/`))![1]
     storedState.content = storedState.content.replace('"status":"running"', '"status":"completed"')
     await expect(store.getState(state.runId)).rejects.toThrow(`run state object digest mismatch: ${state.runId}`)
+  })
+
+  it.each(['rewritten-body', 'wrong-run', 'arbitrary-key', 'historical-key'])('binds selected state to its run and key: %s', async change => {
+    const bucket = new FakeR2Bucket(), index = new TestD1()
+    const store = new CloudflareRunStore(bucket as unknown as R2Bucket,
+      bucket as unknown as R2Bucket, index as unknown as D1Database)
+    const machine = await createControlledMachine(audit0Definition, 'a'.repeat(64), 'bound-state')
+    await machine.start()
+    const state = machine.view()
+    await publish(store, state)
+    const pointer = index.states.get(state.runId)!, originalKey = pointer.state_key
+    const object = bucket.objects.get(originalKey)!
+    if (change === 'rewritten-body' || change === 'wrong-run') {
+      object.content = canonicalJson({ ...state, ...(change === 'wrong-run'
+        ? { runId: 'another-run' } : { terminalReason: 'substituted' }) })
+      object.checksum = object.customMetadata.objectSha256 = await sha256(object.content)
+      if (change === 'wrong-run') {
+        // Even an internally consistent content-addressed pointer cannot select
+        // a different run's state under the requested run identity.
+        pointer.state_key = originalKey.replace(await sha256(canonicalJson(state)), object.checksum)
+        bucket.objects.set(pointer.state_key, object)
+      }
+    } else {
+      pointer.state_key = change === 'historical-key'
+        ? `runs/${state.runId}/states/${String(state.stateGeneration).padStart(12, '0')}.json`
+        : 'arbitrary/state.json'
+      bucket.objects.set(pointer.state_key, object)
+    }
+    if (pointer.state_key !== originalKey) {
+      expect(() => index.db.sqlite.prepare('UPDATE experiment_runs SET state_key=? WHERE run_id=?')
+        .run(pointer.state_key, state.runId)).toThrow('state selection receipts are immutable')
+      // Independently verify the reader also refuses a substituted storage response.
+      const prepare = index.prepare
+      index.prepare = ((sql: string) => sql === 'SELECT state_key, state_generation FROM experiment_runs WHERE run_id = ?1'
+        ? { bind: () => ({ first: async () => pointer }) } : prepare(sql)) as typeof index.prepare
+    }
+    await expect(store.getState(state.runId)).rejects.toThrow(change === 'wrong-run'
+      ? 'run state identity mismatch' : 'run state pointer digest mismatch')
   })
 
   it('reuses an identical persisted state when another body upload would fail', async () => {
@@ -262,17 +283,17 @@ describe('Cloudflare content-addressed checkpoint storage', () => {
         return super.put(key, value, options)
       }
     }()
-    const index = new FakeD1()
+    const index = new TestD1()
     const store = new CloudflareRunStore(bucket as unknown as R2Bucket,
       bucket as unknown as R2Bucket, index as unknown as D1Database)
     const release = await sealReleasePackage(audit0PackageBody)
-    const machine = await RunMachine.create(audit0Definition, release.digest, 'identical-state-replay')
+    const machine = await createControlledMachine(audit0Definition, release.digest, 'identical-state-replay')
     await machine.start()
-    const state = machine.snapshot()
-    await store.putState(state)
+    const state = machine.view()
+    await publish(store, state)
     const pointer = structuredClone(index.states.get(state.runId))
 
-    await store.putState(structuredClone(state))
+    await publish(store, state)
 
     expect(uploads).toBe(1)
     expect(bucket.objects.size).toBe(1)
@@ -282,18 +303,19 @@ describe('Cloudflare content-addressed checkpoint storage', () => {
 
   it('rejects differing bytes at the same committed generation', async () => {
     const bucket = new FakeR2Bucket()
-    const index = new FakeD1()
+    const index = new TestD1()
     const store = new CloudflareRunStore(bucket as unknown as R2Bucket,
       bucket as unknown as R2Bucket, index as unknown as D1Database)
     const release = await sealReleasePackage(audit0PackageBody)
-    const machine = await RunMachine.create(audit0Definition, release.digest, 'same-generation-conflict')
+    const machine = await createControlledMachine(audit0Definition, release.digest, 'same-generation-conflict')
     await machine.start()
-    const state = machine.snapshot()
-    await store.putState(state)
+    const state = machine.view()
+    await publish(store, state)
     const pointer = structuredClone(index.states.get(state.runId))
-    const changed = { ...state, updatedAt: new Date(Date.parse(state.updatedAt) + 1).toISOString() }
+    const competing = await createControlledMachine(audit0Definition, release.digest, state.runId, state.createdAt)
+    await competing.start(new Date(Date.parse(state.updatedAt) + 1).toISOString())
 
-    await expect(store.putState(changed)).rejects.toThrow('stale run-state generation rejected')
+    await expect(publish(store, competing.view())).rejects.toThrow('stale run-state generation rejected')
 
     expect(index.states.get(state.runId)).toEqual(pointer)
     expect(await store.getState(state.runId)).toEqual(state)
@@ -301,20 +323,20 @@ describe('Cloudflare content-addressed checkpoint storage', () => {
 
   it.each(['metadata', 'checksum'])('rejects an existing state with invalid %s before updating D1', async kind => {
     const bucket = new FakeR2Bucket()
-    const index = new FakeD1()
+    const index = new TestD1()
     const store = new CloudflareRunStore(bucket as unknown as R2Bucket,
       bucket as unknown as R2Bucket, index as unknown as D1Database)
     const release = await sealReleasePackage(audit0PackageBody)
-    const machine = await RunMachine.create(audit0Definition, release.digest, `state-head-${kind}`)
+    const machine = await createControlledMachine(audit0Definition, release.digest, `state-head-${kind}`)
     await machine.start()
-    const state = machine.snapshot()
-    await store.putState(state)
+    const state = machine.view()
+    await publish(store, state)
     const pointer = structuredClone(index.states.get(state.runId))
     const object = [...bucket.objects.values()][0]!
     if (kind === 'metadata') object.customMetadata.objectSha256 = 'f'.repeat(64)
     else object.checksum = 'f'.repeat(64)
 
-    await expect(store.putState(state)).rejects.toThrow('run-state generation already exists with different bytes')
+    await expect(publish(store, state)).rejects.toThrow('run-state generation already exists with different bytes')
 
     expect(index.states.get(state.runId)).toEqual(pointer)
   })
@@ -328,17 +350,17 @@ describe('Cloudflare content-addressed checkpoint storage', () => {
         throw new Error('Network connection lost.')
       }
     }()
-    const index = new FakeD1()
+    const index = new TestD1()
     const store = new CloudflareRunStore(bucket as unknown as R2Bucket,
       bucket as unknown as R2Bucket, index as unknown as D1Database)
     const release = await sealReleasePackage(audit0PackageBody)
-    const machine = await RunMachine.create(audit0Definition, release.digest, 'r2-lost-acknowledgement')
+    const machine = await createControlledMachine(audit0Definition, release.digest, 'r2-lost-acknowledgement')
     await machine.start()
-    const state = machine.snapshot()
+    const state = machine.view()
 
-    await expect(store.putState(state)).rejects.toThrow('Network connection lost.')
+    await expect(publish(store, state)).rejects.toThrow('Network connection lost.')
     expect(index.states.has(state.runId)).toBe(false)
-    await store.putState(state)
+    await publish(store, state)
 
     expect(uploads).toBe(1)
     expect(await store.getState(state.runId)).toEqual(state)
@@ -352,39 +374,39 @@ describe('Cloudflare content-addressed checkpoint storage', () => {
         return null
       }
     }()
-    const index = new FakeD1()
+    const index = new TestD1()
     const store = new CloudflareRunStore(bucket as unknown as R2Bucket,
       bucket as unknown as R2Bucket, index as unknown as D1Database)
     const release = await sealReleasePackage(audit0PackageBody)
-    const machine = await RunMachine.create(audit0Definition, release.digest, `raced-state-${valid}`)
+    const machine = await createControlledMachine(audit0Definition, release.digest, `raced-state-${valid}`)
     await machine.start()
-    const state = machine.snapshot()
+    const state = machine.view()
 
     if (valid) {
-      await store.putState(state)
+      await publish(store, state)
       expect(await store.getState(state.runId)).toEqual(state)
     } else {
-      await expect(store.putState(state)).rejects.toThrow('run-state generation already exists with different bytes')
+      await expect(publish(store, state)).rejects.toThrow('run-state generation already exists with different bytes')
       expect(index.states.has(state.runId)).toBe(false)
     }
   })
 
   it('rejects a stale state generation instead of moving the run pointer backwards', async () => {
     const bucket = new FakeR2Bucket()
-    const index = new FakeD1()
+    const index = new TestD1()
     const store = new CloudflareRunStore(
       bucket as unknown as R2Bucket,
       bucket as unknown as R2Bucket,
       index as unknown as D1Database,
     )
     const release = await sealReleasePackage(audit0PackageBody)
-    const machine = await RunMachine.create(audit0Definition, release.digest, 'generation-cas')
+    const machine = await createControlledMachine(audit0Definition, release.digest, 'generation-cas')
     await machine.start()
-    const older = machine.snapshot()
-    await machine.stop('sealed-boundary-stop')
-    const newer = machine.snapshot()
-    await store.putState(newer)
-    await expect(store.putState(older)).rejects.toThrow('stale run-state generation rejected')
+    const older = machine.view()
+    await machine.fail('synthetic terminal failure')
+    const newer = machine.view()
+    await publish(store, newer)
+    await expect(publish(store, older)).rejects.toThrow('stale run-state generation rejected')
     expect(await store.getState(newer.runId)).toEqual(newer)
   })
 
@@ -393,48 +415,57 @@ describe('Cloudflare content-addressed checkpoint storage', () => {
     const store = new CloudflareRunStore(
       bucket as unknown as R2Bucket,
       bucket as unknown as R2Bucket,
-      new FakeD1() as unknown as D1Database,
+      new TestD1() as unknown as D1Database,
     )
     const release = await sealReleasePackage(audit0PackageBody)
-    const machine = await RunMachine.create(audit0Definition, release.digest, 'late-stop-write')
+    const machine = await createControlledMachine(audit0Definition, release.digest, 'late-stop-write')
     await machine.start()
-    const running = machine.snapshot()
-    await store.putState(running)
-    await machine.stop('operator-requested-immediate-stop')
-    const stopped = machine.snapshot()
-    await store.putState(stopped)
-    const late = { ...running, stateGeneration: stopped.stateGeneration + 1 }
-    await expect(store.putState(late)).rejects.toThrow('stale run-state generation rejected')
+    const running = machine.view()
+    await publish(store, running)
+    await machine.fail('synthetic terminal failure')
+    const stopped = machine.view()
+    await publish(store, stopped, { generation: running.stateGeneration, digest: await sha256(running) })
+    const competing = await createControlledMachine(audit0Definition, release.digest, running.runId, running.createdAt)
+    await competing.start(running.updatedAt)
+    await competing.seal()
+    await competing.seal()
+    expect(competing.view().stateGeneration).toBeGreaterThan(stopped.stateGeneration)
+    await expect(publish(store, competing.view())).rejects.toThrow('stale run-state generation rejected')
     expect(await store.getState(stopped.runId)).toEqual(stopped)
   })
 
   it('recovers when R2 commits but the D1 state pointer fails before update', async () => {
     const bucket = new FakeR2Bucket()
     const release = await sealReleasePackage(audit0PackageBody)
-    const machine = await RunMachine.create(audit0Definition, release.digest, 'orphaned-generation')
+    const machine = await createControlledMachine(audit0Definition, release.digest, 'orphaned-generation')
     await machine.start()
-    const firstBranch = machine.snapshot()
+    const firstBranch = machine.view()
+    const index = new TestD1()
+    const prepare = index.prepare
     const failedIndex = {
-      prepare: () => ({ bind: () => ({
-        run: async () => { throw new Error('simulated Durable Object reset') },
-        first: async () => null,
-      }) }),
+      batch: index.batch,
+      prepare: (sql: string) => {
+        const statement = prepare(sql)
+        if (!sql.includes('INSERT INTO experiment_runs')) return statement
+        return { bind: () => ({ run: async () => { throw new Error('simulated Durable Object reset') } }) }
+      },
     }
     const interrupted = new CloudflareRunStore(
       bucket as unknown as R2Bucket,
       bucket as unknown as R2Bucket,
       failedIndex as unknown as D1Database,
     )
-    await expect(interrupted.putState(firstBranch)).rejects.toThrow('simulated Durable Object reset')
+    await expect(publish(interrupted, firstBranch)).rejects.toThrow('simulated Durable Object reset')
 
-    const retryBranch = structuredClone(firstBranch)
-    retryBranch.updatedAt = new Date(Date.parse(firstBranch.updatedAt) + 1).toISOString()
+    const retryMachine = await createControlledMachine(audit0Definition, release.digest, firstBranch.runId, firstBranch.createdAt)
+    await retryMachine.start(new Date(Date.parse(firstBranch.updatedAt) + 1).toISOString())
+    const retryBranch = retryMachine.view()
     const recovered = new CloudflareRunStore(
       bucket as unknown as R2Bucket,
       bucket as unknown as R2Bucket,
-      new FakeD1() as unknown as D1Database,
+      index as unknown as D1Database,
     )
-    await recovered.putState(retryBranch)
+    await publish(recovered, retryBranch)
 
     expect(await recovered.getState(retryBranch.runId)).toEqual(retryBranch)
     expect([...bucket.objects.keys()].filter(key => key.startsWith(`runs/${retryBranch.runId}/states/`))).toHaveLength(2)

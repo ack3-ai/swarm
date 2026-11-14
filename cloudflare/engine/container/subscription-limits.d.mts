@@ -18,3 +18,15 @@ export interface SubscriptionWait {
 }
 export function validSubscriptionWaits(value: unknown): value is readonly SubscriptionWait[] | undefined
 export function subscriptionWaits(stdout: string): SubscriptionWait[] | undefined
+
+/** Binding names of the exhausted and the next Claude account; never token values. */
+export interface SubscriptionSwitch {
+  provider: 'claude'
+  sessionId: string
+  from: string
+  to: string
+  at: string
+  resetsAt: string
+}
+export function validSubscriptionSwitches(value: unknown): value is readonly SubscriptionSwitch[] | undefined
+export function subscriptionSwitches(stdout: string): SubscriptionSwitch[]

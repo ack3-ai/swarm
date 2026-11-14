@@ -8,6 +8,7 @@ export const observationHealthIoMs = 2_000
 
 export interface AgentObservationIdentity {
   runId: string
+  taskExecutionId?: string
   stageId: string
   waveId: string
   taskId: string
@@ -30,6 +31,7 @@ export interface AgentObservationHealth {
 
 function validateIdentity(identity: AgentObservationIdentity): void {
   if (!/^[a-z0-9][a-z0-9._-]{0,99}$/.test(identity.runId)
+    || (identity.taskExecutionId !== undefined && !/^[a-z0-9][a-z0-9._-]{0,99}$/.test(identity.taskExecutionId))
     || !Number.isSafeInteger(identity.attempt) || identity.attempt < 1
     || !/^[a-f0-9]{64}$/.test(identity.promptDigest)
     || [identity.stageId, identity.waveId, identity.taskId].some(value =>
@@ -137,15 +139,24 @@ export class R2AgentObservationHealthStore {
     throw new Error('agent observation health changed concurrently')
   }
 
+  /** Order failures by observation start; defer retries from completion. A newer
+   * confirmed success supersedes a late failure from an older observation. */
   async recordFailure(identity: AgentObservationIdentity, requestDigest: string,
-    operation: string, now = new Date()): Promise<AgentObservationHealth> {
-    if (!/^[a-f0-9]{64}$/.test(requestDigest) || !/^[a-z][a-z-]{0,79}$/.test(operation)) {
+    operation: string, now = new Date(), completedAt = now): Promise<AgentObservationHealth> {
+    if (!/^[a-f0-9]{64}$/.test(requestDigest) || !/^[a-z][a-z-]{0,79}$/.test(operation)
+      || !Number.isFinite(now.getTime()) || !Number.isFinite(completedAt.getTime()) || completedAt < now) {
       throw new TypeError('agent observation failure identity is invalid')
     }
     const at = now.toISOString()
     return this.update(identity, requestDigest, previous => {
-      if (previous.lastSuccessfulProcessAt !== null && at <= previous.lastSuccessfulProcessAt
-        || previous.lastFailedAt !== null && at < previous.lastFailedAt) return previous
+      if (previous.lastSuccessfulProcessAt !== null && at <= previous.lastSuccessfulProcessAt) return previous
+      const deadline = (incident: boolean) => new Date(Math.max(
+        Date.parse(previous.nextObservationAfter ?? '') || 0,
+        completedAt.getTime() + (incident ? observationIncidentPollMs : observationFailureSpacingMs))).toISOString()
+      // An older failure may finish later: extend its rate limit, never recount it.
+      if (previous.lastFailedAt !== null && at < previous.lastFailedAt) {
+        return { ...previous, nextObservationAfter: deadline(previous.incidentSince !== null) }
+      }
       const distinct = previous.lastFailedAt === null
         || now.getTime() - Date.parse(previous.lastFailedAt) >= observationFailureSpacingMs
       const consecutiveFailures = previous.consecutiveFailures + Number(distinct)
@@ -155,8 +166,7 @@ export class R2AgentObservationHealthStore {
       return { ...previous, firstFailedAt, lastFailedAt: at, consecutiveFailures,
         incidentSince: previous.incidentSince ?? (unresolved ? at : null),
         lastFailedOperation: operation,
-        nextObservationAfter: new Date(now.getTime() + (unresolved
-          ? observationIncidentPollMs : observationFailureSpacingMs)).toISOString(),
+        nextObservationAfter: deadline(unresolved),
       }
     })
   }

@@ -1,7 +1,13 @@
+import { createControlledMachine } from './support/controlled-machine.js'
+import { admissionControl, pauseWhen } from './support/admission-control.js'
+import { selectedSnapshots, restoreSelected } from './support/selected-snapshots.js'
+import { onTestFinished } from 'vitest'
 import { compileExperimentConfig } from './support/compile-config.js'
 import { AgentAttemptFailure, AgentExecutionPending, PermanentRunFailure } from '../src/run-errors.js'
 import { sha256 } from '../src/canonical.js'
-import { prepareFailedWaveRecovery } from '../src/failed-wave-recovery.js'
+import { forkWithSavedWork } from './support/saved-work.js'
+import { prepareStageForkSource } from '../src/stage-fork-source.js'
+import { syntheticSourceFence } from './support/source-fence.js'
 import document from './fixtures/audit0-hello-vault.json' with { type: 'json' }
 import { describe, expect, it } from 'vitest'
 import type { AgentRequest } from '../src/contracts.js'
@@ -38,7 +44,8 @@ const deepseek = {
 async function preparedMachine(config: any, runId: string) {
   const body = compileExperimentConfig(config)
   const release = await sealReleasePackage(body)
-  const machine = await RunMachine.create(body.definition, release.digest, runId)
+  const machine = await createControlledMachine(body.definition, release.digest, runId, undefined, undefined,
+    { auditId: runId, executionId: runId, epoch: 0, runtimeDigest: await sha256(null) })
   const store = new MemoryArtifactStore()
   const base = new DeterministicAuditProvider()
   await advanceExperimentOneWave({ definition: body.definition, machine, provider: base, artifactStore: store })
@@ -93,8 +100,8 @@ describe('independent review: sharing and failure boundaries', () => {
 })
 
 
-it('recovers independently sealed fast cohorts through the public recovery path without replaying them', async () => {
-  const config = manifest([{ ...luna, agents: 1 }, deepseek], 5)
+it('preserves accepted discovery peers through a source-owned saved-work export without replaying them', async () => {
+  const config = manifest([luna, { ...deepseek, required: true }], 5)
   const body = compileExperimentConfig(config)
   const release = await sealReleasePackage(body)
   const runtime = {
@@ -102,7 +109,7 @@ it('recovers independently sealed fast cohorts through the public recovery path 
     workerService: 'swarm-runtime-review-source', workerVersionId: '11111111-1111-4111-8111-111111111111',
     workflowName: 'audit-runtime-review-source', containerImageDigest: `sha256:${'a'.repeat(64)}`,
   }
-  const machine = await RunMachine.create(body.definition, release.digest, 'review-recovery-parent', new Date().toISOString(), runtime)
+  const machine = await createControlledMachine(body.definition, release.digest, 'review-recovery-parent', new Date().toISOString(), runtime, { auditId: 'review-recovery-parent', executionId: 'review-recovery-parent', epoch: 0, runtimeDigest: await sha256(runtime) })
   const store = new MemoryArtifactStore()
   const base = new DeterministicAuditProvider()
   await advanceExperimentOneWave({ definition: body.definition, machine, provider: base, artifactStore: store })
@@ -112,7 +119,7 @@ it('recovers independently sealed fast cohorts through the public recovery path 
       await advanceExperimentOneWave({ definition: body.definition, machine, artifactStore: store, provider: {
         async run(request) {
           if (configuredResearchTaskPoolId(request.task) === 'deepseek') {
-            throw new AgentAttemptFailure('fixture lost process without output', { includeDiagnosticsInRepair: false })
+            throw new PermanentRunFailure('fixture framework failure', 'integrity-failed')
           }
           return base.run(request)
         },
@@ -128,18 +135,18 @@ it('recovers independently sealed fast cohorts through the public recovery path 
   const targetRuntime = { ...runtime, id: 'runtime-review-target', frameworkCommit: 'b'.repeat(40),
     workerService: 'swarm-runtime-review-target', workerVersionId: '22222222-2222-4222-8222-222222222222',
     workflowName: 'audit-runtime-review-target' }
-  const prepared = await prepareFailedWaveRecovery({
-    definition: body.definition, checkpoint, source, sourceStateGeneration: source.stateGeneration,
-    sourceStateDigest: await sha256(source), targetRuntimeRelease: targetRuntime,
-    artifacts: { async read(record) {
-      const raw = store.contents.get(record.uri)!
-      expect(await sha256(raw)).toBe(record.contentDigest)
-      return JSON.parse(raw)
-    } },
-  })
-  const child = await RunMachine.recoverFailedWave(body.definition, checkpoint, source, 'review-recovery-child',
-    prepared.importedArtifacts, prepared.inheritedRejectedAttempts, prepared.evidence)
-  const restored = await RunMachine.fromState(body.definition, child.snapshot())
+  const load = async () => release
+  const selected = selectedSnapshots(); onTestFinished(selected.close)
+  await selected.select(machine)
+  const stateAt = selected.load
+  const prepared = await prepareStageForkSource({ sourceFrontier: true,
+    source: { runId: source.runId, state: { generation: source.stateGeneration, digest: await sha256(source) } },
+    releaseDigest: release.digest, sourceFence: syntheticSourceFence(source),
+    read: { stateAt, checkpoint: async () => checkpoint, release: load },
+    readArtifact: async record => store.contents.get(record.uri)!, readInputs: digest => store.readExecutionInputs(digest) })
+  const child = await forkWithSavedWork(prepared, 'review-recovery-child', targetRuntime, load, stateAt)
+  await selected.select(child)
+  const restored = await RunMachine.fromState(body.definition, child.snapshot(), load, stateAt)
   const calls: string[] = []
   await advanceExperimentOneWave({ definition: body.definition, machine: restored, artifactStore: store, provider: {
     async run(request) { calls.push(request.task.id); return base.run(request) },
@@ -172,21 +179,21 @@ it('replays a pending failure drain without re-dispatching the permanently faile
   } }
   await advanceExperimentOneWave({ definition: body.definition, machine, artifactStore: store, provider })
   expect(failedCalls).toBe(1)
-  const restored = await RunMachine.fromState(body.definition, machine.snapshot())
+  const restored = await restoreSelected(machine)
   await advanceExperimentOneWave({ definition: body.definition, machine: restored, artifactStore: store, provider })
   expect(failedCalls, 'a new polling slice must observe the saved failure rather than dispatching it again').toBe(1)
 })
 
 
-it('resumes a portable checkpoint at drained independent discovery without replaying accepted tasks', async () => {
+it('restores drained independent discovery without replaying accepted tasks', async () => {
   const { body, machine, store, base } = await preparedMachine(manifest([luna, deepseek]), 'review-stop-checkpoint')
-  let checks = 0
   await advanceExperimentOneWave({ definition: body.definition, machine, artifactStore: store, provider: base,
-    stopRequested: async () => ++checks > 1 })
+    reconcileControls: pauseWhen(machine, () => (machine.view().discoveryScheduler?.pools.some(pool => pool.nextWaveIndex > 0) ?? false)) })
   const accepted = machine.snapshot().artifacts.filter(artifact => artifact.stageId === 'discovery')
   expect(accepted).toHaveLength(4)
-  const checkpoint = await machine.seal()
-  const child = await RunMachine.resume(body.definition, checkpoint, 'review-stopped-child', new Set())
+  await machine.seal()
+  const child = await restoreSelected(machine)
+  await admissionControl(child, 'continue')
   const calls: string[] = []
   await advanceExperimentOneWave({ definition: body.definition, machine: child, artifactStore: store, provider: {
     async run(request) { calls.push(request.task.id); return base.run(request) },

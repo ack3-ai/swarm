@@ -1,15 +1,18 @@
 import document from '../fixtures/audit0-hello-vault.json' with { type: 'json' }
-import type { ResearchAssignment } from '../../src/contracts.js'
+import type { ExperimentDefinition, ResearchAssignment } from '../../src/contracts.js'
 import { compileExperimentConfig } from './compile-config.js'
 
+// The fixture has 16 discovery waves because every request carries its whole stage; no test
+// gets past wave 12. Tests of the 64-wave maximum compile it with `maxDiscoveryWaves: 64`.
 export const audit0PackageBody = compileExperimentConfig(document)
 export const audit0Definition = audit0PackageBody.definition
 
 export function expectedResearchAssignment(
   wave: number,
   researcher: number,
+  definition: ExperimentDefinition = audit0Definition,
 ): Pick<ResearchAssignment, 'role' | 'buildsOn'> {
-  const task = audit0Definition.stages
+  const task = definition.stages
     .find(stage => stage.kind === 'discovery')
     ?.waves[wave]
     ?.tasks.find(candidate => candidate.providerClass === 'core' && candidate.research?.researcher === researcher)

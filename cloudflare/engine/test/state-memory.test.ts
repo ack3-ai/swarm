@@ -1,3 +1,5 @@
+import { createControlledMachine } from './support/controlled-machine.js'
+import { selectedSnapshots } from './support/selected-snapshots.js'
 import { describe, expect, it } from 'vitest'
 import { canonicalJson, sha256 } from '../src/canonical.js'
 import { canonicalJsonBytes } from '../src/canonical-bytes.js'
@@ -33,7 +35,7 @@ describe('bounded state serialization and internal views', () => {
   })
 
   it('shares frozen views across reads while snapshots and old frontiers remain independent', async () => {
-    const machine = await RunMachine.create(audit0Definition, 'a'.repeat(64), 'immutable-state-view')
+    const machine = await createControlledMachine(audit0Definition, 'a'.repeat(64), 'immutable-state-view')
     const before = machine.view(), snapshot = machine.snapshot()
     expect(machine.view()).toBe(before)
     expect(() => { before.cursor.stageIndex = 99 }).toThrow(TypeError)
@@ -67,8 +69,12 @@ describe('bounded state serialization and internal views', () => {
     const clone = machine.snapshot()
     clone.artifacts[0]!.protocol = {}
     expect(machine.view().artifacts[0]!.protocol).toBe(protocol)
-    const restored = await RunMachine.fromState(audit0Definition, accepted)
-    expect(restored.view()).toEqual(accepted)
-    expect(restored.view()).not.toBe(accepted)
+    const selections = selectedSnapshots()
+    try {
+      await selections.select(accepted)
+      const restored = await RunMachine.fromState(audit0Definition, accepted, undefined, selections.load)
+      expect(restored.view()).toEqual(accepted)
+      expect(restored.view()).not.toBe(accepted)
+    } finally { selections.close() }
   })
 })

@@ -1,3 +1,5 @@
+import { createControlledMachine } from './support/controlled-machine.js'
+import { restoreSelected } from './support/selected-snapshots.js'
 import { describe, expect, it } from 'vitest'
 import document from './fixtures/audit0-hello-vault.json' with { type: 'json' }
 import type { AgentProvider, AgentRequest } from '../src/contracts.js'
@@ -55,7 +57,7 @@ describe('required discovery pools', () => {
   it('completes when required discovery and both reviewers return accepted work', async () => {
     const body = compileExperimentConfig(manifest())
     const release = await sealReleasePackage(body)
-    const machine = await RunMachine.create(body.definition, release.digest, 'required-discovery-success', startedAt)
+    const machine = await createControlledMachine(body.definition, release.digest, 'required-discovery-success', startedAt)
     const outcome = await runExperiment({ definition: body.definition, machine,
       provider: new DeterministicAuditProvider(), artifactStore: new MemoryArtifactStore(),
       policy: createAudit0RunPolicy(() => Date.parse(startedAt) + 60_000),
@@ -68,7 +70,7 @@ describe('required discovery pools', () => {
   it('fails after bounded same-session recovery and retains unfinished native work', async () => {
     const body = compileExperimentConfig(manifest())
     const release = await sealReleasePackage(body)
-    const machine = await RunMachine.create(body.definition, release.digest, 'required-discovery-outage', startedAt)
+    const machine = await createControlledMachine(body.definition, release.digest, 'required-discovery-outage', startedAt)
     const base = new DeterministicAuditProvider()
     const requests: AgentRequest[] = []
     const disposed: string[] = []
@@ -99,18 +101,17 @@ describe('required discovery pools', () => {
     const firstLane = requests.filter(request => request.task.id === requests[0]!.task.id)
     expect(firstLane.map(request => request.continuationMode)).toEqual(['new', 'resume'])
     expect(firstLane[1]!.sessionId).toBe('session-11111111-1111-4111-8111-111111111111')
-    const cleanup = await disposeTerminalWorkspaces(provider, body.definition, state)
+    await expect(disposeTerminalWorkspaces(provider, body.definition, machine.view())).rejects.toThrow('cancel control')
     for (const request of requests) {
-      expect(cleanup.retainedWorkspaceKeys).toContain(request.task.workspaceKey)
-      expect(disposed).not.toContain(request.task.workspaceKey)
+      expect(disposed).not.toContain(request.execution!.workspaceKey)
     }
-    await expect(RunMachine.fromState(body.definition, state)).resolves.toBeDefined()
+    await expect(restoreSelected(machine)).resolves.toBeDefined()
   })
 
   it('fails a bounded core observation incident without rejecting or disposing unknown native work', async () => {
     const body = compileExperimentConfig(manifest())
     const release = await sealReleasePackage(body)
-    const machine = await RunMachine.create(body.definition, release.digest,
+    const machine = await createControlledMachine(body.definition, release.digest,
       'core-observation-outage', startedAt)
     const base = new DeterministicAuditProvider()
     const disposed: string[] = []
@@ -137,10 +138,9 @@ describe('required discovery pools', () => {
         promptDigest: unresolved!.promptDigest }),
     ]))
     expect(state.rejectedAttempts.some(value => value.taskId === unresolved!.task.id)).toBe(false)
-    const restored = await RunMachine.fromState(body.definition, state)
+    const restored = await restoreSelected(machine)
     expect(restored.snapshot().inFlightAgentAttempts).toEqual(state.inFlightAgentAttempts)
-    const cleanup = await disposeTerminalWorkspaces(provider, body.definition, state)
-    expect(cleanup.activeWorkspaceKeys).toContain(unresolved!.task.workspaceKey)
-    expect(disposed).not.toContain(unresolved!.task.workspaceKey)
+    await expect(disposeTerminalWorkspaces(provider, body.definition, machine.view())).rejects.toThrow('cancel control')
+    expect(disposed).not.toContain(unresolved!.execution!.workspaceKey)
   })
 })

@@ -1,3 +1,5 @@
+import { createControlledMachine } from './support/controlled-machine.js'
+import { restoreSelected } from './support/selected-snapshots.js'
 import { compileExperimentConfig } from './support/compile-config.js'
 import document from './fixtures/audit0-hello-vault.json' with { type: 'json' }
 import { expect, it } from 'vitest'
@@ -33,7 +35,7 @@ const deepseek = {
 async function preparedMachine(config: any, runId: string) {
   const body = compileExperimentConfig(config)
   const release = await sealReleasePackage(body)
-  const machine = await RunMachine.create(body.definition, release.digest, runId)
+  const machine = await createControlledMachine(body.definition, release.digest, runId)
   const store = new MemoryArtifactStore()
   const base = new DeterministicAuditProvider()
   await advanceExperimentOneWave({ definition: body.definition, machine, provider: base, artifactStore: store })
@@ -53,7 +55,7 @@ it('records two completed peers while one observation remains unknown, without s
  expect(accepted).toHaveLength(2);expect(state.rejectedAttempts).toHaveLength(0)
  expect(state.inFlightAgentAttempts?.map(a=>a.taskId).sort()).toEqual(['additive-wave-0-research-1','core-wave-0-research-3'])
  const priorUsage=state.budget.modelCalls
- const restored=await RunMachine.fromState(body.definition,state)
+ const restored=await restoreSelected(machine,state)
  const afterCalls:string[]=[]
  await advanceExperimentOneWave({definition:body.definition,machine:restored,artifactStore:store,provider:{async run(request){afterCalls.push(request.task.id);throw new AgentExecutionPending('same-process','unavailable')}}})
  expect(afterCalls.sort()).toEqual(['additive-wave-0-research-1','core-wave-0-research-3'])

@@ -1,5 +1,5 @@
 /// <reference types="node" />
-import { audit0Request, operationLatency, summarizeStatus } from './audit0-control-lib.js'
+import { audit0Request, summarizeStatus, withOperationLatency } from './audit0-control-lib.js'
 
 const endpoint = (process.env.ACK3_ENGINE_URL ?? '').replace(/\/$/, '')
 const token = process.env.CONTROL_API_TOKEN ?? ''
@@ -26,7 +26,6 @@ try {
 }
 if (!response.ok) throw new Error(`control API ${response.status}: ${JSON.stringify(result)}`)
 if (operation.timingField !== undefined) {
-  const record = result as Record<string, unknown>
-  result = { ...record, ...operationLatency(operation.timingField, record[operation.timingField], endToEndMs) }
+  result = withOperationLatency(operation.timingField, result as Record<string, unknown>, endToEndMs)
 }
 console.log(JSON.stringify(command === 'status' ? summarizeStatus(result) : result))

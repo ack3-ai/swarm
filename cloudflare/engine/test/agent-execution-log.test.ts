@@ -2,9 +2,9 @@ import { describe, expect, it } from 'vitest'
 import { sha256 } from '../src/canonical.js'
 import {
   agentLogChunkMaxBytes,
-  chunkAgentLogEvents,
   parseLocalAgentLog,
   R2AgentExecutionLogStore,
+  readAgentLogIndex,
 } from '../src/agent-execution-log.js'
 
 interface Stored {
@@ -87,15 +87,6 @@ function line(at: string, stream: 'stdout' | 'stderr', text: string): string {
 }
 
 describe('private agent execution logs', () => {
-  it('lists exact immutable admitted requests without mixing task siblings', async () => {
-    const bucket = new FakeR2(), store = new R2AgentExecutionLogStore(bucket as unknown as R2Bucket)
-    const first = await request(), second = { ...first, requestDigest: 'b'.repeat(64), attempt: 2 }
-    await store.putRequest(first)
-    await store.putRequest(second)
-    expect((await store.listRequests(runId, taskId)).map(value => value.requestDigest).toSorted())
-      .toEqual([first.requestDigest, second.requestDigest])
-    expect(await store.listRequests(runId, 'unrelated')).toEqual([])
-  })
   it('seals setup-failure diagnostics beside the exact private request without overwriting them', async () => {
     const bucket = new FakeR2()
     const store = new R2AgentExecutionLogStore(bucket as unknown as R2Bucket)
@@ -179,15 +170,60 @@ describe('private agent execution logs', () => {
     expect(JSON.parse(bucket.objects.get(`${base}chunk-000002.json`)!.content).events[0].text).toBe('third')
   })
 
-  it('splits oversized events into valid bounded chunk objects without losing text', () => {
-    const event = { at: '2026-09-26T12:00:01.000Z', stream: 'stdout' as const, text: 'x'.repeat(200_000) }
-    const chunks = chunkAgentLogEvents([event])
+  it('persists native events in bounded chunks without losing text', async () => {
+    const bucket = new FakeR2(), store = new R2AgentExecutionLogStore(bucket as unknown as R2Bucket)
+    const event = { at: '2026-09-26T12:00:01.000Z', stream: 'stdout' as const, text: 'x'.repeat(4 * 1024) }
+    const source = (JSON.stringify({ schemaVersion: 1, ...event }) + '\n').repeat(64)
+    const index = await store.sync({ runId, taskId, requestDigest, source, sourceOffset: 0, complete: true })
+    const chunks = [...bucket.objects].filter(([key]) => key.includes('/chunk-')).map(([, value]) => value.content)
     expect(chunks.length).toBeGreaterThan(3)
-    expect(chunks.every(chunk => new TextEncoder().encode(JSON.stringify({ schemaVersion: 1, events: chunk.events })).byteLength
-      <= agentLogChunkMaxBytes)).toBe(true)
-    expect(chunks.flatMap(chunk => chunk.events).map(item => item.text).join('')).toBe(event.text)
-    expect(chunks.reduce((total, chunk) => total + chunk.sourceEventsConsumed, 0))
-      .toBe(chunks.flatMap(chunk => chunk.events).length)
+    expect(chunks.every(content => new TextEncoder().encode(content).byteLength <= agentLogChunkMaxBytes)).toBe(true)
+    expect(chunks.flatMap(content => JSON.parse(content).events).map(item => item.text).join('')).toBe(event.text.repeat(64))
+    expect(index).toMatchObject({ sourceBytes: new TextEncoder().encode(source).byteLength, complete: true, truncated: false })
+  })
+
+  it('keeps a reported quota wait in the index until it ends or the log completes', async () => {
+    const bucket = new FakeR2(), store = new R2AgentExecutionLogStore(bucket as unknown as R2Bucket)
+    const wait = (at: string, resetsAt: string | null) =>
+      `${JSON.stringify({ schemaVersion: 1, kind: 'subscription-wait', at, provider: 'claude', resetsAt })}\n`
+    const read = () => readAgentLogIndex(bucket as unknown as R2Bucket, { runId, taskId, requestDigest })
+    const before = await store.sync({ runId, taskId, requestDigest, complete: false, sourceOffset: 0,
+      source: line('2026-11-06T09:00:00.000Z', 'stdout', 'working\n') })
+    expect(before.subscriptionWait).toBeUndefined()
+    const waiting = await store.sync({ runId, taskId, requestDigest, complete: false, sourceOffset: before.sourceBytes,
+      source: wait('2026-11-06T09:01:00.000Z', '2026-11-10T08:00:00.000Z') })
+    const open = { provider: 'claude', since: '2026-11-06T09:01:00.000Z', resetsAt: '2026-11-10T08:00:00.000Z' }
+    expect(waiting).toMatchObject({ chunkCount: 1, eventCount: 1, subscriptionWait: open })
+    // Later observations without a status line keep the open wait.
+    const quiet = await store.sync({ runId, taskId, requestDigest, complete: false,
+      sourceOffset: waiting.sourceBytes, source: '' })
+    expect(quiet.subscriptionWait).toEqual(open)
+    expect((await read())?.subscriptionWait).toEqual(open)
+    const resumed = await store.sync({ runId, taskId, requestDigest, complete: false, sourceOffset: quiet.sourceBytes,
+      source: wait('2026-11-10T08:00:01.000Z', null) + line('2026-11-10T08:00:02.000Z', 'stdout', 'resumed\n') })
+    expect(resumed.subscriptionWait).toBeUndefined()
+    expect(resumed.eventCount).toBe(2)
+    const again = await store.sync({ runId, taskId, requestDigest, complete: false, sourceOffset: resumed.sourceBytes,
+      source: wait('2026-11-10T08:01:00.000Z', '2026-11-10T13:00:00.000Z') })
+    expect(again.subscriptionWait).toMatchObject({ resetsAt: '2026-11-10T13:00:00.000Z' })
+    expect((await store.finish({ runId, taskId, requestDigest, truncated: false })).subscriptionWait).toBeUndefined()
+    expect(await read()).toMatchObject({ complete: true })
+    expect((await read())?.subscriptionWait).toBeUndefined()
+  })
+
+  it('treats a malformed wait status like other corrupt capture lines and reads older indexes', async () => {
+    const malformed = `${JSON.stringify({ schemaVersion: 1, kind: 'subscription-wait', at: '2026-11-06T09:01:00.000Z',
+      provider: 'codex', resetsAt: '2026-11-10T08:00:00.000Z' })}\n`
+    expect(parseLocalAgentLog(malformed)).toMatchObject({ events: [], truncated: true })
+    expect(parseLocalAgentLog(malformed).subscriptionWait).toBeUndefined()
+    const bucket = new FakeR2(), store = new R2AgentExecutionLogStore(bucket as unknown as R2Bucket)
+    // An index written before this field existed has no wait and stays valid.
+    await store.sync({ runId, taskId, requestDigest, complete: false, sourceOffset: 0,
+      source: line('2026-11-06T09:00:00.000Z', 'stdout', 'working\n') })
+    expect(JSON.parse(bucket.objects.get(`${base}index.json`)!.content)).not.toHaveProperty('subscriptionWait')
+    expect(await readAgentLogIndex(bucket as unknown as R2Bucket, { runId, taskId, requestDigest }))
+      .toMatchObject({ chunkCount: 1, complete: false })
+    expect(await readAgentLogIndex(bucket as unknown as R2Bucket, { runId, taskId: 'research-2', requestDigest })).toBeNull()
   })
 
   it('ignores an unfinished line until the next observation and marks terminal corruption', () => {
@@ -198,23 +234,5 @@ describe('private agent execution logs', () => {
       truncated: false,
     })
     expect(parseLocalAgentLog(completeLine + partial, true)).toMatchObject({ truncated: true })
-  })
-})
-
-
-describe('fenced native log snapshots', () => {
-  it('hashes all captured chunks without promoting incomplete logs to a terminal receipt', async () => {
-    const bucket = new FakeR2(), store = new R2AgentExecutionLogStore(bucket as unknown as R2Bucket)
-    await store.putRequest(await request())
-    await store.sync({ runId, taskId, requestDigest,
-      source: line('2026-09-26T12:00:01Z', 'stdout', 'subscription wait'), sourceOffset: 0, complete: false })
-    const before = JSON.stringify([...bucket.objects])
-    const custody = await store.custodySnapshot({ runId, taskId, requestDigest })
-    expect(custody.index.complete).toBe(false)
-    expect(custody.chunkDigests).toHaveLength(1)
-    expect(custody.requestDigest).toBe(await sha256(await request()))
-    expect(JSON.stringify([...bucket.objects])).toBe(before)
-    bucket.objects.get(`${base}chunk-000000.json`)!.content += 'corruption'
-    await expect(store.custodySnapshot({ runId, taskId, requestDigest })).rejects.toThrow()
   })
 })

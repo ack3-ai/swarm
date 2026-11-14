@@ -13,6 +13,8 @@ export interface DashboardRun {
   updatedAt: string
   createdAt: string
   terminalReason: string | null
+  fork?: { sourceRunId: string; sourceGeneration: number; sourceDigest: string; boundary: string;
+    savedWorkDigest?: string }
 }
 
 export interface LiveCompletion {
@@ -79,7 +81,9 @@ export interface DashboardWaveTask {
   model: string
   provider: string
   role: string
-  status: 'pending' | 'awaiting-result' | 'returned' | 'accepted' | 'rejected' | 'unavailable' | 'interrupted' | 'not-run' | 'unknown'
+  required?: boolean
+  status: 'pending' | 'awaiting-result' | 'returned' | 'accepted' | 'rejected' | 'blocked' | 'paused' | 'unavailable' | 'interrupted' | 'not-run' | 'unknown'
+  statusDetail?: string
   lastAttempt: number | null
   lastReceiptAt: string | null
   rejectedAttempts: number
@@ -169,10 +173,17 @@ export interface DashboardSnapshot {
   schemaVersion: 1
   generatedAt: string
   run: DashboardRun
+  control?: { revision: number; pauses: readonly import('./run-commands.js').RunCommandScope[];
+    lastOutcome: { commandId: string; status: string; detail?: string } | null;
+    blockedTasks: readonly { taskId: string; category: string; message: string }[] }
+  commandStatus?: { kind: 'recorded'; commandId: string; action: string;
+    status: import('./run-command-journal.js').RunOperationStatus | 'waiting' | 'superseded'; revision: number }
+    | { kind: 'unavailable' } | null
   executionStatus?: RunStatus | 'incomplete' | 'unknown' | 'paused'
   timing?: DashboardTiming
   throughput?: DashboardThroughput | null
   recordedUsage: ProviderUsage
+  accountingUncertain?: boolean
   provisionalUsage: ProviderUsage
   stages: DashboardStage[]
   waves: DashboardWave[]

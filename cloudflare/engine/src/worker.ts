@@ -1,22 +1,32 @@
-import type { DiscoveryPoolWaiver } from './discovery-pool-waiver.js'
+import { RunCommandConflict } from './run-commands.js'
+import { dispatchAuditWorkflow, reconcileAuditStartup } from './execution-workflow.js'
+import { requestSavedWorkExport } from './source-export.js'
+import { observeExpiredFixture } from './fixture-native-observation.js'
+import { assertCompletedRunDelivery, deliverCompletedRun, registerCompletedRunDelivery } from './completed-run-delivery.js'
+import type { CoordinatorDeliveryMarker, LaunchDeliveryMarker } from './run-control-delivery.js'
+import { verifiedCleanupWorkspaces } from './command-custody.js'
+import { RunControlDelivery, registerDelivery } from './run-control-delivery.js'
+import { deliverRunControl, settleCancelledExecution, settleControlledFailure, assertExecutionOwner } from './run-control-executor.js'
+import { bootstrapExecution } from './root-execution.js'
+import { CommandCustodyCollector } from './command-custody.js'
+import { runControlResponse } from './run-control-api.js'
+import { RunCommandJournal } from './run-command-journal.js'
+import { hasPendingNativeControl, reconcileRunControls, settleTerminalControlsAndDispose } from './run-control-reconcile.js'
 import { DurableObject, WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloudflare:workers'
 import { NonRetryableError } from 'cloudflare:workflows'
 import { getAgentSandbox } from './agent-sandbox-client.js'
 import { resolveTargetEnvironment } from './target-environment.js'
 import { assertReleaseEnvironmentMatchesRuntime } from './environment-image.js'
-import type { AuditWorkflowPayload, Env, QuarantinedRevalidation } from './env.js'
+import type { AuditWorkflowPayload, Env } from './env.js'
 import type {
-  FailedWaveRecoveryEvidence, ReleasePackageBody, RetainedNativeRecoveryEvidence,
+  ReleasePackageBody,
   RunCursor, RunState, RuntimeRelease, SealedCheckpoint,
-  TerminalCompletionRecoveryEvidence, RuntimeTransitionEvidence,
 } from './contracts.js'
-import { CloudflareRunStore, R2ArtifactStore } from './cloudflare-storage.js'
+import { CloudflareRunStore, R2ArtifactStore, stateWriter } from './cloudflare-storage.js'
 import { canonicalJson, sha256 } from './canonical.js'
 import { containerReadinessCommand } from './container-readiness.js'
-import { expiredResumeClockAmendment } from './recovery-clock.js'
-import { rejectedAttemptIdentity, RunMachine } from './machine.js'
+import { RunMachine } from './machine.js'
 import { SandboxAgentProvider } from './sandbox-provider.js'
-import { QuarantinedRevalidationProvider } from './revalidation-provider.js'
 import { advanceExperimentOneWave, audit0RunPolicy, disposeTerminalWorkspaces } from './runner.js'
 import dashboardHtml from './dashboard.html'
 import { monitoringRoute } from './dashboard-api.js'
@@ -24,29 +34,19 @@ import { dashboardAccessAllowed, monitoringRequestFromDashboard } from './dashbo
 import { storeSourceArchive } from './source-provenance.js'
 import { isPermanentRunFailure, PermanentRunFailure, TransientRunFailure } from './run-errors.js'
 import {
-  canStopAtSealedWaveBoundary,
   failureForWorkflowProgress,
   type WaveProgress,
   workflowFailureDisposition,
   workflowProgress,
 } from './workflow-outcome.js'
-import { waveStepConfig, workflowBootstrapProgress } from './workflow-step-config.js'
+import { waveStepConfig } from './workflow-step-config.js'
 import {
   pinnedRuntime, resolveRuntimeSelector, RuntimeRouter, sameRuntimeRelease, type RuntimeSelector,
 } from './runtime-release.js'
 import { assertLocalRuntime, engineRole, runtimeServiceRoute } from './runtime-service.js'
 import { placement } from './placement.js'
-import { prepareFailedWaveRecovery } from './failed-wave-recovery.js'
-import { prepareTerminalCompletionRecovery } from './terminal-completion-recovery.js'
-import { prepareCheckpointRuntimeTransition } from './checkpoint-runtime-transition.js'
 import { durableLaneDiagnostic } from './lane-diagnostics.js'
-import { R2AgentExecutionReceiptStore } from './agent-execution-receipt.js'
-import { R2AgentExecutionLogStore } from './agent-execution-log.js'
-import { PromotedExecutionProvider } from './promoted-execution.js'
 import { retireTerminalFixture } from './terminal-fixture-retirement.js'
-import { retireStoppedRun } from './stopped-run-retirement.js'
-import { retireFailedRun } from './failed-run-retirement.js'
-import { assertUnmaterializedRecoveryRetirementProof } from './unmaterialized-recovery-retirement.js'
 import { validateNewSearchAdmission } from './validation.js'
 
 export { AgentSandbox, Sandbox } from './agent-sandbox.js'
@@ -71,7 +71,7 @@ async function authorized(request: Request, secret: string): Promise<boolean> {
 }
 
 function experimentFrom(pathname: string): string | null {
-  const value = pathname.match(/^\/v1\/experiments\/([a-z0-9][a-z0-9._-]{0,99})\/(?:release|activate|runs|resumes|recoveries|terminal-recoveries|discovery-waivers|retire-unmaterialized-recovery|retire-failed-native)$/)?.[1]
+  const value = pathname.match(/^\/v1\/experiments\/([a-z0-9][a-z0-9._-]{0,99})\/(?:release|activate|runs)$/)?.[1]
   return value ?? null
 }
 
@@ -86,34 +86,7 @@ interface ReleasePointer {
   runtimeRelease?: RuntimeRelease
 }
 
-type RunReservationProvenance =
-  | Readonly<{ mode: 'start', releaseDigest: string, runtimeRelease?: RuntimeRelease }>
-  | Readonly<{
-    mode: 'resume'
-    checkpointDigest: string
-    runtimeRelease?: RuntimeRelease
-    runtimeTransition?: RuntimeTransitionEvidence
-    revalidate?: { sourceRunId?: string, outputDigest?: string }
-  }>
-  | Readonly<{
-    mode: 'recover-failed-wave'
-    checkpointDigest: string
-    runtimeRelease: RuntimeRelease
-    failedWaveRecovery: FailedWaveRecoveryEvidence
-  }>
-  | Readonly<{
-    mode: 'recover-terminal-completion'
-    checkpointDigest: string
-    runtimeRelease: RuntimeRelease
-    terminalCompletionRecovery: TerminalCompletionRecoveryEvidence
-  }>
-
-  | Readonly<{
-    mode: 'recover-discovery-waiver'
-    checkpointDigest: string
-    runtimeRelease: RuntimeRelease
-    discoveryPoolWaiver: DiscoveryPoolWaiver
-  }>
+type RunReservationProvenance = Readonly<{ mode: 'start', releaseDigest: string, runtimeRelease?: RuntimeRelease }>
 
 interface RunReservation {
   experimentId: string
@@ -125,6 +98,7 @@ interface RunReservation {
   retirementProofDigest?: string
   dispatchInProgress?: true
   dispatchRefusedStatus?: number
+  dispatchRefusedReason?: string
 }
 
 async function runtimeResponseBody(response: Response): Promise<Record<string, unknown>> {
@@ -136,48 +110,35 @@ async function runtimeResponseBody(response: Response): Promise<Record<string, u
   return value as Record<string, unknown>
 }
 
-async function dispatchAuditWorkflow(env: Env, payload: AuditWorkflowPayload): Promise<string> {
-  if (engineRole(env) !== 'front-door') {
-    const instance = await env.AUDIT_WORKFLOW.create({
-      id: payload.runId,
-      params: payload,
-      ...placement(env),
-      retention: { successRetention: '30 days', errorRetention: '30 days' },
-    })
-    return instance.id
-  }
-  if (payload.runtimeRelease === undefined) throw new Error('runtime-bound audit payload is required')
-  const response = await new RuntimeRouter(env).fetch(payload.runtimeRelease, '/internal/runtime/audit-runs', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(payload),
-  })
-  const body = await runtimeResponseBody(response)
-  if (typeof body.workflowInstanceId !== 'string' || body.workflowInstanceId !== payload.runId) {
-    throw new Error('runtime release returned an invalid Workflow identity')
-  }
-  return body.workflowInstanceId
-}
-
 export class ExperimentCoordinator extends DurableObject<Env> {
+  async alarm(): Promise<void> {
+    await new RunControlDelivery<CoordinatorDeliveryMarker>(this.ctx.storage).alarm(marker =>
+      'kind' in marker && marker.kind === 'launch' ? this.deliverLaunch(marker)
+        : 'kind' in marker && marker.kind === 'completed' ? deliverCompletedRun(marker, this.env) : deliverRunControl(marker, this.env))
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url)
     const experimentId = request.headers.get('x-ack3-experiment') ?? ''
     if (!/^[a-z0-9][a-z0-9._-]{0,99}$/.test(experimentId)) return json({ error: 'invalid experiment id' }, 400)
     try {
+      const controls = url.pathname.match(/^\/audits\/([a-z0-9][a-z0-9._-]{0,99})\/commands(?:\/([a-z0-9][a-z0-9._-]{0,99}))?$/)
+      if (controls !== null) return await runControlResponse(request,
+        new CloudflareRunStore(this.env.PACKAGES, this.env.ARTIFACTS, this.env.INDEX),
+        this.env.INDEX, experimentId, controls[1]!, controls[2],
+        marker => new RunControlDelivery(this.ctx.storage).register(marker),
+        command => requestSavedWorkExport(this.env, command))
+      if (request.method === 'POST' && url.pathname === '/completed-executions') {
+        const marker: unknown = await request.json()
+        assertCompletedRunDelivery(marker)
+        if (engineRole(this.env) !== 'runtime' || marker.experimentId !== experimentId) throw new Error('completed delivery destination differs')
+        assertLocalRuntime(this.env, marker.runtimeRelease)
+        await new RunControlDelivery<CoordinatorDeliveryMarker>(this.ctx.storage).register(marker)
+        return json({ markerDigest: await sha256(marker) })
+      }
       if (request.method === 'GET' && url.pathname === '/release') return await this.release(experimentId)
       if (request.method === 'POST' && url.pathname === '/activate') return await this.activate(request, experimentId)
       if (request.method === 'POST' && url.pathname === '/runs') return await this.start(request, experimentId)
-      if (request.method === 'POST' && url.pathname === '/resumes') return await this.resume(request, experimentId)
-      if (request.method === 'POST' && url.pathname === '/recoveries') return await this.recoverFailedWave(request, experimentId)
-      if (request.method === 'POST' && url.pathname === '/retire-unmaterialized-recovery') {
-        return await this.retireUnmaterializedRecovery(request, experimentId)
-      }
-      if (request.method === 'POST' && url.pathname === '/retire-failed-native') {
-        return await this.retireFailedNative(request, experimentId)
-      }
-      if (request.method === 'POST' && url.pathname === '/discovery-waivers') return await this.waiveDiscoveryPool(request, experimentId)
-      if (request.method === 'POST' && url.pathname === '/terminal-recoveries') return await this.recoverTerminalCompletion(request, experimentId)
       return json({ error: 'not found' }, 404)
     } catch (error) {
       return json({ error: error instanceof Error ? error.message : String(error) }, 409)
@@ -292,15 +253,15 @@ export class ExperimentCoordinator extends DurableObject<Env> {
     if (reservation.provenance.mode !== 'start') throw new Error(`run already exists: ${runId}`)
     const { releaseDigest, runtimeRelease } = reservation.provenance
     assertReleaseEnvironmentMatchesRuntime(selectedRelease ?? (await store.getRelease(releaseDigest)).body, runtimeRelease)
-    if (runtimeRelease !== undefined) await store.reserveRunRoute(runId, experimentId, runtimeRelease)
-    if (reservation.workflowInstanceId !== undefined) {
-      const dispatchMs = performance.now() - started
-      return json({
-        runId, workflowInstanceId: reservation.workflowInstanceId, releaseDigest, runtimeRelease,
-        dispatchMs, reusedReservation: true,
-      }, 202, { 'server-timing': `dispatch;dur=${dispatchMs.toFixed(1)}` })
-    }
     try {
+      if (runtimeRelease !== undefined) await this.reserveLaunchRoute(store, runId, experimentId, runtimeRelease)
+      if (reservation.workflowInstanceId !== undefined) {
+        const dispatchMs = performance.now() - started
+        return json({
+          runId, workflowInstanceId: reservation.workflowInstanceId, releaseDigest, runtimeRelease,
+          dispatchMs, reusedReservation: true,
+        }, 202, { 'server-timing': `dispatch;dur=${dispatchMs.toFixed(1)}` })
+      }
       const workflowInstanceId = await dispatchAuditWorkflow(this.env, {
         mode: 'start', experimentId, runId, releaseDigest,
         ...(runtimeRelease === undefined ? {} : { runtimeRelease }),
@@ -310,705 +271,19 @@ export class ExperimentCoordinator extends DurableObject<Env> {
       return json({ runId, workflowInstanceId, releaseDigest, runtimeRelease, dispatchMs }, 202,
         { 'server-timing': `dispatch;dur=${dispatchMs.toFixed(1)}` })
     } catch (error) {
-      throw new Error(`workflow dispatch failed; retry the identical request: ${error instanceof Error ? error.message : String(error)}`)
+      if (error instanceof RunCommandConflict) return json({ error: error.message }, 409)
+      return json({ runId, releaseDigest, runtimeRelease, dispatchPending: true }, 202)
     }
-  }
-
-  private async resume(request: Request, experimentId: string): Promise<Response> {
-    const started = performance.now()
-    const body = await request.json<{
-      childRunId?: string
-      checkpointDigest?: string
-      revalidate?: { sourceRunId?: string, outputDigest?: string }
-      runtimeId?: string
-      transition?: { sourceRunId: string, sourceStateGeneration: number, sourceStateDigest: string }
-    }>()
-    if (!runIdPattern.test(body.childRunId ?? '') || !digestPattern.test(body.checkpointDigest ?? '')) {
-      return json({ error: 'valid childRunId and checkpointDigest are required' }, 400)
-    }
-    const runId = body.childRunId as string
-    const checkpointDigest = body.checkpointDigest as string
-    if ((body.runtimeId !== undefined) !== (body.transition !== undefined)
-      || (body.transition !== undefined && (body.revalidate !== undefined
-        || !runIdPattern.test(body.transition.sourceRunId ?? '')
-        || !Number.isSafeInteger(body.transition.sourceStateGeneration) || body.transition.sourceStateGeneration < 1
-        || !digestPattern.test(body.transition.sourceStateDigest ?? '')))) {
-      return json({ error: 'runtime transition requires explicit runtimeId and exact stopped source evidence' }, 400)
-    }
-    const store = new CloudflareRunStore(this.env.PACKAGES, this.env.ARTIFACTS, this.env.INDEX)
-    if (engineRole(this.env) === 'front-door') {
-      if (body.revalidate !== undefined && (!runIdPattern.test(body.revalidate.sourceRunId ?? '')
-        || !digestPattern.test(body.revalidate.outputDigest ?? ''))) {
-        return json({ error: 'revalidation requires a valid sourceRunId and outputDigest' }, 400)
-      }
-      const router = new RuntimeRouter(this.env)
-      const requestIdentity = {
-        mode: 'resume', experimentId, runId, checkpointDigest,
-        ...(body.revalidate === undefined ? {} : { revalidate: body.revalidate }),
-        ...(body.transition === undefined ? {} : { runtimeId: body.runtimeId, transition: body.transition }),
-      }
-      let reservation = await this.reservationFor(runId, requestIdentity)
-      if (reservation === undefined) {
-        let runtimeRelease = pinnedRuntime(await store.checkpointRuntime(checkpointDigest))
-        let runtimeTransition: RuntimeTransitionEvidence | undefined
-        if (body.transition !== undefined) {
-          runtimeRelease = await resolveRuntimeSelector(body.runtimeId === 'latest'
-            ? { mode: 'latest' } : { mode: 'release', id: body.runtimeId! }, router)
-          const checkpoint = await store.getCheckpoint(checkpointDigest)
-          const release = await store.getRelease(checkpoint.body.releaseDigest)
-          const source = await store.getState(body.transition.sourceRunId)
-          if (checkpoint.body.experimentId !== experimentId) throw new Error('resume experiment mismatch')
-          runtimeTransition = await prepareCheckpointRuntimeTransition({ definition: release.body.definition,
-            checkpoint, source, ...body.transition, targetRuntimeRelease: runtimeRelease })
-          await RunMachine.resume(release.body.definition, checkpoint, runId, new Set(),
-            new Date().toISOString(), undefined, runtimeRelease, runtimeTransition, source)
-        }
-        const selectedCheckpoint = await store.getCheckpoint(checkpointDigest)
-        assertReleaseEnvironmentMatchesRuntime(
-          (await store.getRelease(selectedCheckpoint.body.releaseDigest)).body, runtimeRelease)
-        reservation = await this.reserveRunId(runId, requestIdentity, {
-          mode: 'resume', checkpointDigest, runtimeRelease,
-          ...(runtimeTransition === undefined ? {} : { runtimeTransition }),
-          ...(body.revalidate === undefined ? {} : { revalidate: body.revalidate }),
-        })
-      }
-      if (reservation.provenance.mode !== 'resume') throw new Error(`run already exists: ${runId}`)
-      const runtimeRelease = reservation.provenance.runtimeRelease
-      if (runtimeRelease === undefined) throw new Error('front-door resume reservation is missing its runtime release')
-      const selectedCheckpoint = await store.getCheckpoint(checkpointDigest)
-      assertReleaseEnvironmentMatchesRuntime(
-        (await store.getRelease(selectedCheckpoint.body.releaseDigest)).body, runtimeRelease)
-      await store.reserveRunRoute(runId, experimentId, runtimeRelease)
-      if (reservation.workflowInstanceId !== undefined) {
-        const resumeDispatchMs = performance.now() - started
-        return json({
-          runId,
-          workflowInstanceId: reservation.workflowInstanceId,
-          checkpointDigest,
-          runtimeRelease,
-          resumeDispatchMs,
-          reusedReservation: true,
-        }, 202, { 'server-timing': `resume-dispatch;dur=${resumeDispatchMs.toFixed(1)}` })
-      }
-      const routed = await router.fetch(runtimeRelease, '/internal/runtime/audit-resumes', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          experimentId,
-          childRunId: runId,
-          checkpointDigest,
-          runtimeRelease,
-          ...(body.revalidate === undefined ? {} : { revalidate: body.revalidate }),
-          ...(reservation.provenance.runtimeTransition === undefined ? {} : { runtimeTransition: reservation.provenance.runtimeTransition }),
-        }),
-      })
-      const result = await runtimeResponseBody(routed)
-      if (result.workflowInstanceId !== runId) throw new Error('runtime release returned an invalid Workflow identity')
-      await this.markRunDispatched(runId, runId)
-      const resumeDispatchMs = performance.now() - started
-      return json({ runId, ...result, resumeDispatchMs }, 202,
-        { 'server-timing': `resume-dispatch;dur=${resumeDispatchMs.toFixed(1)}` })
-    }
-    if (body.transition !== undefined) return json({ error: 'runtime transition requires the front door' }, 409)
-    const checkpoint = await store.getCheckpoint(checkpointDigest)
-    const release = await store.getRelease(checkpoint.body.releaseDigest)
-    if (checkpoint.body.experimentId !== experimentId || release.body.definition.id !== experimentId) {
-      return json({ error: 'resume experiment mismatch' }, 409)
-    }
-    let revalidation: QuarantinedRevalidation | undefined
-    if (body.revalidate !== undefined) {
-      if (!runIdPattern.test(body.revalidate.sourceRunId ?? '')
-        || !digestPattern.test(body.revalidate.outputDigest ?? '')) {
-        return json({ error: 'revalidation requires a valid sourceRunId and outputDigest' }, 400)
-      }
-      const source = await store.getState(body.revalidate.sourceRunId as string)
-      const sourceOwnsCheckpoint = source.checkpoints.some(candidate => (
-        candidate.digest === checkpointDigest && sameCursor(candidate.body.cursor, checkpoint.body.cursor)
-      ))
-      if (source.status !== 'failed' || source.experimentId !== experimentId
-        || source.releaseDigest !== checkpoint.body.releaseDigest
-        || (source.parentCheckpointDigest !== checkpointDigest && !sourceOwnsCheckpoint)
-        || !sameCursor(source.cursor, checkpoint.body.cursor)) {
-        return json({ error: 'revalidation source is not a failed descendant or owner of this checkpoint' }, 409)
-      }
-      const matchingCandidates = source.rejectedAttempts.filter(attempt => (
-        attempt.outputDigest === body.revalidate?.outputDigest && attempt.quarantineUri !== null
-      ))
-      const candidates = [...new Map(matchingCandidates.map(candidate => (
-        [rejectedAttemptIdentity(candidate), candidate]
-      ))).values()]
-      if (candidates.length !== 1) return json({ error: 'revalidation attempt is missing or ambiguous' }, 409)
-      const candidate = candidates[0]!
-      const stage = release.body.definition.stages[checkpoint.body.cursor.stageIndex]
-      const wave = stage?.waves[checkpoint.body.cursor.waveIndex]
-      const matchedTask = wave?.tasks.find(task => task.id === candidate.taskId)
-      if (stage?.id !== candidate.stageId || wave?.id !== candidate.waveId
-        || matchedTask === undefined || matchedTask.retryPolicy !== 'none'
-        || candidate.outputDigest === null || candidate.quarantineUri === null
-        || candidate.usage.modelCalls !== 1
-        || candidate.attempt !== 1) {
-        return json({ error: 'revalidation attempt does not match the checkpoint cursor' }, 409)
-      }
-      revalidation = {
-        sourceRunId: source.runId,
-        stageId: candidate.stageId,
-        waveId: candidate.waveId,
-        taskId: candidate.taskId,
-        promptDigest: candidate.promptDigest,
-        outputDigest: candidate.outputDigest,
-        quarantineUri: candidate.quarantineUri,
-        usage: candidate.usage,
-      }
-    }
-    const resumedAt = new Date().toISOString()
-    const timeAmendment = expiredResumeClockAmendment(release.body.definition, checkpoint, resumedAt)
-    const runtimeRelease = checkpoint.body.runtimeRelease
-    assertReleaseEnvironmentMatchesRuntime(release.body, runtimeRelease)
-    await RunMachine.resume(
-      release.body.definition, checkpoint, runId, new Set(), resumedAt, timeAmendment ?? undefined, runtimeRelease,
-    )
-    const legacyRequestIdentity = {
-      mode: 'resume', experimentId, runId, checkpointDigest,
-      ...(body.revalidate === undefined ? {} : { revalidate: body.revalidate }),
-    }
-    await this.reserveRunId(runId, legacyRequestIdentity, {
-      mode: 'resume', checkpointDigest,
-      ...(runtimeRelease === undefined ? {} : { runtimeRelease }),
-      ...(body.revalidate === undefined ? {} : { revalidate: body.revalidate }),
-    })
-    try {
-      const workflowInstanceId = await dispatchAuditWorkflow(this.env, {
-        mode: 'resume', experimentId, runId, checkpointDigest,
-        ...(timeAmendment === null ? {} : { timeAmendment }),
-        ...(revalidation === undefined ? {} : { revalidation }),
-        ...(runtimeRelease === undefined ? {} : { runtimeRelease }),
-      })
-      await this.markRunDispatched(runId, workflowInstanceId)
-      const resumeDispatchMs = performance.now() - started
-      return json({
-        runId, workflowInstanceId, checkpointDigest, timeAmendment, runtimeRelease, resumeDispatchMs,
-        revalidation: revalidation === undefined ? null : {
-          sourceRunId: revalidation.sourceRunId,
-          taskId: revalidation.taskId,
-          outputDigest: revalidation.outputDigest,
-        },
-      }, 202,
-        { 'server-timing': `resume-dispatch;dur=${resumeDispatchMs.toFixed(1)}` })
-    } catch (error) {
-      throw new Error(`resume dispatch failed; reserved child ID must not be reused: ${error instanceof Error ? error.message : String(error)}`)
-    }
-  }
-
-  private async recoverFailedWave(request: Request, experimentId: string): Promise<Response> {
-    if (engineRole(this.env) !== 'front-door') return json({ error: 'failed-wave recovery requires the front door' }, 409)
-    const started = performance.now()
-    const body = await request.json<{
-      childRunId?: string
-      sourceRunId?: string
-      sourceStateGeneration?: number
-      sourceStateDigest?: string
-      checkpointDigest?: string
-      runtimeId?: string
-      promoteExecution?: {
-        taskId?: string
-        sourceAttempt?: number
-        requestDigest?: string
-        quarantineOutputDigest?: string
-      }
-      retainNative?: { taskId?: string, requestDigest?: string, snapshotDigest?: string, sandboxObjectId?: string }
-      repairQuarantined?: { taskId?: string, requestDigest?: string, outputDigest?: string }
-    }>()
-    const repairQuarantined = body.repairQuarantined
-    const repairIsValid = repairQuarantined === undefined || (
-      typeof repairQuarantined.taskId === 'string' && repairQuarantined.taskId.trim() !== ''
-      && digestPattern.test(repairQuarantined.requestDigest ?? '')
-      && digestPattern.test(repairQuarantined.outputDigest ?? '')
-      && body.promoteExecution === undefined && body.retainNative === undefined
-    )
-    const promoteExecution = body.promoteExecution
-    const promotionIsValid = promoteExecution === undefined || (
-      typeof promoteExecution.taskId === 'string' && promoteExecution.taskId.trim() !== ''
-      && Number.isSafeInteger(promoteExecution.sourceAttempt) && (promoteExecution.sourceAttempt ?? 0) >= 1
-      && digestPattern.test(promoteExecution.requestDigest ?? '')
-      && (promoteExecution.quarantineOutputDigest === undefined
-        || digestPattern.test(promoteExecution.quarantineOutputDigest))
-    )
-    const retainNative = body.retainNative
-    const retentionIsValid = retainNative === undefined || (
-      typeof retainNative.taskId === 'string' && retainNative.taskId.trim() !== ''
-      && digestPattern.test(retainNative.requestDigest ?? '')
-      && digestPattern.test(retainNative.snapshotDigest ?? '')
-      && digestPattern.test(retainNative.sandboxObjectId ?? '')
-      && promoteExecution === undefined
-    )
-    if (!runIdPattern.test(body.childRunId ?? '') || !runIdPattern.test(body.sourceRunId ?? '')
-      || !Number.isSafeInteger(body.sourceStateGeneration) || (body.sourceStateGeneration ?? 0) < 1
-      || !digestPattern.test(body.sourceStateDigest ?? '') || !digestPattern.test(body.checkpointDigest ?? '')
-      || !runIdPattern.test(body.runtimeId ?? '') || !promotionIsValid || !retentionIsValid || !repairIsValid) {
-      return json({
-        error: 'valid childRunId, sourceRunId, sourceStateGeneration, sourceStateDigest, checkpointDigest, and explicit runtimeId are required',
-      }, 400)
-    }
-    const runId = body.childRunId as string
-    const sourceRunId = body.sourceRunId as string
-    const sourceStateGeneration = body.sourceStateGeneration as number
-    const sourceStateDigest = body.sourceStateDigest as string
-    const checkpointDigest = body.checkpointDigest as string
-    const runtimeId = body.runtimeId as string
-    const requestIdentity = {
-      mode: 'recover-failed-wave', experimentId, runId, sourceRunId, sourceStateGeneration,
-      sourceStateDigest, checkpointDigest, runtimeId,
-      ...(promoteExecution === undefined ? {} : { promoteExecution }),
-      ...(retainNative === undefined ? {} : { retainNative }),
-      ...(repairQuarantined === undefined ? {} : { repairQuarantined }),
-    }
-    const store = new CloudflareRunStore(this.env.PACKAGES, this.env.ARTIFACTS, this.env.INDEX)
-    const retired = await store.retiredUnmaterializedRoute(runId)
-    if (retired !== null) throw new Error(`recovery identity was archived: ${runId}`)
-    let reservation = await this.reservationFor(runId, requestIdentity)
-    if (reservation === undefined) {
-      const router = new RuntimeRouter(this.env)
-      const runtimeRelease = await resolveRuntimeSelector({ mode: 'release', id: runtimeId }, router)
-      const source = await store.getState(sourceRunId)
-      const checkpoint = await store.getCheckpoint(checkpointDigest)
-      const release = await store.getRelease(checkpoint.body.releaseDigest)
-      if (source.experimentId !== experimentId || checkpoint.body.experimentId !== experimentId
-        || release.body.definition.id !== experimentId) {
-        return json({ error: 'failed-wave recovery experiment mismatch' }, 409)
-      }
-      if (repairQuarantined === undefined
-        && source.failedWaveRecovery?.quarantinedRepair?.kind !== 'negative-review'
-        && source.failedWaveRecovery?.sealedWaveRetry?.imageAuthorization === undefined) {
-        assertReleaseEnvironmentMatchesRuntime(release.body, runtimeRelease)
-      }
-      if (repairQuarantined !== undefined && await store.retiredRunWorkflow(sourceRunId) === null) {
-        throw new Error('quarantined synthesis source must be retired before repair')
-      }
-      const unobservableNative = (source.inFlightAgentAttempts ?? []).length === 0
-        ? undefined : await store.fencedUnobservableNativeEvidence(source)
-      const prepared = await prepareFailedWaveRecovery({
-        definition: release.body.definition,
-        checkpoint,
-        source,
-        sourceStateGeneration,
-        sourceStateDigest,
-        targetRuntimeRelease: runtimeRelease,
-        artifacts: new R2ArtifactStore(this.env.ARTIFACTS),
-        retirementProofDigest: (await store.retiredRunWorkflow(source.runId))?.fenceProofDigest ?? undefined,
-        ...(unobservableNative === undefined ? {} : { unobservableNative }),
-        ...(promoteExecution === undefined ? {} : {
-          promoteExecution: {
-            taskId: promoteExecution.taskId!,
-            sourceAttempt: promoteExecution.sourceAttempt!,
-            requestDigest: promoteExecution.requestDigest!,
-            ...(promoteExecution.quarantineOutputDigest === undefined ? {}
-              : { quarantineOutputDigest: promoteExecution.quarantineOutputDigest }),
-          },
-          executionReceipts: new R2AgentExecutionReceiptStore(this.env.ARTIFACTS),
-          executionRequests: new R2AgentExecutionLogStore(this.env.ARTIFACTS),
-          ...(promoteExecution.quarantineOutputDigest === undefined ? {}
-            : { quarantined: new R2ArtifactStore(this.env.ARTIFACTS) }),
-        }),
-        ...(repairQuarantined === undefined ? {} : {
-          repairQuarantined: {
-            taskId: repairQuarantined.taskId!, requestDigest: repairQuarantined.requestDigest!,
-            outputDigest: repairQuarantined.outputDigest!,
-          },
-          executionReceipts: new R2AgentExecutionReceiptStore(this.env.ARTIFACTS),
-          executionRequests: new R2AgentExecutionLogStore(this.env.ARTIFACTS),
-          quarantined: new R2ArtifactStore(this.env.ARTIFACTS),
-        }),
-        ...(retainNative === undefined ? {} : { retainNative: {
-          taskId: retainNative.taskId!, requestDigest: retainNative.requestDigest!,
-          snapshotDigest: retainNative.snapshotDigest!, sandboxObjectId: retainNative.sandboxObjectId!,
-        } }),
-      })
-      assertReleaseEnvironmentMatchesRuntime(release.body, runtimeRelease, prepared.evidence)
-      if (prepared.evidence.retainedNative !== undefined) {
-        const retained = prepared.evidence.retainedNative
-        const claim = await store.retainedNativeWorkspaceClaim(sourceRunId, retained.workspaceKey)
-        if (claim?.childRunId !== runId || claim.sourceStateDigest !== sourceStateDigest
-          || claim.snapshotDigest !== retained.nativeTransport.snapshotDigest
-          || claim.sandboxObjectId !== retained.sandboxObjectId
-          || await store.retiredRunWorkflow(sourceRunId) === null) {
-          throw new Error('retained native workspace was not exclusively fenced for this child')
-        }
-      }
-      await RunMachine.recoverFailedWave(
-        release.body.definition, checkpoint, source, runId,
-        prepared.importedArtifacts, prepared.inheritedRejectedAttempts, prepared.evidence,
-      )
-      if (prepared.evidence.unobservableNative !== undefined) {
-        const freshSource = await store.getState(sourceRunId)
-        const fresh = await store.fencedUnobservableNativeEvidence(freshSource)
-        if (canonicalJson(fresh ?? null) !== canonicalJson(prepared.evidence.unobservableNative)) {
-          throw new Error('unobservable recovery fence or receipt changed before reservation')
-        }
-      }
-      reservation = await this.reserveRunId(runId, requestIdentity, {
-        mode: 'recover-failed-wave', checkpointDigest, runtimeRelease, failedWaveRecovery: prepared.evidence,
-      })
-    }
-    if (reservation.provenance.mode !== 'recover-failed-wave') throw new Error(`run already exists: ${runId}`)
-    const { runtimeRelease, failedWaveRecovery } = reservation.provenance
-    const selectedCheckpoint = await store.getCheckpoint(checkpointDigest)
-    assertReleaseEnvironmentMatchesRuntime(
-      (await store.getRelease(selectedCheckpoint.body.releaseDigest)).body, runtimeRelease, failedWaveRecovery)
-    if (failedWaveRecovery.unobservableNative !== undefined) {
-      const freshSource = await store.getState(sourceRunId)
-      const fresh = await store.fencedUnobservableNativeEvidence(freshSource)
-      if (canonicalJson(fresh ?? null) !== canonicalJson(failedWaveRecovery.unobservableNative)) {
-        throw new Error('unobservable recovery fence or receipt changed before route reservation')
-      }
-    }
-    await store.reserveRunRoute(runId, experimentId, runtimeRelease)
-    if (reservation.workflowInstanceId !== undefined) {
-      const recoveryDispatchMs = performance.now() - started
-      return json({
-        runId, workflowInstanceId: reservation.workflowInstanceId, checkpointDigest,
-        runtimeRelease, failedWaveRecovery, recoveryDispatchMs, reusedReservation: true,
-      }, 202, { 'server-timing': `recovery-dispatch;dur=${recoveryDispatchMs.toFixed(1)}` })
-    }
-    if (reservation.dispatchInProgress === true) {
-      const observed = await new RuntimeRouter(this.env).fetch(runtimeRelease,
-        `/internal/runtime/audit-workflows/${runId}`)
-      const native = await runtimeResponseBody(observed)
-      if (native.runId !== runId || native.runtimeRelease === null
-        || typeof native.runtimeRelease !== 'object'
-        || !sameRuntimeRelease(native.runtimeRelease as RuntimeRelease, runtimeRelease)
-        || native.workflow === null || typeof native.workflow !== 'object'
-        || typeof (native.workflow as { status?: unknown }).status !== 'string') {
-        throw new Error('pending recovery Workflow identity is unavailable or different')
-      }
-      const existingState = await store.getStateIfPresent(runId)
-      if (existingState !== null && (existingState.runId !== runId
-        || existingState.runtimeRelease === undefined
-        || !sameRuntimeRelease(existingState.runtimeRelease, runtimeRelease)
-        || existingState.failedWaveRecovery === undefined
-        || canonicalJson(existingState.failedWaveRecovery) !== canonicalJson(failedWaveRecovery))) {
-        throw new Error('pending recovery state differs from its reservation')
-      }
-      await this.markRunDispatched(runId, runId)
-      return json({ runId, workflowInstanceId: runId, checkpointDigest,
-        runtimeRelease, failedWaveRecovery, reusedReservation: true,
-        reconciledExistingWorkflow: true }, 202)
-    }
-    await this.claimRecoveryDispatch(runId, reservation.requestDigest)
-    const routed = await new RuntimeRouter(this.env).fetch(runtimeRelease, '/internal/runtime/audit-recoveries', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        experimentId,
-        childRunId: runId,
-        sourceRunId,
-        sourceStateGeneration,
-        sourceStateDigest,
-        checkpointDigest,
-        runtimeRelease,
-        ...(promoteExecution === undefined ? {} : { promoteExecution }),
-        ...(retainNative === undefined ? {} : { retainNative }),
-        ...(repairQuarantined === undefined ? {} : { repairQuarantined }),
-      }),
-    })
-    if (!routed.ok && [400, 409].includes(routed.status)
-      && routed.headers.get('x-ack3-runtime-worker-version') === runtimeRelease.workerVersionId) {
-      await this.markRecoveryDispatchRefused(runId, routed.status)
-    }
-    const result = await runtimeResponseBody(routed)
-    if (result.workflowInstanceId !== runId) throw new Error('runtime release returned an invalid recovery Workflow identity')
-    if (canonicalJson(result.failedWaveRecovery) !== canonicalJson(failedWaveRecovery)) {
-      throw new Error('runtime release returned different failed-wave recovery evidence')
-    }
-    await this.markRunDispatched(runId, runId)
-    const recoveryDispatchMs = performance.now() - started
-    return json({ runId, ...result, recoveryDispatchMs }, 202,
-      { 'server-timing': `recovery-dispatch;dur=${recoveryDispatchMs.toFixed(1)}` })
-  }
-
-  private async retireUnmaterializedRecovery(request: Request, experimentId: string): Promise<Response> {
-    if (engineRole(this.env) !== 'front-door') {
-      return json({ error: 'recovery retirement requires the front door' }, 409)
-    }
-    const proof: unknown = await request.json()
-    assertUnmaterializedRecoveryRetirementProof(proof)
-    if (proof.experimentId !== experimentId) throw new Error('recovery retirement experiment differs')
-    const key = `run-reservation:${proof.runId}`
-    const reservation = await this.ctx.storage.get<RunReservation>(key)
-    if (reservation?.provenance.mode !== 'recover-failed-wave'
-      || reservation.workflowInstanceId !== undefined
-      || reservation.dispatchedAt !== undefined
-      || reservation.dispatchInProgress === true
-      || reservation.requestDigest !== proof.reservationRequestDigest
-      || !sameRuntimeRelease(reservation.provenance.runtimeRelease, proof.runtimeRelease)
-      || reservation.provenance.checkpointDigest !== proof.checkpointDigest
-      || reservation.provenance.failedWaveRecovery.sourceRunId !== proof.sourceRunId
-      || reservation.provenance.failedWaveRecovery.sourceStateDigest !== proof.sourceStateDigest) {
-      throw new Error('recovery reservation changed or was dispatched')
-    }
-    const proofDigest = await sha256(canonicalJson(proof))
-    if (reservation.retirementProofDigest !== undefined
-      && reservation.retirementProofDigest !== proofDigest) {
-      throw new Error('recovery reservation was retired with different proof')
-    }
-    if (reservation.retirementProofDigest === undefined
-      && (Date.now() - Date.parse(proof.observedAt) > 120_000
-        || Date.parse(proof.observedAt) > Date.now() + 10_000)) {
-      throw new Error('recovery retirement observation is stale')
-    }
-    await this.ctx.storage.transaction(async transaction => {
-      const current = await transaction.get<RunReservation>(key)
-      if (current === undefined || current.requestDigest !== reservation.requestDigest
-        || current.workflowInstanceId !== undefined || current.dispatchedAt !== undefined
-        || current.dispatchInProgress === true
-        || (current.retirementProofDigest !== undefined
-          && current.retirementProofDigest !== proofDigest)) {
-        throw new Error('recovery reservation changed before retirement')
-      }
-      await transaction.put(key, { ...current, retirementProofDigest: proofDigest })
-    })
-    const store = new CloudflareRunStore(this.env.PACKAGES, this.env.ARTIFACTS, this.env.INDEX)
-    const archivedDigest = await store.archiveUnmaterializedRecoveryAndReleaseLease(proof)
-    if (archivedDigest !== proofDigest) throw new Error('recovery retirement proof changed')
-    return json({ runId: proof.runId, retired: true, proofDigest })
-  }
-
-  private async retireFailedNative(request: Request, experimentId: string): Promise<Response> {
-    if (engineRole(this.env) !== 'front-door') {
-      return json({ error: 'failed native retirement requires the front door' }, 409)
-    }
-    const body = await request.json<{
-      childRunId?: string, sourceRunId?: string, sourceStateGeneration?: number,
-      sourceStateDigest?: string, checkpointDigest?: string,
-      retainNative?: { taskId?: string, requestDigest?: string, snapshotDigest?: string, sandboxObjectId?: string }
-    }>()
-    const selection = body.retainNative
-    if (!runIdPattern.test(body.childRunId ?? '') || !runIdPattern.test(body.sourceRunId ?? '')
-      || !Number.isSafeInteger(body.sourceStateGeneration) || (body.sourceStateGeneration ?? 0) < 1
-      || !digestPattern.test(body.sourceStateDigest ?? '') || !digestPattern.test(body.checkpointDigest ?? '')
-      || typeof selection?.taskId !== 'string' || selection.taskId.trim() === ''
-      || !digestPattern.test(selection.requestDigest ?? '')
-      || !digestPattern.test(selection.snapshotDigest ?? '')
-      || !digestPattern.test(selection.sandboxObjectId ?? '')) {
-      return json({ error: 'exact failed native source, child, checkpoint and retained session are required' }, 400)
-    }
-    const sourceRunId = body.sourceRunId!, childRunId = body.childRunId!
-    const store = new CloudflareRunStore(this.env.PACKAGES, this.env.ARTIFACTS, this.env.INDEX)
-    if (await this.ctx.storage.get<RunReservation>(`run-reservation:${childRunId}`) !== undefined
-      || await store.getStateIfPresent(childRunId) !== null
-      || await store.runRuntime(childRunId) !== null) {
-      throw new Error('retained native child identity is already reserved')
-    }
-    const source = await store.getState(sourceRunId)
-    const checkpoint = await store.getCheckpoint(body.checkpointDigest!)
-    if (source.experimentId !== experimentId || checkpoint.body.experimentId !== experimentId
-      || source.status !== 'failed' || source.runtimeRelease === undefined
-      || source.stateGeneration !== body.sourceStateGeneration
-      || await sha256(source) !== body.sourceStateDigest) {
-      throw new Error('failed native source or checkpoint differs')
-    }
-    const stage = (await store.getRelease(source.releaseDigest)).body.definition.stages[source.cursor.stageIndex]
-    const wave = stage?.waves[source.cursor.waveIndex]
-    const task = wave?.tasks.find(candidate => candidate.id === selection.taskId)
-    const rejection = source.rejectedAttempts.filter(value => value.stageId === stage?.id
-      && value.waveId === wave?.id && value.taskId === task?.id
-      && (value.repairScopeRunId ?? source.runId) === source.runId)
-      .toSorted((left, right) => left.attempt - right.attempt).at(-1)
-    const native = rejection?.nativeTransport
-    if (stage === undefined || wave === undefined || task === undefined
-      || task.providerClass !== 'additive' || task.backend !== 'dsh-chat-completions'
-      || rejection?.attempt !== 2 || rejection.outputDigest !== null || rejection.quarantineUri !== null
-      || native?.code !== 'SERVER' || native.workState !== 'present'
-      || native.sourceRunId !== sourceRunId || native.requestDigest !== selection.requestDigest
-      || native.snapshotDigest !== selection.snapshotDigest
-      || source.failedWaveRecovery?.retainedNative?.taskId === task.id) {
-      throw new Error('failed native source has no selected retained task')
-    }
-    const retainedNative: RetainedNativeRecoveryEvidence = {
-      stageId: stage.id, waveId: wave.id, taskId: task.id, workspaceKey: task.workspaceKey,
-      workspaceAllocationRunId: sourceRunId, sandboxObjectId: selection.sandboxObjectId!,
-      nativeTransport: native,
-    }
-    const observed = await runtimeResponseBody(await new RuntimeRouter(this.env).fetch(
-      source.runtimeRelease, `/internal/runtime/audit-workflows/${sourceRunId}`))
-    if (observed.runId !== sourceRunId
-      || canonicalJson(observed.runtimeRelease) !== canonicalJson(source.runtimeRelease)
-      || (observed.workflow as { status?: unknown } | null)?.status !== 'errored') {
-      throw new Error('native Workflow is not terminally errored for this source')
-    }
-    const proofDigest = await store.archiveFailedNativeRunAndReleaseLease({
-      experimentId, sourceRunId, childRunId,
-      sourceStateGeneration: body.sourceStateGeneration!, sourceStateDigest: body.sourceStateDigest!,
-      checkpointDigest: body.checkpointDigest!, retainedNative, workflow: observed.workflow,
-    })
-    return json({ sourceRunId, childRunId, retired: true, proofDigest })
-  }
-
-  private async recoverTerminalCompletion(request: Request, experimentId: string): Promise<Response> {
-    if (engineRole(this.env) !== 'front-door') return json({ error: 'terminal completion recovery requires the front door' }, 409)
-    const body = await request.json<{
-      childRunId?: string
-      sourceRunId?: string
-      sourceStateGeneration?: number
-      sourceStateDigest?: string
-      checkpointDigest?: string
-      runtimeId?: string
-    }>()
-    if (!runIdPattern.test(body.childRunId ?? '') || !runIdPattern.test(body.sourceRunId ?? '')
-      || !Number.isSafeInteger(body.sourceStateGeneration) || (body.sourceStateGeneration ?? 0) < 1
-      || !digestPattern.test(body.sourceStateDigest ?? '') || !digestPattern.test(body.checkpointDigest ?? '')
-      || !runIdPattern.test(body.runtimeId ?? '')) {
-      return json({ error: 'valid terminal completion recovery identity and explicit runtimeId are required' }, 400)
-    }
-    const runId = body.childRunId as string
-    const sourceRunId = body.sourceRunId as string
-    const sourceStateGeneration = body.sourceStateGeneration as number
-    const sourceStateDigest = body.sourceStateDigest as string
-    const checkpointDigest = body.checkpointDigest as string
-    const runtimeId = body.runtimeId as string
-    const requestIdentity = {
-      mode: 'recover-terminal-completion', experimentId, runId, sourceRunId, sourceStateGeneration,
-      sourceStateDigest, checkpointDigest, runtimeId,
-    }
-    const store = new CloudflareRunStore(this.env.PACKAGES, this.env.ARTIFACTS, this.env.INDEX)
-    let reservation = await this.reservationFor(runId, requestIdentity)
-    if (reservation === undefined) {
-      const runtimeRelease = await resolveRuntimeSelector(
-        { mode: 'release', id: runtimeId }, new RuntimeRouter(this.env),
-      )
-      const source = await store.getState(sourceRunId)
-      const checkpoint = await store.getCheckpoint(checkpointDigest)
-      const release = await store.getRelease(checkpoint.body.releaseDigest)
-      if (source.experimentId !== experimentId || checkpoint.body.experimentId !== experimentId
-        || release.body.definition.id !== experimentId) {
-        return json({ error: 'terminal completion recovery experiment mismatch' }, 409)
-      }
-      assertReleaseEnvironmentMatchesRuntime(release.body, runtimeRelease)
-      const evidence = await prepareTerminalCompletionRecovery({
-        definition: release.body.definition, checkpoint, source, sourceStateGeneration, sourceStateDigest,
-        targetRuntimeRelease: runtimeRelease,
-      })
-      await RunMachine.recoverTerminalCompletion(release.body.definition, checkpoint, source, runId, evidence)
-      reservation = await this.reserveRunId(runId, requestIdentity, {
-        mode: 'recover-terminal-completion', checkpointDigest, runtimeRelease,
-        terminalCompletionRecovery: evidence,
-      })
-    }
-    if (reservation.provenance.mode !== 'recover-terminal-completion') throw new Error(`run already exists: ${runId}`)
-    const { runtimeRelease, terminalCompletionRecovery } = reservation.provenance
-    const selectedCheckpoint = await store.getCheckpoint(checkpointDigest)
-    assertReleaseEnvironmentMatchesRuntime(
-      (await store.getRelease(selectedCheckpoint.body.releaseDigest)).body, runtimeRelease)
-    await store.reserveRunRoute(runId, experimentId, runtimeRelease)
-    if (reservation.workflowInstanceId !== undefined) {
-      return json({ runId, workflowInstanceId: reservation.workflowInstanceId, checkpointDigest,
-        runtimeRelease, terminalCompletionRecovery, reusedReservation: true }, 202)
-    }
-    const routed = await new RuntimeRouter(this.env).fetch(
-      runtimeRelease, '/internal/runtime/audit-terminal-recoveries', {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ experimentId, childRunId: runId, sourceRunId, sourceStateGeneration,
-          sourceStateDigest, checkpointDigest, runtimeRelease }),
-      },
-    )
-    const result = await runtimeResponseBody(routed)
-    if (result.workflowInstanceId !== runId
-      || canonicalJson(result.terminalCompletionRecovery) !== canonicalJson(terminalCompletionRecovery)) {
-      throw new Error('runtime release returned different terminal completion recovery evidence')
-    }
-    await this.markRunDispatched(runId, runId)
-    return json({ runId, ...result }, 202)
-  }
-
-  private async waiveDiscoveryPool(request: Request, experimentId: string): Promise<Response> {
-    if (engineRole(this.env) !== 'front-door') return json({ error: 'discovery waiver requires the front door' }, 409)
-    const body = await request.json<{ childRunId: string, sourceRunId: string, sourceStateGeneration: number,
-      sourceStateDigest: string, checkpointDigest: string, runtimeId: string, poolId: string, requestDigest: string }>()
-    if (![body.childRunId, body.sourceRunId, body.runtimeId, body.poolId].every(value => runIdPattern.test(value ?? ''))
-      || !Number.isSafeInteger(body.sourceStateGeneration) || body.sourceStateGeneration < 1
-      || ![body.sourceStateDigest, body.checkpointDigest, body.requestDigest].every(value => digestPattern.test(value ?? ''))) {
-      return json({ error: 'exact discovery waiver source, pool, request and runtime are required' }, 400)
-    }
-    const identity = { mode: 'recover-discovery-waiver', experimentId,
-      childRunId: body.childRunId, sourceRunId: body.sourceRunId, sourceStateGeneration: body.sourceStateGeneration,
-      sourceStateDigest: body.sourceStateDigest, checkpointDigest: body.checkpointDigest,
-      runtimeId: body.runtimeId, poolId: body.poolId, requestDigest: body.requestDigest }
-    const store = new CloudflareRunStore(this.env.PACKAGES, this.env.ARTIFACTS, this.env.INDEX)
-    let reservation = await this.reservationFor(body.childRunId, identity)
-    if (reservation === undefined) {
-      const runtimeRelease = await resolveRuntimeSelector({ mode: 'release', id: body.runtimeId }, new RuntimeRouter(this.env))
-      const { evidence, fence } = await store.prepareDiscoveryWaiver({ ...body, targetRuntimeRelease: runtimeRelease })
-      const source = await store.getState(body.sourceRunId)
-      const checkpoint = await store.getCheckpoint(body.checkpointDigest)
-      const release = await store.getRelease(source.releaseDigest)
-      if (source.experimentId !== experimentId) return json({ error: 'waiver experiment differs' }, 409)
-      assertReleaseEnvironmentMatchesRuntime(release.body, runtimeRelease)
-      await RunMachine.recoverDiscoveryPoolWaiver(release.body.definition, checkpoint, source, evidence, fence)
-      await store.claimDiscoveryWaiver(evidence, true)
-      reservation = await this.reserveRunId(body.childRunId, identity, { mode: 'recover-discovery-waiver',
-        checkpointDigest: body.checkpointDigest, runtimeRelease, discoveryPoolWaiver: evidence })
-    }
-    if (reservation.provenance.mode !== 'recover-discovery-waiver') throw new Error('waiver reservation differs')
-    const { runtimeRelease, discoveryPoolWaiver } = reservation.provenance
-    await store.claimDiscoveryWaiver(discoveryPoolWaiver)
-    await store.reserveRunRoute(body.childRunId, experimentId, runtimeRelease)
-    if (reservation.workflowInstanceId !== undefined) return json({ runId: body.childRunId,
-      workflowInstanceId: reservation.workflowInstanceId, runtimeRelease, discoveryPoolWaiver, reusedReservation: true }, 202)
-    const routed = await new RuntimeRouter(this.env).fetch(runtimeRelease, '/internal/runtime/audit-discovery-waivers', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ ...body, experimentId, runtimeRelease }),
-    })
-    const result = await runtimeResponseBody(routed)
-    if (result.workflowInstanceId !== body.childRunId
-      || canonicalJson(result.discoveryPoolWaiver) !== canonicalJson(discoveryPoolWaiver)) {
-      throw new Error('runtime returned different discovery waiver evidence')
-    }
-    await this.markRunDispatched(body.childRunId, body.childRunId)
-    return json({ runId: body.childRunId, ...result }, 202)
   }
 
   private async reservationFor(runId: string, requestIdentity: unknown): Promise<RunReservation | undefined> {
     const existing = await this.ctx.storage.get<RunReservation>(`run-reservation:${runId}`)
     if (existing === undefined) return undefined
     if (existing.retirementProofDigest !== undefined) throw new Error(`run was archived: ${runId}`)
-    if (existing.dispatchRefusedStatus !== undefined) throw new Error(`run dispatch was refused: ${runId}`)
+    if (existing.dispatchRefusedStatus !== undefined) throw new Error(existing.dispatchRefusedReason ?? `run dispatch was refused: ${runId}`)
     const requestDigest = await sha256(canonicalJson(requestIdentity))
     if (existing.requestDigest !== requestDigest) throw new Error(`run already exists: ${runId}`)
     return existing
-  }
-
-  /** A durable coordinator fence makes retirement and dispatch mutually exclusive. */
-  private async claimRecoveryDispatch(runId: string, requestDigest: string): Promise<void> {
-    await this.ctx.storage.transaction(async transaction => {
-      const key = `run-reservation:${runId}`
-      const current = await transaction.get<RunReservation>(key)
-      if (current?.provenance.mode !== 'recover-failed-wave'
-        || current.requestDigest !== requestDigest
-        || current.workflowInstanceId !== undefined
-        || current.retirementProofDigest !== undefined
-        || current.dispatchRefusedStatus !== undefined
-        || current.dispatchInProgress === true) {
-        throw new Error(`recovery dispatch is already claimed or archived: ${runId}`)
-      }
-      await transaction.put(key, { ...current, dispatchInProgress: true })
-    })
-  }
-
-  /** A returned runtime rejection ends the in-flight claim but never authorizes replay. */
-  private async markRecoveryDispatchRefused(runId: string, status: number): Promise<void> {
-    if (!Number.isSafeInteger(status) || status < 400 || status > 599) {
-      throw new Error('runtime refusal status is invalid')
-    }
-    await this.ctx.storage.transaction(async transaction => {
-      const key = `run-reservation:${runId}`
-      const current = await transaction.get<RunReservation>(key)
-      if (current?.provenance.mode !== 'recover-failed-wave'
-        || current.workflowInstanceId !== undefined || current.dispatchInProgress !== true
-        || current.retirementProofDigest !== undefined) {
-        throw new Error(`recovery refusal identity changed: ${runId}`)
-      }
-      const { dispatchInProgress: _, ...rest } = current
-      await transaction.put(key, { ...rest, dispatchRefusedStatus: status })
-    })
   }
 
   private async reserveRunId(
@@ -1040,8 +315,54 @@ export class ExperimentCoordinator extends DurableObject<Env> {
         reservedAt: new Date().toISOString(),
       }
       await transaction.put(key, reservation)
+      await registerDelivery(transaction, { kind: 'launch', auditId: runId, requestDigest })
       return reservation
     })
+  }
+
+  private async reserveLaunchRoute(store: CloudflareRunStore, runId: string, experimentId: string, runtime: RuntimeRelease) {
+    try { await store.reserveRunRoute(runId, experimentId, runtime) }
+    catch (error) {
+      if (error instanceof RunCommandConflict) {
+        await this.ctx.storage.transaction(async tx => {
+          const key = `run-reservation:${runId}`, reservation = await tx.get<RunReservation>(key)
+          if (reservation === undefined || reservation.workflowInstanceId !== undefined) throw new Error('launch refusal conflicts with dispatch')
+          await tx.put(key, { ...reservation, dispatchRefusedStatus: 409, dispatchRefusedReason: error.message })
+        })
+      }
+      throw error
+    }
+  }
+
+  private async deliverLaunch(marker: LaunchDeliveryMarker): Promise<boolean> {
+    const reservation = await this.ctx.storage.get<RunReservation>(`run-reservation:${marker.auditId}`)
+    if (reservation === undefined || reservation.requestDigest !== marker.requestDigest) throw new Error('launch reservation differs')
+    if (reservation.dispatchRefusedStatus !== undefined) return true
+    const store = new CloudflareRunStore(this.env.PACKAGES, this.env.ARTIFACTS, this.env.INDEX)
+    const state = await store.getStateIfPresent(marker.auditId)
+    if (state?.status === 'stopped') {
+      const receipt = state.controls?.lastReceipt
+      if (receipt === undefined || state.executionAuthority === undefined) throw new Error('cancelled launch has no control receipt')
+      return deliverRunControl({ schemaVersion: 1, auditId: state.rootRunId, experimentId: state.experimentId,
+        commandId: receipt.commandId, commandDigest: receipt.commandDigest,
+        expectedRevision: receipt.revision - 1, authority: state.executionAuthority }, this.env)
+    }
+    const { releaseDigest, runtimeRelease } = reservation.provenance
+    const release = await store.getRelease(releaseDigest)
+    try {
+      if (runtimeRelease !== undefined) await this.reserveLaunchRoute(store, marker.auditId, release.body.definition.id, runtimeRelease)
+    } catch (error) {
+      if (error instanceof RunCommandConflict) return true
+      throw error
+    }
+    const payload: AuditWorkflowPayload = {
+      mode: 'start', experimentId: release.body.definition.id, runId: marker.auditId, releaseDigest,
+      ...(runtimeRelease === undefined ? {} : { runtimeRelease }),
+    }
+    if (reservation.workflowInstanceId === undefined) {
+      await this.markRunDispatched(marker.auditId, await dispatchAuditWorkflow(this.env, payload))
+    }
+    return reconcileAuditStartup(this.env, payload)
   }
 
   private async markRunDispatched(runId: string, workflowInstanceId: string): Promise<RunReservation> {
@@ -1075,18 +396,20 @@ export class AuditWorkflow extends WorkflowEntrypoint<Env, AuditWorkflowPayload>
       await store.ensureSchema()
       return { ready: true }
     })
-    const bootstrap = await step.do<WaveProgress | { progress: WaveProgress, maxWaveExecutionMs: number }>('bootstrap-run', {
+    let progress = await step.do<WaveProgress>('bootstrap-run', {
       retries: { limit: 1, delay: '2 seconds' }, timeout: '1 minute',
     }, async () => {
-      const machine = await this.bootstrap(payload, store)
+      const predecessor = await store.getStateIfPresent(payload.runId)
+      if (predecessor !== null) await assertExecutionOwner(predecessor, this.env)
+      const persist = await stateWriter(store, predecessor)
+      const machine = await this.bootstrap(payload, store, predecessor)
       await machine.start()
-      if (payload.mode === 'recover-discovery-waiver') {
-        for (const checkpoint of machine.view().checkpoints) await store.putCheckpoint(checkpoint)
+      if (predecessor === null || machine.view().stateGeneration !== predecessor.stateGeneration) {
+        await persist(machine.view())
       }
-      await store.putState(machine.view())
+      await store.recordExecutionBootstrap(machine.view())
       return this.progress(machine.view())
     })
-    let progress = workflowBootstrapProgress(bootstrap)
     if (progress.status === 'stopped' || progress.status === 'failed') {
       progress = await step.do<WaveProgress>('reconcile-terminal-workspaces', {
         retries: { limit: 10, delay: '2 seconds', backoff: 'exponential' }, timeout: '1 minute',
@@ -1119,7 +442,11 @@ export class AuditWorkflow extends WorkflowEntrypoint<Env, AuditWorkflowPayload>
           try {
             progress = await step.do<WaveProgress>(`recover-wave-state-${pollCycle}`, {
               retries: { limit: 10, delay: '5 seconds', backoff: 'exponential' }, timeout: '1 minute',
-            }, async () => this.progress(await store.getState(payload.runId)))
+            }, async () => {
+              const recovered = await store.getState(payload.runId)
+              await assertExecutionOwner(recovered, this.env)
+              return recovered.status === 'stopped' ? this.cleanupPersistedTerminal(payload.runId, store) : this.progress(recovered)
+            })
           } catch (recoveryError) {
             if (recoveryError instanceof NonRetryableError
               || workflowFailureDisposition(recoveryError) === 'fail') throw recoveryError
@@ -1132,11 +459,12 @@ export class AuditWorkflow extends WorkflowEntrypoint<Env, AuditWorkflowPayload>
         if (progress.status === 'running' && sameCursor(progress.cursor, expectedCursor)) {
           // Agent execution is unfinished or temporarily unobservable. Its
           // durable admission remains authoritative; back off before another
-          // bounded status slice and do not cross a wave/stop boundary.
+          // bounded status slice before advancing the wave. A pause with nothing
+          // in flight waits longer, so a long pause does not use up Workflow steps.
           try {
             await step.sleep(
               `agent-poll-backoff-${pollCycle}`,
-              observationFailed ? '30 seconds' : '15 seconds',
+              progress.pausedIdle === true ? '5 minutes' : observationFailed ? '30 seconds' : '15 seconds',
             )
           } catch (error) {
             if (error instanceof NonRetryableError || workflowFailureDisposition(error) === 'fail') throw error
@@ -1147,24 +475,14 @@ export class AuditWorkflow extends WorkflowEntrypoint<Env, AuditWorkflowPayload>
           }
           continue
         }
-        if (progress.status === 'running') {
-          progress = await step.do<WaveProgress>(`stop-boundary-${pollCycle}`, {
-            retries: { limit: 2, delay: '1 second', backoff: 'exponential' }, timeout: '1 minute',
-          }, async () => this.stopAtBoundary(payload.runId, store))
-        }
       }
       const terminalFailure = failureForWorkflowProgress(progress)
       if (terminalFailure !== null) throw terminalFailure
-      if (progress.status === 'completed') {
-        await step.do('dispose-completed-workspaces', {
+      if (progress.status === 'completed' || progress.status === 'stopped') {
+        progress = await step.do<WaveProgress>(progress.status === 'completed'
+          ? 'dispose-completed-workspaces' : 'reconcile-stopped-workspaces', {
           retries: { limit: 10, delay: '2 seconds', backoff: 'exponential' }, timeout: '1 minute',
-        }, async () => {
-          const state = await store.getState(payload.runId)
-          const release = await store.getRelease(state.releaseDigest)
-          const cleanup = await this.cleanupTerminalWorkspaces(release.body.definition, state)
-          await store.putCompletedCleanupProof(state, cleanup)
-          return { ready: true }
-        })
+        }, async () => this.cleanupPersistedTerminal(payload.runId, store))
       }
       return progress
     } catch (error) {
@@ -1185,312 +503,75 @@ export class AuditWorkflow extends WorkflowEntrypoint<Env, AuditWorkflowPayload>
     }
   }
 
-  private async bootstrap(payload: Readonly<AuditWorkflowPayload>, store: CloudflareRunStore): Promise<RunMachine> {
+  private async bootstrap(payload: Readonly<AuditWorkflowPayload>, store: CloudflareRunStore, initialState?: RunState | null): Promise<RunMachine> {
     if (!runIdPattern.test(payload.runId)) throw new TypeError('run id is invalid')
     if (engineRole(this.env) === 'runtime') {
       if (payload.runtimeRelease === undefined) throw new TypeError('runtime-bound Workflow payload is required')
       assertLocalRuntime(this.env, payload.runtimeRelease)
     }
-    if (payload.mode === 'start') {
-      if (!digestPattern.test(payload.releaseDigest ?? '')) throw new TypeError('release digest is invalid')
-      const release = await store.getRelease(payload.releaseDigest as string)
-      if (release.body.definition.id !== payload.experimentId) throw new Error('release experiment mismatch')
-      assertReleaseEnvironmentMatchesRuntime(release.body, payload.runtimeRelease)
-      const existing = await store.getStateIfPresent(payload.runId)
-      if (existing !== null) {
-        this.assertBootstrapIdentity(payload, existing, {
-          releaseDigest: release.digest,
-          rootRunId: payload.runId,
-          recoveryEpoch: 0,
-          parentRunId: null,
-          parentCheckpointDigest: null,
-        })
-        return RunMachine.fromState(release.body.definition, existing)
-      }
-      return RunMachine.create(
-        release.body.definition, release.digest, payload.runId, new Date().toISOString(), payload.runtimeRelease,
-      )
-    }
-    if (!digestPattern.test(payload.checkpointDigest ?? '')) throw new TypeError('checkpoint digest is invalid')
-    const checkpoint = await store.getCheckpoint(payload.checkpointDigest as string)
-    const release = await store.getRelease(checkpoint.body.releaseDigest)
-    if (release.body.definition.id !== payload.experimentId || checkpoint.body.experimentId !== payload.experimentId) {
-      throw new Error('resume experiment mismatch')
-    }
-    if (payload.mode !== 'recover-failed-wave') {
-      assertReleaseEnvironmentMatchesRuntime(release.body, payload.runtimeRelease)
-    }
-    const existing = await store.getStateIfPresent(payload.runId)
-    if (payload.mode === 'recover-discovery-waiver') {
-      const evidence = payload.discoveryPoolWaiver
-      if (evidence === undefined || payload.runtimeRelease === undefined || evidence.childRunId !== payload.runId
-        || evidence.checkpointDigest !== checkpoint.digest
-        || !sameRuntimeRelease(evidence.targetRuntimeRelease, payload.runtimeRelease)) {
-        throw new TypeError('exact discovery waiver identity is required')
-      }
-      await store.claimDiscoveryWaiver(evidence)
-      if (existing !== null) {
-        this.assertBootstrapIdentity(payload, existing, { releaseDigest: release.digest,
-          rootRunId: checkpoint.body.rootRunId, recoveryEpoch: checkpoint.body.recoveryEpoch + 1,
-          parentRunId: evidence.sourceRunId, parentCheckpointDigest: checkpoint.digest,
-          rootCreatedAt: checkpoint.body.rootCreatedAt, modelStartedAt: checkpoint.body.modelStartedAt })
-        if (canonicalJson(existing.stageEndReceipts.find(receipt => receipt.reason === 'operator-discovery-pool-waiver')?.evidence)
-          !== canonicalJson(evidence)) throw new Error('persisted discovery waiver differs')
-        return RunMachine.fromState(release.body.definition, existing)
-      }
-      const prepared = await store.prepareDiscoveryWaiver({ sourceRunId: evidence.sourceRunId, childRunId: payload.runId,
-        sourceStateGeneration: evidence.sourceStateGeneration, sourceStateDigest: evidence.sourceStateDigest,
-        checkpointDigest: checkpoint.digest, targetRuntimeRelease: payload.runtimeRelease,
-        poolId: evidence.poolId, requestDigest: evidence.requestDigest })
-      if (canonicalJson(prepared.evidence) !== canonicalJson(evidence)) throw new Error('waiver custody changed before bootstrap')
-      return RunMachine.recoverDiscoveryPoolWaiver(release.body.definition, checkpoint,
-        await store.getState(evidence.sourceRunId), evidence, prepared.fence)
-    }
-    if (payload.mode === 'recover-failed-wave') {
-      if (payload.failedWaveRecovery === undefined || payload.runtimeRelease === undefined) {
-        throw new TypeError('failed-wave recovery identity is required')
-      }
-      if (existing !== null) {
-        this.assertBootstrapIdentity(payload, existing, {
-          releaseDigest: release.digest,
-          rootRunId: checkpoint.body.rootRunId,
-          recoveryEpoch: checkpoint.body.recoveryEpoch + 1,
-          parentRunId: payload.failedWaveRecovery.sourceRunId,
-          parentCheckpointDigest: checkpoint.digest,
-          rootCreatedAt: checkpoint.body.rootCreatedAt,
-          modelStartedAt: checkpoint.body.modelStartedAt,
-          failedWaveRecovery: payload.failedWaveRecovery,
-        })
-        const machine = await RunMachine.fromState(release.body.definition, existing)
-        assertReleaseEnvironmentMatchesRuntime(release.body, payload.runtimeRelease, existing.failedWaveRecovery)
-        return machine
-      }
-      const source = await store.getState(payload.failedWaveRecovery.sourceRunId)
-      const unobservableNative = (source.inFlightAgentAttempts ?? []).length === 0
-        ? undefined : await store.fencedUnobservableNativeEvidence(source)
-      if (canonicalJson(unobservableNative ?? null)
-        !== canonicalJson(payload.failedWaveRecovery.unobservableNative ?? null)) {
-        throw new PermanentRunFailure('unobservable recovery fence changed before bootstrap', 'integrity-failed')
-      }
-      if (payload.failedWaveRecovery.quarantinedRepair !== undefined
-        && await store.retiredRunWorkflow(source.runId) === null) {
-        throw new PermanentRunFailure('quarantined output source retirement missing', 'integrity-failed')
-      }
-      const prepared = await prepareFailedWaveRecovery({
-        definition: release.body.definition,
-        checkpoint,
-        source,
-        sourceStateGeneration: payload.failedWaveRecovery.sourceStateGeneration,
-        sourceStateDigest: payload.failedWaveRecovery.sourceStateDigest,
-        targetRuntimeRelease: payload.runtimeRelease,
-        artifacts: new R2ArtifactStore(this.env.ARTIFACTS),
-        retirementProofDigest: (await store.retiredRunWorkflow(source.runId))?.fenceProofDigest ?? undefined,
-        ...(unobservableNative === undefined ? {} : { unobservableNative }),
-        ...(payload.failedWaveRecovery.promotedExecution === undefined ? {} : {
-          promoteExecution: {
-            taskId: payload.failedWaveRecovery.promotedExecution.taskId,
-            sourceAttempt: payload.failedWaveRecovery.promotedExecution.sourceAttempt,
-            requestDigest: payload.failedWaveRecovery.promotedExecution.requestDigest,
-            ...(payload.failedWaveRecovery.promotedExecution.quarantineOutputDigest === undefined ? {}
-              : { quarantineOutputDigest: payload.failedWaveRecovery.promotedExecution.quarantineOutputDigest }),
-          },
-          executionReceipts: new R2AgentExecutionReceiptStore(this.env.ARTIFACTS),
-          executionRequests: new R2AgentExecutionLogStore(this.env.ARTIFACTS),
-          ...(payload.failedWaveRecovery.promotedExecution.quarantineOutputDigest === undefined ? {}
-            : { quarantined: new R2ArtifactStore(this.env.ARTIFACTS) }),
-        }),
-        ...(payload.failedWaveRecovery.quarantinedRepair === undefined ? {} : {
-          repairQuarantined: payload.failedWaveRecovery.quarantinedRepair,
-          executionReceipts: new R2AgentExecutionReceiptStore(this.env.ARTIFACTS),
-          executionRequests: new R2AgentExecutionLogStore(this.env.ARTIFACTS),
-          quarantined: new R2ArtifactStore(this.env.ARTIFACTS),
-        }),
-        ...(payload.failedWaveRecovery.retainedNative === undefined ? {} : {
-          retainNative: {
-            taskId: payload.failedWaveRecovery.retainedNative.taskId,
-            requestDigest: payload.failedWaveRecovery.retainedNative.nativeTransport.requestDigest,
-            snapshotDigest: payload.failedWaveRecovery.retainedNative.nativeTransport.snapshotDigest,
-            sandboxObjectId: payload.failedWaveRecovery.retainedNative.sandboxObjectId,
-          },
-        }),
-      })
-      if (canonicalJson(prepared.evidence) !== canonicalJson(payload.failedWaveRecovery)) {
-        throw new PermanentRunFailure('failed-wave recovery evidence changed before bootstrap', 'integrity-failed')
-      }
-      assertReleaseEnvironmentMatchesRuntime(release.body, payload.runtimeRelease, prepared.evidence)
-      return RunMachine.recoverFailedWave(
-        release.body.definition,
-        checkpoint,
-        source,
-        payload.runId,
-        prepared.importedArtifacts,
-        prepared.inheritedRejectedAttempts,
-        prepared.evidence,
-      )
-    }
-    if (payload.mode === 'recover-terminal-completion') {
-      if (payload.terminalCompletionRecovery === undefined || payload.runtimeRelease === undefined) {
-        throw new TypeError('terminal completion recovery identity is required')
-      }
-      if (existing !== null) {
-        this.assertBootstrapIdentity(payload, existing, {
-          releaseDigest: release.digest,
-          rootRunId: checkpoint.body.rootRunId,
-          recoveryEpoch: checkpoint.body.recoveryEpoch + 1,
-          parentRunId: payload.terminalCompletionRecovery.sourceRunId,
-          parentCheckpointDigest: checkpoint.digest,
-          rootCreatedAt: checkpoint.body.rootCreatedAt,
-          modelStartedAt: checkpoint.body.modelStartedAt,
-          terminalCompletionRecovery: payload.terminalCompletionRecovery,
-        })
-        return RunMachine.fromState(release.body.definition, existing)
-      }
-      const source = await store.getState(payload.terminalCompletionRecovery.sourceRunId)
-      const evidence = await prepareTerminalCompletionRecovery({
-        definition: release.body.definition,
-        checkpoint,
-        source,
-        sourceStateGeneration: payload.terminalCompletionRecovery.sourceStateGeneration,
-        sourceStateDigest: payload.terminalCompletionRecovery.sourceStateDigest,
-        targetRuntimeRelease: payload.runtimeRelease,
-      })
-      if (canonicalJson(evidence) !== canonicalJson(payload.terminalCompletionRecovery)) {
-        throw new PermanentRunFailure('terminal completion recovery evidence changed before bootstrap', 'integrity-failed')
-      }
-      return RunMachine.recoverTerminalCompletion(
-        release.body.definition, checkpoint, source, payload.runId, evidence,
-      )
-    }
-    let transitionSource: RunState | undefined
-    let preparedResume: RunMachine | undefined
-    if (payload.runtimeTransition !== undefined) {
-      if (payload.mode !== 'resume' || payload.timeAmendment !== undefined || payload.revalidation !== undefined) {
-        throw new PermanentRunFailure('runtime transition cannot amend time or revalidate output', 'integrity-failed')
-      }
-      transitionSource = await store.getState(payload.runtimeTransition.sourceRunId)
-      preparedResume = await RunMachine.resume(release.body.definition, checkpoint, payload.runId,
-        new Set(), new Date().toISOString(), undefined, payload.runtimeRelease, payload.runtimeTransition, transitionSource)
-    }
-    if (existing !== null) {
-      this.assertBootstrapIdentity(payload, existing, {
-          releaseDigest: release.digest,
-          rootRunId: checkpoint.body.rootRunId,
-          recoveryEpoch: checkpoint.body.recoveryEpoch + 1,
-        parentRunId: checkpoint.body.runId,
-        parentCheckpointDigest: checkpoint.digest,
-        rootCreatedAt: checkpoint.body.rootCreatedAt,
-        modelStartedAt: payload.timeAmendment?.amendedModelStartedAt ?? checkpoint.body.modelStartedAt,
-        failedWaveRecovery: checkpoint.body.failedWaveRecovery,
-        terminalCompletionRecovery: checkpoint.body.terminalCompletionRecovery,
-        runtimeTransition: payload.runtimeTransition ?? checkpoint.body.runtimeTransition,
-      })
-      return RunMachine.fromState(release.body.definition, existing)
-    }
-    return preparedResume ?? RunMachine.resume(
-      release.body.definition,
-      checkpoint,
-      payload.runId,
-      new Set(),
-      new Date().toISOString(),
-      payload.timeAmendment,
-      payload.runtimeRelease,
-      payload.runtimeTransition,
-      transitionSource ?? undefined,
-    )
-  }
-
-  private assertBootstrapIdentity(
-    payload: Readonly<AuditWorkflowPayload>,
-    state: RunState,
-    expected: Readonly<Pick<RunState,
-      'releaseDigest' | 'rootRunId' | 'recoveryEpoch' | 'parentRunId' | 'parentCheckpointDigest'>
-      & {
-        rootCreatedAt?: RunState['rootCreatedAt']
-        modelStartedAt?: RunState['modelStartedAt']
-        failedWaveRecovery?: RunState['failedWaveRecovery']
-        terminalCompletionRecovery?: RunState['terminalCompletionRecovery']
-        runtimeTransition?: RunState['runtimeTransition']
-      }>,
-  ): void {
-    const runtimeMatches = state.runtimeRelease === undefined && payload.runtimeRelease === undefined
-      || state.runtimeRelease !== undefined && payload.runtimeRelease !== undefined
-        && sameRuntimeRelease(state.runtimeRelease, payload.runtimeRelease)
-    const recordedAmendment = state.journal.find(event => event.type === 'run.time-amended')?.payload ?? null
-    const requestedAmendment = payload.mode === 'resume' ? payload.timeAmendment ?? null : null
-    if (state.runId !== payload.runId || state.experimentId !== payload.experimentId
-      || state.releaseDigest !== expected.releaseDigest || state.rootRunId !== expected.rootRunId
-      || state.recoveryEpoch !== expected.recoveryEpoch || state.parentRunId !== expected.parentRunId
-      || state.parentCheckpointDigest !== expected.parentCheckpointDigest || !runtimeMatches
-      || canonicalJson(state.failedWaveRecovery ?? null) !== canonicalJson(expected.failedWaveRecovery ?? null)
-      || canonicalJson(state.terminalCompletionRecovery ?? null)
-        !== canonicalJson(expected.terminalCompletionRecovery ?? null)
-      || canonicalJson(state.runtimeTransition ?? null) !== canonicalJson(expected.runtimeTransition ?? null)
-      || (expected.rootCreatedAt !== undefined && state.rootCreatedAt !== expected.rootCreatedAt)
-      || (expected.modelStartedAt !== undefined && state.modelStartedAt !== expected.modelStartedAt)) {
-      throw new PermanentRunFailure('persisted bootstrap state differs from the requested run identity', 'integrity-failed')
-    }
-    if (canonicalJson(recordedAmendment) !== canonicalJson(requestedAmendment)) {
-      throw new PermanentRunFailure('persisted bootstrap amendment differs from the requested resume', 'integrity-failed')
-    }
+    if (payload.mode === 'start') return bootstrapExecution(payload, store, this.env, initialState)
+    throw new PermanentRunFailure('legacy Workflow mode is retired; use audit controls', 'invalid-configuration')
   }
 
   private async runOneWave(payload: Readonly<AuditWorkflowPayload>, expectedCursor: RunCursor, store: CloudflareRunStore): Promise<WaveProgress> {
     if (payload.runtimeRelease !== undefined) assertLocalRuntime(this.env, payload.runtimeRelease)
     const state = await store.getState(payload.runId)
+    const persist = await stateWriter(store, state)
     if (state.runtimeRelease !== undefined && payload.runtimeRelease !== undefined
       && !sameRuntimeRelease(state.runtimeRelease, payload.runtimeRelease)) {
       throw new PermanentRunFailure('run runtime release differs from its Workflow destination', 'integrity-failed')
     }
+    await assertExecutionOwner(state, this.env)
+    if (state.status === 'stopped') return this.cleanupPersistedTerminal(payload.runId, store)
     if (state.status === 'failed') {
       await this.cleanupPersistedTerminal(payload.runId, store)
       throw new PermanentRunFailure(state.terminalReason ?? 'audit run failed without a recorded reason', 'persisted-run-failed')
     }
     if (state.status !== 'running' || !sameCursor(state.cursor, expectedCursor)) return this.progress(state)
     const release = await store.getRelease(state.releaseDigest)
-    const machine = await RunMachine.fromState(release.body.definition, state)
-    const provider = new QuarantinedRevalidationProvider(
-      new PromotedExecutionProvider(
-        new SandboxAgentProvider(this.env),
-        new R2AgentExecutionReceiptStore(this.env.ARTIFACTS),
-        new R2AgentExecutionLogStore(this.env.ARTIFACTS),
-        payload.failedWaveRecovery?.promotedExecution,
-      ),
-      new R2ArtifactStore(this.env.ARTIFACTS),
-      payload.revalidation,
-      payload.timeAmendment !== undefined,
-    )
+    const machine = await RunMachine.fromState(release.body.definition, state, digest => store.getRelease(digest), store.executionSources())
+    const provider = new SandboxAgentProvider(this.env)
     const pendingCheckpoints: SealedCheckpoint[] = []
     let checkpointsPublished = false
+    let controlsReady = true
+    const reconcileControls = async () => {
+      controlsReady = await reconcileRunControls({ machine, persist,
+        journal: new RunCommandJournal(this.env.INDEX, machine.view().rootRunId),
+        native: new CommandCustodyCollector(this.env) })
+      return controlsReady
+    }
     try {
+      if (!await reconcileControls()) {
+        if (machine.view().status === 'stopped') await this.cleanupTerminalWorkspaces(machine.definition, machine.view())
+        return this.progress(machine.view())
+      }
       await advanceExperimentOneWave({
-        definition: release.body.definition, machine,
+        definition: machine.definition, machine,
         provider,
         artifactStore: new R2ArtifactStore(this.env.ARTIFACTS),
+        loadOwnedWorkspaces: current => verifiedCleanupWorkspaces(this.env, current),
         policy: audit0RunPolicy,
-        onWaveAdmission: state => store.putState(state),
-        stopRequested: () => store.stopRequested(payload.runId),
+        onWaveAdmission: persist,
+        reconcileControls,
         onCheckpoint: async checkpoint => { pendingCheckpoints.push(checkpoint) },
       })
-      if (machine.view().cursor.stageIndex >= release.body.definition.stages.length) {
-        const issues = audit0RunPolicy.assessCompletion({ definition: release.body.definition, state: machine.view() })
+      if (!controlsReady || machine.view().status !== 'running') {
+        if (machine.view().status === 'stopped') await this.cleanupTerminalWorkspaces(machine.definition, machine.view())
+        return this.progress(machine.view())
+      }
+      if (machine.view().cursor.stageIndex >= machine.definition.stages.length) {
+        const issues = audit0RunPolicy.assessCompletion({ definition: machine.definition, state: machine.view() })
         if (issues.length > 0) {
           throw new PermanentRunFailure(`completion contract failed: ${issues.join('; ')}`, 'completion-contract-failed')
         }
         await machine.complete()
       }
-      const stopRequested = release.body.definition.stages[machine.view().cursor.stageIndex]?.kind === 'discovery'
-        && canStopAtSealedWaveBoundary(machine.view(), true)
-        && await store.stopRequested(payload.runId)
-      // Independent cohorts drain at unequal local wave counters. Preserve that
-      // portable frontier before stopping rather than reverting resume to preflight.
-      if (stopRequested) pendingCheckpoints.push(await machine.seal())
       for (const checkpoint of pendingCheckpoints) await store.putCheckpoint(checkpoint)
       checkpointsPublished = true
-      if (stopRequested) await machine.stop('operator-requested-stop-at-sealed-wave-boundary')
       const next = machine.view()
-      await store.putState(next)
-      if (next.status === 'stopped') await this.cleanupTerminalWorkspaces(release.body.definition, next)
-      return this.progress(next)
+      await persist(next)
+      if (next.status === 'stopped') await this.cleanupTerminalWorkspaces(machine.definition, next)
+      return this.progress(next, state.stateGeneration)
     } catch (error) {
       // A sealed cursor becomes authoritative only after every checkpoint and
       // runtime route for that transition is durable. Completed executions are
@@ -1498,13 +579,21 @@ export class AuditWorkflow extends WorkflowEntrypoint<Env, AuditWorkflowPayload>
       if (pendingCheckpoints.length > 0 && !checkpointsPublished) throw error
       // Save paid attempts, validation diagnostics, and the last sealed boundary before
       // the Workflow retry or terminal-failure path reconstructs this run.
+      if (machine.view().journal?.at(-2)?.type === 'run.cancelled') {
+        await this.cleanupTerminalWorkspaces(machine.definition, machine.view())
+        return this.progress(machine.view())
+      }
       if (isPermanentRunFailure(error) && machine.view().status === 'running') {
+        if (await hasPendingNativeControl(machine.view(), new RunCommandJournal(this.env.INDEX, machine.view().rootRunId))) {
+          await persist(machine.view())
+          throw new TransientRunFailure('native control reconciliation must finish before terminal failure', { cause: error })
+        }
         await machine.fail(error.message)
       }
       const terminal = machine.view()
-      await store.putState(terminal)
+      await persist(terminal)
       if (terminal.status === 'failed' || terminal.status === 'stopped') {
-        await this.cleanupTerminalWorkspaces(release.body.definition, terminal)
+        await this.cleanupTerminalWorkspaces(machine.definition, terminal)
       }
       throw error
     }
@@ -1513,17 +602,22 @@ export class AuditWorkflow extends WorkflowEntrypoint<Env, AuditWorkflowPayload>
   private async recordTerminalFailure(runId: string, store: CloudflareRunStore, error: unknown): Promise<void> {
     try {
       const state = await store.getState(runId)
+      await assertExecutionOwner(state, this.env)
       if (state.status !== 'running') {
         if (state.status === 'failed' || state.status === 'stopped') {
           await this.cleanupPersistedTerminal(runId, store)
         }
         return
       }
+      if (await hasPendingNativeControl(state, new RunCommandJournal(this.env.INDEX, state.rootRunId))) {
+        throw new TransientRunFailure('native control reconciliation must finish before terminal failure', { cause: error })
+      }
       const release = await store.getRelease(state.releaseDigest)
-      const machine = await RunMachine.fromState(release.body.definition, state)
+      const persist = await stateWriter(store, state)
+      const machine = await RunMachine.fromState(release.body.definition, state, digest => store.getRelease(digest), store.executionSources())
       await machine.fail(error instanceof Error ? error.message : String(error))
       const failed = machine.view()
-      await store.putState(failed)
+      await persist(failed)
       await this.cleanupTerminalWorkspaces(release.body.definition, failed)
     } catch (cleanupError) {
       // Preserve the original Workflow failure, but never silently present a
@@ -1534,38 +628,23 @@ export class AuditWorkflow extends WorkflowEntrypoint<Env, AuditWorkflowPayload>
     }
   }
 
-  private async stopAtBoundary(runId: string, store: CloudflareRunStore): Promise<WaveProgress> {
-    const state = await store.getState(runId)
-    if (state.status === 'stopped' || state.status === 'failed') {
-      return this.cleanupPersistedTerminal(runId, store)
-    }
-    if (!canStopAtSealedWaveBoundary(state, await store.stopRequested(runId))) {
-      return this.progress(state)
-    }
-    const release = await store.getRelease(state.releaseDigest)
-    const machine = await RunMachine.fromState(release.body.definition, state)
-    await machine.stop('operator-requested-stop-at-sealed-wave-boundary')
-    const stopped = machine.view()
-    await store.putState(stopped)
-    await this.cleanupTerminalWorkspaces(release.body.definition, stopped)
-    return this.progress(stopped)
-  }
-
   private async cleanupTerminalWorkspaces(
     definition: ReleasePackageBody['definition'],
     state: RunState,
-  ): Promise<Awaited<ReturnType<typeof disposeTerminalWorkspaces>>> {
+  ): Promise<Awaited<ReturnType<typeof disposeTerminalWorkspaces>> | {
+    mode: 'command-cancelled'; workspaceKeys: string[]; activeWorkspaceKeys: string[]; retainedWorkspaceKeys: string[]; proofDigest: string
+  } | Awaited<ReturnType<typeof settleControlledFailure>>> {
+    if (state.status === 'failed') return settleControlledFailure(state.runId, this.env)
+    if (state.journal?.at(-2)?.type === 'run.cancelled') {
+      return settleCancelledExecution(state, this.env)
+    }
     const store = new CloudflareRunStore(this.env.PACKAGES, this.env.ARTIFACTS, this.env.INDEX)
-    const cleanup = await disposeTerminalWorkspaces(new SandboxAgentProvider(this.env), definition, state,
-      { forceOwnedWorkspaces: state.status === 'failed' || state.status === 'stopped',
-        workspaceAllocationForOwner: async workspaceKey => {
-          const imported = state.failedWaveRecovery?.retainedNative?.workspaceKey === workspaceKey
-            ? state.failedWaveRecovery.retainedNative.workspaceAllocationRunId : null
-          const allocationRunId = imported ?? state.runId
-          const claim = await store.retainedNativeWorkspaceClaim(allocationRunId, workspaceKey)
-          return claim !== null && claim.childRunId !== state.runId ? null
-            : imported !== null && claim?.childRunId !== state.runId ? null : allocationRunId
-        } })
+    const cleanup = await settleTerminalControlsAndDispose(state,
+      new RunCommandJournal(this.env.INDEX, state.rootRunId), () =>
+      disposeTerminalWorkspaces(new SandboxAgentProvider(this.env), definition, state,
+      { loadRelease: digest => store.getRelease(digest), loadExecution: store.executionSources(),
+      loadOwnedWorkspaces: current => verifiedCleanupWorkspaces(this.env, current),
+      }))
     console.log(canonicalJson({
       schemaVersion: 1,
       kind: 'terminal-workspace-cleanup',
@@ -1585,14 +664,19 @@ export class AuditWorkflow extends WorkflowEntrypoint<Env, AuditWorkflowPayload>
 
   private async cleanupPersistedTerminal(runId: string, store: CloudflareRunStore): Promise<WaveProgress> {
     const state = await store.getState(runId)
-    if (state.status !== 'stopped' && state.status !== 'failed') return this.progress(state)
+    await assertExecutionOwner(state, this.env)
+    if (state.status === 'created' || state.status === 'running') return this.progress(state)
     const release = await store.getRelease(state.releaseDigest)
-    await this.cleanupTerminalWorkspaces(release.body.definition, state)
-    return this.progress(state)
+    const cleanup = await this.cleanupTerminalWorkspaces(release.body.definition, state)
+    if (state.status === 'completed') {
+      await store.putCompletedCleanupProof(state, cleanup)
+      await registerCompletedRunDelivery(state, this.env)
+    }
+    return this.progress(await store.getState(runId))
   }
 
-  private progress(state: RunState): WaveProgress {
-    return workflowProgress(state)
+  private progress(state: RunState, polledGeneration?: number): WaveProgress {
+    return workflowProgress(state, polledGeneration)
   }
 
   private workflowStepError(error: unknown): Error {
@@ -1611,23 +695,6 @@ async function forwardCoordinator(request: Request, env: Env, experimentId: stri
   return stub.fetch(new Request(`https://coordinator.internal/${action}`, { method: request.method, headers, body: request.body }))
 }
 
-async function boundedFrontDoorStop(operation: Promise<Response>, ctx: ExecutionContext,
-  runId: string, deadlineAt: number): Promise<Response> {
-  ctx.waitUntil(operation.catch(error => {
-    console.error(canonicalJson({ schemaVersion: 1, kind: 'frontdoor-stop-failed', runId,
-      error: error instanceof Error ? error.message : String(error) }))
-  }))
-  let timer: ReturnType<typeof setTimeout> | undefined
-  try {
-    return await Promise.race([operation, new Promise<Response>(resolve => {
-      timer = setTimeout(() => resolve(json({ runId, stop: 'deadline-missed',
-        deadlineMet: false, physicalZeroVerified: false }, 503)), Math.max(0, deadlineAt - Date.now()))
-    })])
-  } finally {
-    if (timer !== undefined) clearTimeout(timer)
-  }
-}
-
 async function dashboardWorkflowStatus(runId: string, state: RunState, env: Env): Promise<unknown> {
   if (engineRole(env) !== 'front-door') return (await env.AUDIT_WORKFLOW.get(runId)).status()
   const retired = await new CloudflareRunStore(env.PACKAGES, env.ARTIFACTS, env.INDEX)
@@ -1642,7 +709,7 @@ async function dashboardWorkflowStatus(runId: string, state: RunState, env: Env)
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const internal = await runtimeServiceRoute(request, env, ctx)
+    const internal = await runtimeServiceRoute(request, env)
     if (internal !== null) return internal
     const url = new URL(request.url)
     if (request.method === 'GET' && url.pathname === '/health') {
@@ -1652,10 +719,14 @@ export default {
       if (!await dashboardAccessAllowed(request, undefined, env)) return json({ error: 'unauthorized' }, 401)
       const dashboardRequest = monitoringRequestFromDashboard(request)
       if (dashboardRequest !== null) {
-        const store = new CloudflareRunStore(env.PACKAGES, env.ARTIFACTS, env.INDEX)
-        return await monitoringRoute(dashboardRequest, store, env.ARTIFACTS, env.INDEX,
-          new R2ArtifactStore(env.ARTIFACTS), env.PACKAGES,
-          (runId, state) => dashboardWorkflowStatus(runId, state, env))
+        try {
+          const store = new CloudflareRunStore(env.PACKAGES, env.ARTIFACTS, env.INDEX)
+          return await monitoringRoute(dashboardRequest, store, env.ARTIFACTS, env.INDEX,
+            new R2ArtifactStore(env.ARTIFACTS), env.PACKAGES,
+            (runId, state) => dashboardWorkflowStatus(runId, state, env))
+        } catch (error) {
+          return json({ error: error instanceof Error ? error.message : String(error) }, 400)
+        }
       }
     }
     if (request.method === 'GET' && (url.pathname === '/dashboard' || url.pathname === '/dashboard/')) {
@@ -1669,7 +740,6 @@ export default {
       } })
     }
     if (!await authorized(request, env.CONTROL_API_TOKEN)) return json({ error: 'unauthorized' }, 401)
-    const authenticatedAt = Date.now()
     const store = new CloudflareRunStore(env.PACKAGES, env.ARTIFACTS, env.INDEX)
     try {
       if (engineRole(env) === 'front-door' && request.method === 'POST'
@@ -1778,6 +848,8 @@ export default {
         })
         return json(result.body, result.status)
       }
+      const controlPath = url.pathname.match(/^\/v1\/experiments\/([a-z0-9][a-z0-9._-]{0,99})\/(audits\/[a-z0-9][a-z0-9._-]{0,99}\/commands(?:\/[a-z0-9][a-z0-9._-]{0,99})?)$/)
+      if (controlPath !== null) return forwardCoordinator(request, env, controlPath[1]!, controlPath[2]!)
       const experimentId = experimentFrom(url.pathname)
       if (experimentId !== null) return forwardCoordinator(request, env, experimentId, url.pathname.split('/').at(-1) ?? '')
       if (request.method === 'POST' && url.pathname === '/v1/runtime-fixtures') {
@@ -1834,7 +906,8 @@ export default {
         if (engineRole(env) !== 'front-door') return json({ error: 'fixture retirement requires the front door' }, 409)
         const proof: unknown = await request.json()
         return json(await retireTerminalFixture({ fixtureId: terminalFixtureRetire,
-          proof, now: Date.now(), store,
+          accountId: typeof env.ACK3_CLOUDFLARE_ACCOUNT_ID === 'string' ? env.ACK3_CLOUDFLARE_ACCOUNT_ID : undefined,
+          observeExpired: proof => observeExpiredFixture(env, proof), proof, now: Date.now(), store,
           liveFixture: async (runtimeRelease, fixtureId) => {
             const live = await new RuntimeRouter(env).fetch(runtimeRelease,
               `/internal/runtime/fixtures/${fixtureId}`)
@@ -1883,38 +956,6 @@ export default {
           : json({ runId, workspaceKey, ...diagnostic })
       }
       const runMatch = url.pathname.match(/^\/v1\/runs\/([a-z0-9][a-z0-9._-]{0,99})$/)?.[1]
-      const stoppedRetireMatch = url.pathname.match(
-        /^\/v1\/runs\/([a-z0-9][a-z0-9._-]{0,99})\/retire-sealed-stopped$/,
-      )?.[1]
-      const failedRetireMatch = url.pathname.match(
-        /^\/v1\/runs\/([a-z0-9][a-z0-9._-]{0,99})\/retire-terminal-failed$/,
-      )?.[1]
-      if (request.method === 'POST' && failedRetireMatch !== undefined) {
-        if (engineRole(env) !== 'front-door') return json({ error: 'failed retirement requires the front door' }, 409)
-        const proof: unknown = await request.json()
-        return json(await retireFailedRun({ runId: failedRetireMatch,
-          proof, now: Date.now(), store,
-          liveRun: async (runtimeRelease, runId) => {
-            const response = await new RuntimeRouter(env).fetch(runtimeRelease,
-              `/internal/runtime/audit-runs/${runId}`)
-            if (!response.ok) throw new Error('native failed run is unavailable')
-            return response.json<{ state: unknown, workflow: unknown }>()
-          },
-        }))
-      }
-      if (request.method === 'POST' && stoppedRetireMatch !== undefined) {
-        if (engineRole(env) !== 'front-door') return json({ error: 'stopped retirement requires the front door' }, 409)
-        const proof: unknown = await request.json()
-        return json(await retireStoppedRun({ runId: stoppedRetireMatch,
-          proof, now: Date.now(), store,
-          liveRun: async (runtimeRelease, runId) => {
-            const response = await new RuntimeRouter(env).fetch(runtimeRelease,
-              `/internal/runtime/audit-runs/${runId}`)
-            if (!response.ok) throw new Error('native stopped run is unavailable')
-            return response.json<{ state: unknown, workflow: unknown }>()
-          },
-        }))
-      }
       if (request.method === 'GET' && runMatch !== undefined) {
         if (engineRole(env) === 'front-door') {
           const unmaterialized = await store.retiredUnmaterializedRoute(runMatch)
@@ -1928,10 +969,6 @@ export default {
           const retiredWorkflow = await store.retiredRunWorkflow(runMatch)
           if (retiredWorkflow !== null) {
             const state = await store.getState(runMatch)
-            if (retiredWorkflow.disposition === 'terminal'
-              && retiredWorkflow.cleanupProofDigest !== null) {
-              await store.archiveCompletedRunAndReleaseLease(runMatch, retiredWorkflow.workflow)
-            }
             return json({ state, workflow: retiredWorkflow.workflow,
               retirement: { disposition: retiredWorkflow.disposition,
                 fenceProofDigest: retiredWorkflow.fenceProofDigest,
@@ -1945,56 +982,11 @@ export default {
             runtimeRelease, `/internal/runtime/audit-runs/${runMatch}`,
           )
           const body = await runtimeResponseBody(response)
-          if ((body.workflow as { status?: string } | undefined)?.status === 'complete'
-            && (body.state as RunState | undefined)?.status === 'completed') {
-            const persisted = await store.getState(runMatch)
-            if (persisted.status === 'completed'
-              && await store.hasCompletedCleanupProof(persisted)) {
-              await store.archiveCompletedRunAndReleaseLease(runMatch, body.workflow)
-            }
-          }
           return json({ ...body, runtimeRelease })
         }
         const state = await store.getState(runMatch)
         const workflow = await env.AUDIT_WORKFLOW.get(runMatch)
         return json({ state, workflow: await workflow.status() })
-      }
-      const stopMatch = url.pathname.match(/^\/v1\/runs\/([a-z0-9][a-z0-9._-]{0,99})\/stop$/)?.[1]
-      if (request.method === 'POST' && stopMatch !== undefined) {
-        if (engineRole(env) === 'front-door') {
-          const deadlineAt = authenticatedAt + 5_000
-          const operation = (async () => {
-            if (await store.retiredRunWorkflow(stopMatch) !== null
-              || await store.retiredUnmaterializedRoute(stopMatch) !== null) {
-              return json({ error: 'retired terminal run cannot be stopped' }, 409)
-            }
-            const router = new RuntimeRouter(env)
-            const runtimeRelease = pinnedRuntime(await store.runRuntime(stopMatch))
-            return router.fetch(runtimeRelease,
-              `/internal/runtime/audit-runs/${stopMatch}/stop-now`, { method: 'POST',
-                headers: { 'x-ack3-stop-deadline-at': String(deadlineAt) } })
-          })()
-          return await boundedFrontDoorStop(operation, ctx, stopMatch, deadlineAt)
-        }
-        await store.requestStop(stopMatch)
-        return json({ runId: stopMatch, stop: 'requested-at-next-sealed-wave-boundary' }, 202)
-      }
-      const immediateStopMatch = url.pathname.match(/^\/v1\/runs\/([a-z0-9][a-z0-9._-]{0,99})\/stop-now$/)?.[1]
-      if (request.method === 'POST' && immediateStopMatch !== undefined) {
-        if (engineRole(env) !== 'front-door') return json({ error: 'front-door route required' }, 409)
-        const deadlineAt = authenticatedAt + 5_000
-        const operation = (async () => {
-          if (await store.retiredRunWorkflow(immediateStopMatch) !== null
-            || await store.retiredUnmaterializedRoute(immediateStopMatch) !== null) {
-            return json({ error: 'retired run cannot be stopped again' }, 409)
-          }
-          const router = new RuntimeRouter(env)
-          const runtimeRelease = pinnedRuntime(await store.runRuntime(immediateStopMatch))
-          return router.fetch(runtimeRelease,
-            `/internal/runtime/audit-runs/${immediateStopMatch}/stop-now`, { method: 'POST',
-              headers: { 'x-ack3-stop-deadline-at': String(deadlineAt) } })
-        })()
-        return await boundedFrontDoorStop(operation, ctx, immediateStopMatch, deadlineAt)
       }
       return json({ error: 'not found' }, 404)
     } catch (error) {

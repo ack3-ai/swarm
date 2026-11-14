@@ -55,6 +55,24 @@ describe('immutable dashboard release reader', () => {
     expect(packages.get).toHaveBeenNthCalledWith(2, `releases/sha256/${current.run.releaseDigest}.json`)
   })
 
+  it('loads an imported artifact’s original manifest', async () => {
+    const earlier = await fixture(body => { body.definition.stages[0]!.waves[0]!.tasks[0]!.model = 'earlier-model' })
+    const current = await fixture()
+    const objects = new Map([
+      [`releases/sha256/${earlier.run.releaseDigest}.json`, earlier.object],
+      [`releases/sha256/${current.run.releaseDigest}.json`, current.object],
+    ])
+    const packages = { get: vi.fn(async (key: string) => objects.get(key) as unknown as R2ObjectBody | null) }
+    const run = { ...current.run, artifacts: [{ execution: {
+      releaseDigest: earlier.run.releaseDigest, definitionDigest: earlier.run.definitionDigest,
+    } }] }
+    const result = await readDashboardDefinition(packages, run as unknown as Parameters<typeof readDashboardDefinition>[1])
+    expect(result.stages[0]!.waves[0]!.tasks[0]!.model).toBe(current.body.definition.stages[0]!.waves[0]!.tasks[0]!.model)
+    expect(result.releases?.get(earlier.run.releaseDigest)?.stages[0]!.waves[0]!.tasks[0]!.model).toBe('earlier-model')
+    expect(result.configuration?.revisions).toHaveLength(2)
+    expect(packages.get).toHaveBeenCalledWith(`releases/sha256/${earlier.run.releaseDigest}.json`)
+  })
+
   it('exposes the selected release configuration, preserving historical limits and image', async () => {
     const test = await fixture(body => {
       body.environment = { image: 'registry.example/evm@sha256:' + 'a'.repeat(64) }
@@ -69,6 +87,12 @@ describe('immutable dashboard release reader', () => {
       limits: { maxWallTimeMs: 123456 }, environment: test.body.environment,
       target: test.body.definition.target, pools: test.body.definition.pools })
     expect(result.configuration).not.toHaveProperty('prompts')
+    expect(result.configuration?.scope).toBeNull()
+    const scoped = await fixture(body => {
+      body.definition.policy.scope = 'In scope: src/HelloVault.sol'
+      body.definition.prompts.scopeRules = 'Stay in scope.'
+    })
+    expect((await readDashboardDefinition(scoped.packages, scoped.run)).configuration?.scope).toBe('In scope: src/HelloVault.sol')
     const stages = result.configuration!.stages as any[]
     for (const [index, stage] of test.body.definition.stages.entries()) {
       expect(stages[index].waves).toHaveLength(stage.waves.length)

@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { describe, expect, it, vi } from 'vitest'
 import { readFile } from 'node:fs/promises'
 import {
@@ -10,6 +11,7 @@ import {
   parseDiskUsage,
   parseMemoryEvents,
 } from '../src/container-resource-diagnostics.js'
+import { AgentAttemptFailure, PermanentRunFailure } from '../src/run-errors.js'
 
 const emptySnapshot = {
   memoryCurrentBytes: null,
@@ -98,6 +100,55 @@ describe('container resource diagnostics', () => {
     expect(classifyContainerResourceFailure(new Error('maximum container instances reached'), emptySnapshot))
       .toBe('instance-capacity')
     expect(classifyContainerResourceFailure(new Error('provider returned malformed output'), emptySnapshot)).toBeNull()
+  })
+
+  it('blames memory only for an OOM after this attempt started, when the runner recorded the start', async () => {
+    const failed = new Error('sandbox process result read failed')
+    const oom = { ...emptySnapshot, memoryEvents: { oom: 1, oom_kill: 1 } }
+    expect(classifyContainerResourceFailure(failed, oom)).toBe('memory')
+    expect(classifyContainerResourceFailure(failed, { ...oom, memoryEventsAtLaunch: { oom: 1, oom_kill: 1 } })).toBeNull()
+    expect(classifyContainerResourceFailure(failed, { ...oom, memoryEventsAtLaunch: { oom: 1, oom_kill: 0 } })).toBe('memory')
+    expect(classifyContainerResourceFailure(new Error('out of memory'), { ...oom, memoryEventsAtLaunch: { oom: 1, oom_kill: 1 } }))
+      .toBe('memory')
+
+    const digest = 'b'.repeat(64)
+    const outputs = new Map([['cat /sys/fs/cgroup/memory.events', 'oom 1\noom_kill 1\n'],
+      [`cat /workspace/private/memory-events-${digest}`, 'oom 1\noom_kill 1\n']])
+    const sandbox = { exec: async (command: string) => ({ success: outputs.has(command), stdout: outputs.get(command) ?? '' }) }
+    expect((await captureContainerResourceSnapshot(sandbox, `/workspace/private/memory-events-${digest}`)).memoryEventsAtLaunch)
+      .toEqual({ oom: 1, oom_kill: 1 })
+    expect(await captureContainerResourceSnapshot(sandbox, '/workspace/private/elsewhere')).not.toHaveProperty('memoryEventsAtLaunch')
+    expect(await captureContainerResourceSnapshot(sandbox)).not.toHaveProperty('memoryEventsAtLaunch')
+    const runner = readFileSync(new URL('../container/agent-runner.mjs', import.meta.url), 'utf8')
+    expect(runner).toContain("writeFile(`/workspace/private/memory-events-${request.requestDigest}`, events, { mode: 0o600 })")
+  })
+
+  it('never blames memory for a failure that comes with a parsed runner receipt: the runner survived (E8)', () => {
+    const oom = { ...emptySnapshot, memoryEvents: { oom: 1, oom_kill: 2 }, memoryEventsAtLaunch: { oom: 0, oom_kill: 0 } }
+    const usage = { modelCalls: 1, inputTokens: 10, outputTokens: 2, costUsd: 0 }
+    // A command was killed for memory earlier in the attempt; the agent then exited 1 for another reason.
+    const receiptFailure = new AgentAttemptFailure('sandbox agent failed (1): API Error: 529 overloaded', { usage })
+    expect(classifyContainerResourceFailure(receiptFailure, oom)).toBeNull()
+    // The receipt's stderr tail may quote a killed command's own message.
+    expect(classifyContainerResourceFailure(
+      new AgentAttemptFailure('sandbox agent failed (1): forge: out of memory', { usage }), oom)).toBeNull()
+    // Errors raised after the receipt was parsed carry it as their cause.
+    const quota = new PermanentRunFailure('subscription quota exhausted; execution receipt preserved', 'provider-rejected',
+      { cause: new AgentAttemptFailure('subscription quota exhausted', { usage }) })
+    expect(classifyContainerResourceFailure(quota, oom)).toBeNull()
+    const custody = new PermanentRunFailure('native transport failed without resumable session custody',
+      'session-recovery-unavailable', { cause: receiptFailure })
+    expect(classifyContainerResourceFailure(custody, oom)).toBeNull()
+    // A lost process or container has no receipt: the memory label stays.
+    const lost = new AgentAttemptFailure(
+      'the admitted execution lost its Sandbox process and durable receipt; a replacement attempt is required',
+      { includeDiagnosticsInRepair: false })
+    expect(classifyContainerResourceFailure(lost, oom)).toBe('memory')
+    expect(classifyContainerResourceFailure(new AgentAttemptFailure('sandbox process result read failed'), oom)).toBe('memory')
+    expect(classifyContainerResourceFailure(new Error('Cloudflare Sandbox transport failed'), oom)).toBe('memory')
+    // Disk and capacity rules are unchanged.
+    expect(classifyContainerResourceFailure(
+      new AgentAttemptFailure('sandbox agent failed (1): write failed: ENOSPC', { usage }), emptySnapshot)).toBe('disk')
   })
 })
 

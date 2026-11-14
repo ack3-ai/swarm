@@ -1,20 +1,26 @@
 import { AUDIT_STAGES } from '../contracts.js'
 import { DEFAULT_FORCE_SEARCH_STAGES } from '../native-research.js'
-import { promptFileInstructions, validateStagePrompts, validateStages } from './system-prompts.js'
+import {
+  AUDIT_SCOPE_MAX_BYTES, DEFAULT_INSTRUCTIONS, DEFAULT_POC_CAPTURE, DEFAULT_POC_REVIEW, DEFAULT_RESEARCH_DELTA, DEFAULT_SCOPE_REMINDER,
+  DEFAULT_SCOPE_RULES, DEFAULT_SUBMIT_CHECK, DEFAULT_VERIFICATION_WITH_POCS, SCRATCH_CAPTURE,
+  promptFileInstructions, validateStagePrompts, validateStages,
+} from './system-prompts.js'
 import type {
   AuditStageKind, StagePrompts, ExperimentDefinition, ModelBackend, ModelConnection, ModelPool,
   ProviderClass, ReasoningEffort, ReleasePackageBody, ResearchAssignment, StageDefinition,
   SubagentPolicy, SubagentStage, TaskDefinition, WaveDefinition,
 } from '../contracts.js'
 import { deepClone } from '../canonical.js'
-import { validCodexAccessProgram } from '../../container/reasoning-config.mjs'
+import { validClaudeAccounts, validCodexAccessProgram } from '../../container/reasoning-config.mjs'
 import { researchPoolNamespace, scheduleResearchPoolLanes } from '../research-scheduler.js'
-import { validateReleasePackage } from '../validation.js'
+import { CLAUDE_FALLBACK_RULE, validateReleasePackage } from '../validation.js'
 import { requiresSubmission, SUBMISSION_PATH } from '../submission.js'
+import { RECON_FILES, RECON_SCHEMA, RECON_SEARCH_REQUIRED, sealReconInstructions } from '../recon.js'
 
 interface ScheduledResearchRole { role: string; buildsOn: 'none' | `previous-wave/research-${number}` }
 interface ResolvedProfile {
-  credentialSource?: string; providerClass: ProviderClass; backend?: ModelBackend; provider?: string; connection?: ModelConnection
+  credentialSource?: string; fallbackCredentialSources?: readonly string[]
+  providerClass: ProviderClass; backend?: ModelBackend; provider?: string; connection?: ModelConnection
   pool?: string; model: string; cyberAccessProgram?: ModelPool['cyberAccessProgram']; reasoning: ReasoningEffort; thinking?: ModelPool['thinking']; subagents?: SubagentPolicy
   optional: boolean; workspaceMode: TaskDefinition['workspaceMode']
 }
@@ -23,13 +29,15 @@ interface ResearchWavesTemplate {
   count: number; logicalRole: string; outputSchema: string
   outputPattern: 'waves/wave-{wave}/research-{researcher}.md'; scratchPattern: '/workspace/source/test/swarm/lane-{researcher}'
   minSuccessfulTasks: number; minDistinctActors: number
+  /** Present only with keepPocs. */
+  scratchCapture?: typeof SCRATCH_CAPTURE
   schedule: { first: readonly ScheduledResearchRole[]; cycle: readonly (readonly ScheduledResearchRole[])[] }
 }
 interface TemplatedDiscoveryStage { id: string; kind: 'discovery'; objective: string; wavesTemplate: ResearchWavesTemplate }
 type ManifestModelPool = ModelPool & { reasoningEffort: ReasoningEffort; subagents: NonNullable<ModelPool['subagents']> }
 interface AuditManifestV2 {
   configVersion: 2; kind: 'ack3-audit'; method: 'security-audit-v1'; id: string; objective: string
-  stages: readonly AuditStageKind[]; promptFile: string
+  stages: readonly AuditStageKind[]; promptFile: string; scopeFile?: string; keepPocs?: boolean; submitCheck?: boolean
   stageModelPools: Partial<Record<Exclude<AuditStageKind, 'discovery'>, string | readonly string[]>>
   modelPools: readonly ManifestModelPool[]; maxDiscoveryWaves: number; stopOnSaturation?: boolean
   researchPlan?: { first: readonly Partial<ScheduledResearchRole>[]; cycle: readonly (readonly Partial<ScheduledResearchRole>[])[] }
@@ -38,7 +46,7 @@ interface AuditManifestV2 {
   target: Pick<ExperimentDefinition['target'], 'repository' | 'commit' | 'tree'> & {
     environment?: 'disposable-non-production'; runtime?: ExperimentDefinition['target']['runtime']
   }
-  environment?: ExperimentDefinition['target']['runtime'] & { image: string }
+  environment?: Omit<ExperimentDefinition['target']['runtime'], 'buildRequired'> & { image: string; buildRequired?: boolean }
   limits: Omit<ExperimentDefinition['limits'], 'maxWallTimeMs' | 'phaseMinutes'> & { maxDiscoveryRuntimeMs: number }
 }
 
@@ -63,6 +71,7 @@ const roles = [
   }
 ] as const
 const outputs = {
+  "recon": { "requiredFiles": RECON_FILES, "schema": RECON_SCHEMA },
   "preflight": {
     "requiredFiles": [
       "preflight.json"
@@ -146,7 +155,8 @@ function researchPath(pattern: string, wave: number, researcher: number): string
   return pattern.replaceAll('{wave}', String(wave)).replaceAll('{researcher}', String(researcher))
 }
 
-function assignment(input: ScheduledResearchRole, wave: number, researcher: number): ResearchAssignment {
+function assignment(input: ScheduledResearchRole, wave: number, researcher: number,
+  scratchCapture?: typeof SCRATCH_CAPTURE): ResearchAssignment {
   const previous = input.buildsOn.match(/^previous-wave\/research-([1-9]\d*)$/)?.[1]
   if (input.buildsOn !== 'none' && previous === undefined) throw new TypeError(`invalid buildsOn schedule for wave ${wave}`)
   if (wave === 0 && input.buildsOn !== 'none') throw new TypeError('wave zero cannot build on a previous wave')
@@ -156,6 +166,7 @@ function assignment(input: ScheduledResearchRole, wave: number, researcher: numb
     role: input.role,
     buildsOn: previous === undefined ? 'none' : `wave-${wave - 1}/research-${previous}`,
     laneScratchPath: `/workspace/source/test/swarm/lane-${researcher}`,
+    ...(scratchCapture === undefined ? {} : { scratchCapture: { ...scratchCapture } }),
   }
 }
 
@@ -206,7 +217,8 @@ function retryPolicyFor(providerClass: ProviderClass, promptKind: TaskDefinition
   }
   if (providerClass === 'additive') return 'fresh-repair'
   if (providerClass === 'core' && (
-    promptKind === 'synthesis'
+    promptKind === 'recon'
+    || promptKind === 'synthesis'
     || promptKind === 'coverage-challenge'
     || promptKind === 'negative-review'
     || promptKind === 'verification'
@@ -224,6 +236,7 @@ function researchTask(input: {
   template: ResearchWavesTemplate
   schedule: ScheduledResearchRole
   objective: string
+  reconNotes: boolean
 }): TaskDefinition {
   const { wave, researcher, pool, template } = input
   const { profile } = pool
@@ -237,6 +250,7 @@ function researchTask(input: {
     objective: input.objective,
     providerClass: profile.providerClass,
     ...(profile.credentialSource === undefined ? {} : { credentialSource: profile.credentialSource }),
+    ...(profile.fallbackCredentialSources === undefined ? {} : { fallbackCredentialSources: profile.fallbackCredentialSources }),
     ...(profile.backend === undefined ? {} : { backend: profile.backend }),
     ...(profile.provider === undefined ? {} : { provider: profile.provider }),
     ...(profile.connection === undefined ? {} : { connection: profile.connection }),
@@ -247,7 +261,8 @@ function researchTask(input: {
     ...(profile.thinking === undefined ? {} : { thinking: profile.thinking }),
     ...(profile.subagents === undefined ? {} : { subagents: profile.subagents }),
     promptKind: 'research',
-    visibility: wave === 0 ? 'none' : 'accepted-frontier',
+    // Wave zero sees only the recon notes, when the release has them.
+    visibility: wave === 0 && !input.reconNotes ? 'none' : 'accepted-frontier',
     workspaceMode: 'continuation',
     workspaceKey: `${pool.workspaceKeyPrefix}-${researcher}`,
     output: {
@@ -255,7 +270,7 @@ function researchTask(input: {
       requiredFiles: [researchPath(template.outputPattern, wave, researcher), SUBMISSION_PATH],
       requiredSections: [],
     },
-    research: assignment(input.schedule, wave, researcher),
+    research: assignment(input.schedule, wave, researcher, template.scratchCapture),
     optional: profile.optional,
     retryPolicy: retryPolicyFor(profile.providerClass, 'research'),
   }
@@ -265,6 +280,7 @@ function compileResearchStage(
   stage: TemplatedDiscoveryStage,
   objective: string,
   researchPools: readonly ResolvedResearchPool[],
+  reconNotes = false,
 ): StageDefinition {
   const template = stage.wavesTemplate
   positiveInteger(template.count, 'discovery wave count')
@@ -297,6 +313,7 @@ function compileResearchStage(
           template,
           schedule: schedule[researcher - 1]!,
           objective,
+          reconNotes,
         }))
       }
     }
@@ -345,6 +362,15 @@ function manifestResearchPools(manifest: AuditManifestV2): readonly ManifestMode
     }
     if (pool.backend === 'claude' && !/^CLAUDE_[A-Z0-9_]*OAUTH_TOKEN$/.test(pool.credentialSource ?? '')) {
       throw new TypeError(`model pool ${pool.id} requires a Claude OAuth token binding`)
+    }
+    if (pool.fallbackCredentialSources !== undefined) {
+      if (pool.backend !== 'claude') {
+        throw new TypeError(`model pool ${pool.id}: fallbackCredentialSources is only supported on Claude pools`)
+      }
+      if (!Array.isArray(pool.fallbackCredentialSources)
+        || !validClaudeAccounts([pool.credentialSource, ...pool.fallbackCredentialSources])) {
+        throw new TypeError(`model pool ${pool.id} has invalid fallbackCredentialSources: ${CLAUDE_FALLBACK_RULE}`)
+      }
     }
     if (!validCodexAccessProgram(pool.backend, pool.cyberAccessProgram)) {
       throw new TypeError(`model pool ${pool.id} has invalid cyberAccessProgram`)
@@ -411,6 +437,7 @@ function resolvedResearchPools(pools: readonly ManifestModelPool[]): readonly Re
         backend: pool.backend,
         ...(pool.backend === 'claude' || /^[A-Z][A-Z0-9_]{0,119}_AUTH_JSON$/.test(pool.credentialSource ?? '')
           ? { credentialSource: pool.credentialSource } : {}),
+        ...(pool.fallbackCredentialSources === undefined ? {} : { fallbackCredentialSources: pool.fallbackCredentialSources }),
         ...(pool.provider === undefined ? {} : { provider: pool.provider }),
         ...(pool.connection === undefined ? {} : { connection: pool.connection }),
         pool: pool.id,
@@ -430,17 +457,47 @@ function resolvedResearchPools(pools: readonly ManifestModelPool[]): readonly Re
 function routes(manifest: AuditManifestV2, stage: AuditStageKind): readonly string[] {
   if (stage === 'discovery') return manifest.modelPools.filter(pool => pool.agents > 0).map(pool => pool.id)
   const route = manifest.stageModelPools[stage]
+  // Recon defaults to the first required discovery pool.
+  if (stage === 'recon' && route === undefined && manifest.stages.includes('recon')) {
+    return manifest.modelPools.filter(pool => pool.required && pool.agents > 0).slice(0, 1).map(pool => pool.id)
+  }
   return typeof route === 'string' ? [route] : route ?? []
 }
 
-export function compileSecurityAuditV1(value: unknown, promptContents: unknown): ReleasePackageBody {
+/** The scope file's text, sealed only when the manifest names one. */
+function auditScope(manifest: AuditManifestV2, scopeContents: unknown): string | undefined {
+  if (manifest.scopeFile === undefined) {
+    if (scopeContents !== undefined) throw new TypeError('scope text requires scopeFile')
+    return undefined
+  }
+  if (typeof manifest.scopeFile !== 'string' || manifest.scopeFile.trim() === '') throw new TypeError('scopeFile must name a file')
+  if (typeof scopeContents !== 'string') throw new TypeError('scopeFile contents are required')
+  const scope = scopeContents.replace(/\r\n/g, '\n').trim()
+  if (scope === '') throw new TypeError('scopeFile must not be empty')
+  if (new TextEncoder().encode(scope).byteLength > AUDIT_SCOPE_MAX_BYTES) {
+    throw new TypeError(`scopeFile must be at most ${AUDIT_SCOPE_MAX_BYTES} bytes`)
+  }
+  return scope
+}
+
+export function compileSecurityAuditV1(value: unknown, promptContents: unknown, scopeContents?: unknown): ReleasePackageBody {
   object(value, 'audit manifest')
   const manifest = value as unknown as AuditManifestV2
   validateStages(manifest.stages)
   const stagePrompts: StagePrompts = validateStagePrompts(promptContents, manifest.stages)
-  const instructions = promptFileInstructions(promptContents)
+  const scope = auditScope(manifest, scopeContents)
+  const { scopeRules, scopeReminder, pocCapture, pocReview, submitCheck: submitCheckText, researchDelta, ...instructions } = promptFileInstructions(promptContents)
   if (typeof manifest.promptFile !== 'string' || manifest.promptFile.trim() === '') throw new TypeError('promptFile is required')
   if (manifest.stopOnSaturation !== undefined && typeof manifest.stopOnSaturation !== 'boolean') throw new TypeError('stopOnSaturation must be a boolean')
+  if (manifest.keepPocs !== undefined && typeof manifest.keepPocs !== 'boolean') throw new TypeError('keepPocs must be a boolean')
+  // Only true changes the release, so a manifest without it (or with false) keeps its digest.
+  const keepPocs = manifest.keepPocs === true
+  if (keepPocs && !(manifest.stages.includes('discovery') && manifest.stages.includes('verification'))) {
+    throw new TypeError('keepPocs requires the discovery and verification stages')
+  }
+  if (manifest.submitCheck !== undefined && typeof manifest.submitCheck !== 'boolean') throw new TypeError('submitCheck must be a boolean')
+  // On by default; "submitCheck": false leaves the release without it.
+  const submitCheck = manifest.submitCheck !== false
   positiveInteger(manifest.maxDiscoveryWaves, 'maxDiscoveryWaves')
   if (manifest.maxDiscoveryWaves > 64) throw new TypeError('maxDiscoveryWaves must be between 1 and 64')
   if (typeof manifest.objective !== 'string' || manifest.objective.trim() === '') throw new TypeError('objective must not be empty')
@@ -448,6 +505,13 @@ export function compileSecurityAuditV1(value: unknown, promptContents: unknown):
     throw new TypeError('target.environment must be disposable-non-production')
   }
   positiveInteger(manifest.limits.maxDiscoveryRuntimeMs, 'limits.maxDiscoveryRuntimeMs')
+  if (manifest.environment?.buildRequired !== undefined && typeof manifest.environment.buildRequired !== 'boolean') {
+    throw new TypeError('environment.buildRequired must be a boolean')
+  }
+  const commandTimeout = manifest.environment?.commandTimeoutMinutes
+  if (commandTimeout !== undefined && !(Number.isSafeInteger(commandTimeout) && commandTimeout >= 1 && commandTimeout <= 720)) {
+    throw new TypeError('environment.commandTimeoutMinutes must be a whole number of minutes between 1 and 720')
+  }
   const pools = manifestResearchPools(manifest)
   for (const stage of manifest.stages.filter(stage => stage !== 'discovery')) {
     const selected = routes(manifest, stage)
@@ -462,6 +526,7 @@ export function compileSecurityAuditV1(value: unknown, promptContents: unknown):
   const searchConnection = manifest.nativeSearch === false ? undefined : manifest.nativeSearch?.searchConnection
     ?? { provider: 'exa' as const, apiKeyEnv: 'EXA_API_KEY' }
   if (searchConnection !== undefined && searchConnection.provider !== 'exa') throw new TypeError('use the official native Exa search connection')
+  if (manifest.stages.includes('recon') && searchConnection === undefined) throw new TypeError(RECON_SEARCH_REQUIRED)
   if (manifest.forceSearchStages !== undefined && !Array.isArray(manifest.forceSearchStages)) throw new TypeError('forceSearchStages must be an array')
   const forceSearchStages = manifest.forceSearchStages ?? DEFAULT_FORCE_SEARCH_STAGES.filter(stage => manifest.stages.includes(stage as AuditStageKind))
   if (forceSearchStages.some(stage => !manifest.stages.includes(stage as AuditStageKind))) throw new TypeError('forceSearchStages must select enabled stages')
@@ -477,10 +542,11 @@ export function compileSecurityAuditV1(value: unknown, promptContents: unknown):
         ...(pool.cyberAccessProgram === undefined ? {} : { cyberAccessProgram: pool.cyberAccessProgram }),
         ...(pool.backend === 'claude' || /^[A-Z][A-Z0-9_]{0,119}_AUTH_JSON$/.test(pool.credentialSource ?? '')
           ? { credentialSource: pool.credentialSource } : {}), subagents: subagentPolicy(pool, stage!),
+        ...(pool.fallbackCredentialSources === undefined ? {} : { fallbackCredentialSources: pool.fallbackCredentialSources }),
         ...(pool.provider === undefined ? {} : { provider: pool.provider }),
         ...(pool.connection === undefined ? {} : { connection: pool.connection }),
         ...(pool.thinking === undefined ? {} : { thinking: pool.thinking }) }),
-      promptKind: kind, visibility: ['preflight', 'coverage-challenge'].includes(kind) ? 'none' : 'all-accepted',
+      promptKind: kind, visibility: ['preflight', 'recon', 'coverage-challenge'].includes(kind) ? 'none' : 'all-accepted',
       workspaceMode: pool === undefined ? 'control' : 'fresh-pristine', workspaceKey: id,
       output: { ...deepClone(outputs[kind]), requiredFiles: [...outputs[kind].requiredFiles,
         ...(requiresSubmission({ providerClass, promptKind: kind }) ? [SUBMISSION_PATH] : [])], requiredSections: [] },
@@ -498,12 +564,14 @@ export function compileSecurityAuditV1(value: unknown, promptContents: unknown):
         count: manifest.maxDiscoveryWaves, logicalRole: 'security-researcher', outputSchema: 'ack3.research-delta.policy-v3',
         outputPattern: 'waves/wave-{wave}/research-{researcher}.md', scratchPattern: '/workspace/source/test/swarm/lane-{researcher}',
         minSuccessfulTasks: requiredSeats, minDistinctActors: requiredSeats, schedule: researchSchedule(manifest.researchPlan, laneCount),
-      } }, manifest.objective, resolvedResearchPools(pools)))
+        ...(keepPocs ? { scratchCapture: SCRATCH_CAPTURE } : {}),
+      } }, manifest.objective, resolvedResearchPools(pools), manifest.stages.includes('recon')))
       continue
     }
     const poolId = routes(manifest, stage)[0]!
     let waves: WaveDefinition[]
-    if (stage === 'synthesis') waves = [wave('synthesis', [task('synthesizer', 'synthesis', stage, poolId)])]
+    if (stage === 'recon') waves = [wave('web-research', [task('recon', 'recon', stage, poolId)])]
+    else if (stage === 'synthesis') waves = [wave('synthesis', [task('synthesizer', 'synthesis', stage, poolId)])]
     else if (stage === 'coverage') {
       const challenge = task('challenge-open-adversarial', 'coverage-challenge', stage, poolId)
       challenge.perspective = 'open-adversarial'
@@ -527,6 +595,11 @@ export function compileSecurityAuditV1(value: unknown, promptContents: unknown):
     }
     stages.push({ id: stage, kind: stage, objective: stagePrompts[stage]!, waves })
   }
+  if (submitCheck) {
+    for (const task of stages.flatMap(stage => stage.waves.flatMap(wave => wave.tasks))) {
+      if (task.providerClass !== 'deterministic') task.submitCheck = true
+    }
+  }
   const body: ReleasePackageBody = {
     schemaVersion: 2,
     definition: {
@@ -536,16 +609,27 @@ export function compileSecurityAuditV1(value: unknown, promptContents: unknown):
         runtime: deepClone(manifest.environment === undefined ? manifest.target.runtime! : {
           environmentBindings: manifest.environment.environmentBindings, preflightCommands: manifest.environment.preflightCommands,
           ...(manifest.environment.workspacePreparation === undefined ? {} : { workspacePreparation: manifest.environment.workspacePreparation }),
+          // Sealed only when relaxed, so releases with the default keep their digest.
+          ...(manifest.environment.buildRequired === false ? { buildRequired: false as const } : {}),
+          ...(manifest.environment.commandTimeoutMinutes === undefined ? {}
+            : { commandTimeoutMinutes: manifest.environment.commandTimeoutMinutes }),
         }) },
       limits: { maxWallTimeMs: manifest.limits.maxDiscoveryRuntimeMs, maxModelCalls: manifest.limits.maxModelCalls,
         ...(manifest.limits.maxInputTokens === undefined ? {} : { maxInputTokens: manifest.limits.maxInputTokens }),
         ...(manifest.limits.maxOutputTokens === undefined ? {} : { maxOutputTokens: manifest.limits.maxOutputTokens }), maxCostUsd: manifest.limits.maxCostUsd,
         phaseMinutes: { discovery: manifest.limits.maxDiscoveryRuntimeMs / 60000 } },
-      policy: { outcome: manifest.objective, completionRules: ['Complete the configured stages and preserve their evidence.'],
+      policy: { outcome: manifest.objective, ...(scope === undefined ? {} : { scope }), completionRules: ['Complete the configured stages and preserve their evidence.'],
         doneWhen: ['Every required configured task and deterministic evidence check succeeds.'],
         notDoneWhen: ['A required task or evidence record is missing.'],
         evidenceRules: ['Preserve observations, original claim conditions, provenance and dissent.'] },
-      roles: deepClone(roles), pools: deepClone(pools), prompts: instructions, stagePrompts,
+      roles: deepClone(roles), pools: deepClone(pools),
+      prompts: sealReconInstructions({ ...instructions, researchDelta: researchDelta ?? DEFAULT_RESEARCH_DELTA,
+        ...(scope === undefined ? {} : { scopeRules: scopeRules ?? DEFAULT_SCOPE_RULES, scopeReminder: scopeReminder ?? DEFAULT_SCOPE_REMINDER }),
+        ...(keepPocs ? { pocCapture: pocCapture ?? DEFAULT_POC_CAPTURE, pocReview: pocReview ?? DEFAULT_POC_REVIEW,
+          // The default says earlier tests are absent; with keepPocs the PoC review text says where they are.
+          ...(instructions.verificationInstructions === DEFAULT_INSTRUCTIONS.verificationInstructions
+            ? { verificationInstructions: DEFAULT_VERIFICATION_WITH_POCS } : {}) } : {}),
+        ...(submitCheck ? { submitCheck: submitCheckText ?? DEFAULT_SUBMIT_CHECK } : {}) }, manifest.stages.includes('recon')), stagePrompts,
       ...(searchConnection === undefined ? {} : { nativeSearch: { enabled: true, searchConnection } }),
       ...(manifest.forceSearch === false ? {} : { forceSearchStages: deepClone(forceSearchStages), forceSearch: { enabled: true, promptSet: 'native-exa-v1', ...(searchConnection === undefined ? {} : { searchConnection }) } }),
       discoverySafetyCeiling: manifest.maxDiscoveryWaves, stopOnSaturation: manifest.stopOnSaturation ?? true, stages,

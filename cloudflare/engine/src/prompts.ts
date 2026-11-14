@@ -14,6 +14,11 @@ import { verificationAssignments } from './protocol-transforms.js'
 import { requiresSubmission, SUBMISSION_PATH } from './submission.js'
 import { OUTPUT_FILE_MAX_BYTES, SUBMISSION_MAX_BYTES } from './output-limits.js'
 import { researchEvidencePaths, researchIndexPath, researchPredecessor } from './accepted-mounts.js'
+import { isDiscoveryFrontierArtifact, RECON_FILE_MAX_BYTES, RECON_SEARCH_QUESTION, RECON_SUBMISSION_SHAPE, reconDiscoveryNote, reconPrompt, reconSearchInstruction } from './recon.js'
+
+/** Shown to research tasks with submitCheck: what ack3-submit checks against the source. */
+export const RESEARCH_SUBMIT_CHECK_HINT = 'In your research document, write each observation\'s ID next to its description, '
+  + 'and in its evidence cite the source files you used, as path or path:LINE.'
 
 /** Fill {{NAME}} placeholders literally. */
 function fill(template: string, values: Readonly<Record<string, string>>): string {
@@ -29,6 +34,8 @@ function researchPrompt(definition: ExperimentDefinition, task: TaskDefinition, 
     : `\nPeer evidence: ${paths.documents.join(', ')}\nPeer observations: ${paths.observations}`
   const leadInstruction = task.output.schema === 'ack3.research-delta.policy-v3'
     ? `\n${definition.prompts.researchLeadChecks}` : ''
+  // Sealed only with keepPocs, so other releases render exactly as before.
+  const pocInstruction = definition.prompts.pocCapture === undefined ? '' : `\n\n${definition.prompts.pocCapture}`
   return `Task name: research-${assignment.researcher}
 Wave: ${assignment.wave}
 Role: security-researcher
@@ -39,7 +46,7 @@ Lane scratch path: ${assignment.laneScratchPath}
 
 Objective: ${definition.policy.outcome}
 Protocol: /control/researcher-protocol.md
-Target: /workspace/source${leadInstruction}`
+Target: /workspace/source${leadInstruction}${reconDiscoveryNote(definition)}${pocInstruction}`
 }
 
 function coveragePrompt(definition: ExperimentDefinition, task: TaskDefinition, deadline: string): string {
@@ -106,7 +113,7 @@ ${definition.prompts.verificationInstructions}
 
 Frozen verification assignments (reference and eligible observation IDs):
 ${JSON.stringify(verificationAssignments(visibleArtifacts))}
-${definition.prompts.verificationAssignments}`
+${definition.prompts.verificationAssignments}${definition.prompts.pocReview === undefined ? '' : `\n\n${definition.prompts.pocReview}`}`
 }
 
 function reportingPrompt(definition: ExperimentDefinition, task: TaskDefinition, artifacts: readonly ArtifactRecord[]): string {
@@ -123,10 +130,11 @@ ${definition.prompts.reportingInstructions}${assignments}`
 function submissionInstruction(definition: ExperimentDefinition, task: TaskDefinition, searchRequired = false): string {
   const text = definition.prompts
   if (!requiresSubmission(task)) return ''
-  const shape = task.promptKind === 'research'
+  const shape = task.promptKind === 'recon' ? RECON_SUBMISSION_SHAPE
+    : task.promptKind === 'research'
     ? task.output.schema === 'ack3.research-delta.policy-v3'
-      ? '{"complete":true,"materialHighCriticalDelta":false,"observations":[{"id":"A1","statement":"...","conditions":[],"consequence":"...","evidence":["..."]}],"leadChecks":[{"observationId":"A1","claimConditions":["..."],"examinedConditions":[],"remainingUntestedConditions":["..."],"evidenceMethod":"not-attempted","conclusion":"unresolved","evidence":"..."}]}'
-      : '{"complete":true,"materialHighCriticalDelta":false,"observations":[{"id":"A1","statement":"...","conditions":[],"consequence":"...","evidence":["..."]}]}'
+      ? '{"complete":true,"materialHighCriticalDelta":false,"observations":[{"id":"A1","statement":"...","conditions":[],"consequence":"...","evidence":["..."]}],"leadChecks":[{"observationId":"A1","claimConditions":["..."],"examinedConditions":[],"remainingUntestedConditions":["..."],"evidenceMethod":"not-attempted","conclusion":"unresolved","evidence":"..."}],"nextExperiment":"..."}'
+      : '{"complete":true,"materialHighCriticalDelta":false,"observations":[{"id":"A1","statement":"...","conditions":[],"consequence":"...","evidence":["..."]}],"nextExperiment":"..."}'
     : task.promptKind === 'synthesis'
       ? '{"complete":true,"dispositions":[{"id":"OBS-...","disposition":"candidate","reference":"C-1","rationale":"..."}],"retainedReferences":["C-1"]}'
       : task.promptKind === 'coverage-challenge'
@@ -159,12 +167,15 @@ function submissionInstruction(definition: ExperimentDefinition, task: TaskDefin
     : ''
   const leadReconciliationInstruction = task.promptKind === 'research' && leadChecksV3
     ? `\n${text.leadReconciliation}` : ''
+  // Sealed only in releases compiled after it was added, so older releases render exactly as before.
+  const researchDeltaInstruction = task.promptKind === 'research' && text.researchDelta !== undefined
+    ? `\n${text.researchDelta}` : ''
   return `
 
 ${fill(text.handoffIntro, { SUBMISSION_FILE: `/workspace/results/${SUBMISSION_PATH}` })}
-${searchShape}${queryInstruction}${referenceInstruction}${evidenceMethodInstruction}${reportSectionsInstruction}${leadReconciliationInstruction}${nextExperimentInstruction}
+${searchShape}${researchDeltaInstruction}${queryInstruction}${referenceInstruction}${evidenceMethodInstruction}${reportSectionsInstruction}${leadReconciliationInstruction}${nextExperimentInstruction}
 ${text.handoffClosing}
-Output limits (UTF-8 bytes): each file at most ${OUTPUT_FILE_MAX_BYTES}; ${SUBMISSION_PATH} at most ${SUBMISSION_MAX_BYTES}. Keep reasoning concise without dropping required observations, evidence, or dissent.${task.promptKind === 'synthesis' ? '\nCover every input observation exactly once. Allowed dispositions: candidate, refuted, unresolved. Every candidate or unresolved reference must appear in retainedReferences; refuted observations use reference none. Keep detailed evidence in the ledger and concise rationales in the structured submission.' : ''}`
+Output limits (UTF-8 bytes): each file at most ${task.promptKind === 'recon' ? RECON_FILE_MAX_BYTES : OUTPUT_FILE_MAX_BYTES}; ${SUBMISSION_PATH} at most ${SUBMISSION_MAX_BYTES}. Keep reasoning concise without dropping required observations, evidence, or dissent.${task.promptKind === 'synthesis' ? '\nCover every input observation exactly once. Allowed dispositions: candidate, refuted, unresolved. Every candidate or unresolved reference must appear in retainedReferences; refuted observations use reference none. Keep detailed evidence in the ledger and concise rationales in the structured submission.' : ''}`
 }
 
 function nativeSearchInstruction(definition: ExperimentDefinition, tool: string): string {
@@ -174,6 +185,12 @@ function nativeSearchInstruction(definition: ExperimentDefinition, tool: string)
 function needsSearchInvestigation(diagnostics: readonly string[]): boolean {
   return diagnostics.some(value => /\bresearchQueries\b|missing native search evidence|native search citation mismatch/.test(value))
 }
+
+/** The scope block that opens every scoped model prompt; the workspace also holds a copy. */
+export function auditScopeHeader(definition: ExperimentDefinition, rules = true): string {
+  return `Audit scope (also saved at ${auditScopePath}):\n${definition.policy.scope}\nEnd of audit scope.${rules ? `\n\n${definition.prompts.scopeRules}` : ''}`
+}
+export const auditScopePath = '/control/audit-scope.md'
 
 export function renderTaskPrompt(input: {
   definition: ExperimentDefinition
@@ -192,19 +209,25 @@ export function renderTaskPrompt(input: {
     : requirement === 'narrowing' ? text.searchTriggerNarrowing
       : text.searchTriggerDismissal
   const search = task.providerClass === 'deterministic' ? ''
+    : task.promptKind === 'recon' ? reconSearchInstruction(definition, nativeSearchTool)
     : requirement !== undefined || definition.nativeSearch?.enabled === true
       ? `\n\n${requirement === undefined ? fill(text.searchOptional, { TOOL: nativeSearchTool })
         : `${trigger}, ${nativeSearchInstruction(definition, nativeSearchTool)}`}
 ${text.searchObjective}
 ${text.searchPrivacy}` : ''
+  // Sealed only with submitCheck, so other releases render exactly as before.
+  // Research also learns up front what ack3-submit's source-aware checks expect.
+  const submitCheck = task.submitCheck === true && text.submitCheck !== undefined
+    ? `\n\n${text.submitCheck}${task.promptKind === 'research' ? `\n${RESEARCH_SUBMIT_CHECK_HINT}` : ''}` : ''
   if (input.formatRepairOnly === true) {
     const diagnostics = input.diagnostics ?? []
-    const correction = renderSameSessionOutputCorrection(definition, diagnostics, nativeSearchTool)
+    const correction = renderSameSessionOutputCorrection(definition, diagnostics, nativeSearchTool, task.promptKind)
     // The session already has the schema. Keep search repair focused on the security question.
-    return needsSearchInvestigation(diagnostics) ? correction : `${correction}${submissionInstruction(definition, task)}`
+    return `${needsSearchInvestigation(diagnostics) ? correction : `${correction}${submissionInstruction(definition, task)}`}${submitCheck}`
   }
   let prompt: string
   switch (task.promptKind) {
+    case 'recon': prompt = reconPrompt(definition); break
     case 'research': prompt = researchPrompt(definition, task, input.visibleArtifacts); break
     case 'coverage-challenge': prompt = coveragePrompt(definition, task, deadline); break
     case 'coverage-union': prompt = 'Deterministically union every accepted coverage observation with source provenance; preserve all rows and dissent.'; break
@@ -221,15 +244,24 @@ ${text.searchPrivacy}` : ''
     ? ''
     : `\n\n${text.repairDiagnostics}\n${input.diagnostics.map(value => `- ${value}`).join('\n')}`
   const stageInstructions = task.providerClass === 'deterministic' ? '' : `\n\nStage instructions:\n${definition.stagePrompts[(input.stageKind ?? definition.stages.find(stage => stage.waves.some(wave => wave.tasks.some(candidate => candidate.id === task.id)))?.kind) as import('./contracts.js').AuditStageKind]}`
-  return `${prompt}${stageInstructions}${search}${repair}${submissionInstruction(definition, task, requirement !== undefined)}`
+  // Releases without a scope render exactly as before; their prompt digests are recorded. With
+  // one, the scope comes first and a reminder last, where every model attends most.
+  const scoped = task.providerClass !== 'deterministic' && definition.policy.scope !== undefined
+  // Recon reads the scope as context; its bug-hunting rules do not apply to web research.
+  const scopeHeader = scoped ? `${auditScopeHeader(definition, task.promptKind !== 'recon')}\n\n` : ''
+  const scopeReminder = scoped && task.promptKind !== 'recon' ? `\n\n${text.scopeReminder}` : ''
+  return `${scopeHeader}${prompt}${stageInstructions}${search}${repair}${submissionInstruction(definition, task, requirement !== undefined)}${scopeReminder}${submitCheck}`
 }
 
 export function renderSameSessionOutputCorrection(
   definition: ExperimentDefinition, diagnostics: readonly string[], nativeSearchTool: string,
+  promptKind?: TaskDefinition['promptKind'],
 ): string {
   if (diagnostics.length === 0) throw new Error('output correction requires exact validator diagnostics')
   const text = definition.prompts
-  const question = nativeSearchInstruction(definition, nativeSearchTool)
+  // Recon searches for background, not for how a mechanism fails.
+  const question = promptKind === 'recon' ? fill(RECON_SEARCH_QUESTION, { TOOL: nativeSearchTool })
+    : nativeSearchInstruction(definition, nativeSearchTool)
   const searchRepair = diagnostics.some(value => value.includes('no successful native search queries recorded in this session'))
     ? fill(text.correctionSearchMissing, { SEARCH_QUESTION: question })
     : fill(text.correctionCitations, { SEARCH_QUESTION: question })
@@ -307,6 +339,6 @@ export function selectVisibleArtifacts(
     || (artifact.stageId === stage.id && artifact.waveId !== stage.waves[waveIndex]?.id)
   ))
   return task.promptKind === 'research'
-    ? acceptedFrontier.filter(artifact => artifact.protocol.research !== undefined)
+    ? acceptedFrontier.filter(isDiscoveryFrontierArtifact)
     : acceptedFrontier
 }

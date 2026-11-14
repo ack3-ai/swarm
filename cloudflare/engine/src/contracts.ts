@@ -1,4 +1,5 @@
 export const AUDIT_STAGES = [
+  'recon',
   'discovery',
   'synthesis',
   'coverage',
@@ -19,7 +20,7 @@ export type ReasoningEffort = 'none' | 'low' | 'medium' | 'high' | 'max'
 export type ThinkingMode = 'enabled' | 'disabled'
 export type SubagentPolicy = { mode: 'disabled' } | { mode: 'native'; maxConcurrent: number }
 export type SubagentStage = AuditStageKind
-export type RunPhase = 'preparation' | 'discovery' | 'synthesis' | 'coverage' | 'negative-review' | 'verification' | 'reporting' | 'complete' | 'stopped'
+export type RunPhase = 'preparation' | 'recon' | 'discovery' | 'synthesis' | 'coverage' | 'negative-review' | 'verification' | 'reporting' | 'complete' | 'stopped'
 export type RetryPolicy = 'none' | 'same-session-repair' | 'fresh-repair' | 'redirect-then-fresh-replacement'
 
 export type ArtifactVisibility = 'none' | 'previous-wave' | 'accepted-frontier' | 'all-accepted'
@@ -34,6 +35,10 @@ export interface TargetSnapshot {
   runtime: {
     environmentBindings: Readonly<Record<string, string>>
     preflightCommands: readonly string[]
+    /** Sealed only as `false`: a failed or empty baseline build is recorded and the audit continues. */
+    buildRequired?: false
+    /** Sealed only when set: agent commands, background jobs included, are stopped after this many minutes. */
+    commandTimeoutMinutes?: number
     /** Optional for releases sealed before per-workspace preparation existed. */
     workspacePreparation?: {
       schemaVersion: 1
@@ -58,6 +63,14 @@ export interface ResearchAssignment {
   /** Accepted research this lane receives as peer evidence, or none. */
   buildsOn: string
   laneScratchPath: string
+  /** Sealed only with keepPocs: the runner keeps this task's new text files from the lane scratch path. */
+  scratchCapture?: ScratchCaptureLimits
+}
+
+export interface ScratchCaptureLimits {
+  maxFileBytes: number
+  maxTaskBytes: number
+  maxFiles: number
 }
 
 export interface TaskDefinition {
@@ -75,6 +88,8 @@ export interface TaskDefinition {
   modelPool?: string
   /** Secrets Store binding selected for a native subscription account. */
   credentialSource?: string
+  /** Sealed only on Claude pools that set them: accounts used, in order, once credentialSource is used up. */
+  fallbackCredentialSources?: readonly string[]
   model: string
   /** Native Codex program selected by the originating pool. */
   cyberAccessProgram?: string
@@ -82,7 +97,7 @@ export interface TaskDefinition {
   thinking?: ThinkingMode
   /** Optional only so releases sealed before subagent controls remain replayable. */
   subagents?: SubagentPolicy
-  promptKind: 'preflight' | 'research' | 'synthesis' | 'coverage-challenge' | 'coverage-union' | 'negative-review' | 'review-union' | 'verification' | 'reporting' | 'final-seal'
+  promptKind: 'preflight' | 'recon' | 'research' | 'synthesis' | 'coverage-challenge' | 'coverage-union' | 'negative-review' | 'review-union' | 'verification' | 'reporting' | 'final-seal'
   visibility: ArtifactVisibility
   workspaceMode: 'control' | 'continuation' | 'fresh-pristine'
   workspaceKey: string
@@ -92,6 +107,8 @@ export interface TaskDefinition {
   observationPrefix?: string
   requiredTable?: string
   optional?: boolean
+  /** Sealed only with submitCheck, on every model task: the agent checks its handoff with `ack3-submit`. */
+  submitCheck?: true
   retryPolicy: RetryPolicy
 }
 
@@ -140,6 +157,8 @@ export interface PromptPolicy {
   /** Legacy sealed-release metadata; v2 operator manifests use authenticated control-plane access. */
   authorization?: string
   outcome: string
+  /** Audit scope text from the manifest's scope file, shown to every model task. */
+  scope?: string
   doneWhen: readonly string[]
   notDoneWhen: readonly string[]
   evidenceRules: readonly string[]
@@ -185,6 +204,21 @@ export interface PromptCatalog {
   correctionSearchUpdate: string
   correctionFormat: string
   correctionDiagnostics: string
+  /** Sealed only with an audit scope, so releases without one keep their exact catalog. */
+  scopeRules?: string
+  scopeReminder?: string
+  /** Sealed only with keepPocs: PoC test rules for research and verification. */
+  pocCapture?: string
+  pocReview?: string
+  /** Sealed only with submitCheck: tells every model task to run `ack3-submit` before it finishes. */
+  submitCheck?: string
+  /** What materialHighCriticalDelta means; absent in releases sealed before it existed, which render as before. */
+  researchDelta?: string
+  /** Sealed only with a recon stage (see recon.ts), so releases without one keep their exact catalog. */
+  reconInstructions?: string
+  reconSearch?: string
+  reconPrivacy?: string
+  reconNotes?: string
 }
 
 export interface AgentRoleDefinition {
@@ -215,6 +249,8 @@ export interface ModelPool {
   }
   /** Native subscription secret binding; historical Codex labels use the default account. */
   credentialSource?: string
+  /** Claude only: more subscription bindings, used in order when the previous account is used up. */
+  fallbackCredentialSources?: readonly string[]
   agents: number
   required: boolean
 }
@@ -310,6 +346,7 @@ export interface BudgetUsage {
 
 export interface ProviderUsage extends BudgetUsage {
   subscriptionWaits?: readonly import('../container/subscription-limits.mjs').SubscriptionWait[]
+  subscriptionSwitches?: readonly import('../container/subscription-limits.mjs').SubscriptionSwitch[]
   rawInputTokens?: number
   cachedInputTokens?: number
   cacheAccountingComplete?: boolean
@@ -318,8 +355,13 @@ export interface ProviderUsage extends BudgetUsage {
 }
 
 export interface AgentRequest {
+  /** Frozen dispatched configuration and read set; absent only on historical requests. */
+  execution?: ArtifactExecution
   experimentId: string
   runId: string
+  executionAuthority?: import('./execution-authority.js').ExecutionAuthority
+  /** Stable across automatic retries, new for an explicit task restart. */
+  taskExecutionId?: string
   stage: StageDefinition
   wave: WaveDefinition
   task: TaskDefinition
@@ -338,6 +380,8 @@ export interface AgentRequest {
   repairFiles: Readonly<Record<string, string>>
   /** Optional handoff file collected from the same native task without making it final output. */
   optionalOutputFiles?: readonly string[]
+  /** From the sealed runtime: the runner stops agent commands older than this. */
+  commandTimeoutMs?: number
   freshContext: boolean
   continuationMode: 'new' | 'resume'
   sessionId: string | null
@@ -347,18 +391,19 @@ export interface AgentRequest {
   nativeSearchConnection?: NativeSearchConnection
   /** Native Codex search availability for this model task. */
   enableNativeSearch?: boolean
-  /** Existing Sandbox allocation retained by an exact failed-wave recovery. */
-  workspaceAllocationRunId?: string
-  retainedSandboxObjectId?: string
 }
 
-export interface NativeTransportEvidence {
-  code: 'TRANSPORT' | 'TIMEOUT' | 'STREAM_CLOSED' | 'SERVER' | 'RATE_LIMIT' | 'EMPTY_RESPONSE'
+/** Private session observation. This proves custody, never permission to launch. */
+export interface NativeSessionCustodyReference {
   sourceRunId: string
   requestDigest: string
   sessionId: string
   snapshotDigest: string
   workState: 'none' | 'present' | 'unknown'
+}
+
+export interface NativeTransportEvidence extends NativeSessionCustodyReference {
+  code: 'TRANSPORT' | 'TIMEOUT' | 'STREAM_CLOSED' | 'SERVER' | 'RATE_LIMIT' | 'EMPTY_RESPONSE'
 }
 
 /** Closed credential rejection archived for custody, never an automatic retry grant. */
@@ -469,6 +514,8 @@ export interface FinalObservationCustody {
 }
 
 export interface ProtocolMetadata {
+  /** Background web research from the optional recon stage; never observations about the target. */
+  recon?: { researchQueries: readonly string[] }
   research?: {
     role: ResearchAssignment['role']
     buildsOn: string
@@ -493,6 +540,8 @@ export interface ProtocolMetadata {
 
 export interface AgentResult {
   subscriptionWaits?: readonly import('../container/subscription-limits.mjs').SubscriptionWait[]
+  /** Present exactly when the task has fallbackCredentialSources; empty when no account was used up. */
+  subscriptionSwitches?: readonly import('../container/subscription-limits.mjs').SubscriptionSwitch[]
   status: 'accepted' | 'additive-unavailable'
   actorId: string
   model: string
@@ -512,6 +561,10 @@ export interface AgentResult {
   sessionId?: string
   /** Trusted native-runner tool events, bound to the exact execution receipt. */
   nativeSearchEvidence?: import('./agent-execution-receipt.js').NativeSearchEvidence
+  /** The runner's final `ack3-submit` result; present exactly when the task has submitCheck. */
+  submitCheck?: import('./submission-check.js').SubmitCheckReport
+  /** Output files in which the runner replaced a credential value; each one asks for a correction. */
+  outputCredentials?: readonly import('./agent-execution-receipt.js').OutputCredential[]
 }
 
 export interface ArtifactRecord {
@@ -531,6 +584,26 @@ export interface ArtifactRecord {
   protocol: ProtocolMetadata
   usage: ProviderUsage
   unavailableReason?: AgentResult['unavailableReason']
+  /** Exact execution and input membership; absent only on historical records. */
+  execution?: ArtifactExecution
+}
+
+/** Evidence of execution, not another audit configuration. Releases retain the configuration. */
+export interface ArtifactExecution extends ExecutionConfiguration {
+  /** Frozen physical lane owner selected at admission; absent on historical allocations. */
+  mutationOwner?: import('./workspace-mutation-owner.js').WorkspaceMutationOwner
+  /** Native allocation key derived from this task contract, not the current manifest. */
+  workspaceKey?: string
+  runId: string
+  taskExecutionId?: string
+  releaseDigest: string
+  definitionDigest: string
+  taskDigest: string
+  attempt: number
+  runtimeRelease?: RuntimeRelease
+  /** Content-addressed read set in the artifact store, never copied into every checkpoint. */
+  inputCount: number
+  inputDigest: string
 }
 
 export interface RunCursor {
@@ -549,10 +622,15 @@ export interface JournalEvent {
   digest: string
 }
 
-export interface CheckpointBody {
-  schemaVersion: 2
+export interface RunStateWriteOptions { admission?: boolean; unlessBootstrapped?: boolean }
+
+/** Shared persisted execution identity and progress; current runs always have an owner. */
+interface ExecutionState {
   experimentId: string
   runId: string
+  executionAuthority: import('./execution-authority.js').ExecutionAuthority
+  controls?: import('./run-control-state.js').RunControlState
+  forkOrigin?: import('./stage-fork-origin.js').StageForkOrigin
   stateGeneration: number
   rootRunId: string
   rootCreatedAt: string
@@ -560,57 +638,74 @@ export interface CheckpointBody {
   phase: RunPhase
   recoveryEpoch: number
   parentCheckpointDigest: string | null
-  /** Present only after an exact failed partial-wave recovery. */
-  failedWaveRecovery?: FailedWaveRecoveryEvidence
-  /** Immutable proofs for paid executions promoted by this run or an ancestor. */
-  promotedExecutionProofs?: readonly PromotedExecutionEvidence[]
-  /** Present only after replaying an all-deterministic terminal wave under a corrected runtime. */
-  terminalCompletionRecovery?: TerminalCompletionRecoveryEvidence
-  /** Exact stopped-checkpoint handoff; inherited recovery evidence remains intact. */
-  runtimeTransition?: RuntimeTransitionEvidence
   releaseDigest: string
-  /** Absent only on checkpoints sealed before runtime release isolation. */
   runtimeRelease?: RuntimeRelease
   definitionDigest: string
   cursor: RunCursor
-  acceptedArtifacts: readonly ArtifactRecord[]
   rejectedAttempts: readonly RejectedAttempt[]
   stageEndReceipts: readonly StageEndReceipt[]
   waveReceipts: readonly WaveReceipt[]
-  /** Durable per-pool discovery progress for independently advancing cohorts. */
   discoveryScheduler?: DiscoverySchedulerState
   availabilityBoundaries: readonly AvailabilityBoundary[]
   budget: BudgetUsage
+}
+
+export interface CheckpointBody extends ExecutionState {
+  schemaVersion: 2
+  acceptedArtifacts: readonly ArtifactRecord[]
   journalHead: string
   sealedAt: string
 }
-
 export interface SealedCheckpoint {
   digest: string
   body: CheckpointBody
 }
 
 export interface StageEndReceipt {
+  configuration?: ExecutionConfiguration
   stageIndex: number
   from: RunPhase
   to: RunPhase
-  reason: 'preflight-passed' | 'stage-complete' | 'two-distinct-complete-saturation-cohorts' | 'phase-deadline' | 'insufficient-time-for-full-wave' | 'measured-budget-inability' | 'safety-ceiling-reached' | 'completion-contract-passed' | 'operator-discovery-pool-waiver'
+  reason: 'preflight-passed' | 'stage-complete' | 'two-distinct-complete-saturation-cohorts' | 'phase-deadline' | 'insufficient-time-for-full-wave' | 'measured-budget-inability' | 'safety-ceiling-reached' | 'completion-contract-passed'
   evidence: unknown
   evidenceDigest: string
   endedAt: string
 }
 
+/** A reference to the ordinary immutable release, never inline configuration. */
+export interface ExecutionConfiguration {
+  releaseDigest: string
+  definitionDigest: string
+}
+
+/** Selected execution of a logical task; configuration remains an immutable release reference. */
+export interface TaskOccurrence {
+  mutationOwner?: import('./workspace-mutation-owner.js').WorkspaceMutationOwner
+  taskId: string
+  taskExecutionId: string
+  origin: { authority: import('./execution-authority.js').ExecutionAuthority; ordinal: number }
+  configuration: ExecutionConfiguration
+  taskDigest: string
+}
+
 export interface WaveReceipt {
+  /** Absent only on uncontrolled legacy executions. */
+  taskOccurrences?: readonly TaskOccurrence[]
+  configuration?: ExecutionConfiguration
   stageId: string
   waveId: string
   /** Present for an independently sealed discovery cohort. */
   poolId?: string
-  /** Exact immutable accepted frontier supplied when this cohort was admitted. */
+  /** Exact immutable accepted frontier captured when this wave or cohort was admitted. */
   inputArtifacts?: readonly ArtifactReference[]
   inputDigest?: string
   peerPredecessors?: Readonly<Record<string, string>>
   materialEpoch?: number
   materialHighCriticalDelta?: boolean
+  /** Knowledge epoch after this completion, distinct from its admission epoch above. */
+  materialEpochAfter?: number
+  /** Digest of the prior material completion sharing this epoch, before any new admission. */
+  coalescedWith?: string
   /** Recorded usage at dispatch, independent of this pool's local wave number. */
   budgetAtAdmission?: BudgetUsage
   startedAt: string
@@ -626,14 +721,23 @@ export interface ArtifactReference {
   contentDigest: string
 }
 
-export interface WaveAdmission {
+/** Evidence selected before any current task can execute. */
+export interface AdmissionEvidence {
+  taskOccurrences: readonly TaskOccurrence[]
+  /** Immutable frontier for every attempt in this wave. */
+  inputArtifacts: readonly ArtifactReference[]
+  inputDigest: string
+  configuration: ExecutionConfiguration
+}
+
+export interface WaveAdmission extends AdmissionEvidence {
   stageId: string
   waveId: string
   cursor: RunCursor
   admittedAt: string
 }
 
-export interface DiscoveryCohortAdmission {
+export interface DiscoveryCohortAdmission extends AdmissionEvidence {
   stageId: string
   poolId: string
   waveId: string
@@ -641,8 +745,6 @@ export interface DiscoveryCohortAdmission {
   taskIds: readonly string[]
   admittedAt: string
   budgetAtAdmission: BudgetUsage
-  inputArtifacts: readonly ArtifactReference[]
-  inputDigest: string
   materialEpoch: number
   peerPredecessors: Readonly<Record<string, string>>
 }
@@ -663,6 +765,7 @@ export interface DiscoverySchedulerState {
 }
 
 export interface AvailabilityBoundary {
+  configuration?: ExecutionConfiguration
   provider: string
   effectiveFromWave: number
   reason: 'budget' | 'provider-credit'
@@ -673,8 +776,9 @@ export interface AvailabilityBoundary {
 }
 
 export interface RejectedAttempt {
+  /** Frozen dispatched configuration and read set; absent only on historical requests. */
+  execution?: ArtifactExecution
   /** Explicit operator waiver; must retain its matching stage exception receipt. */
-  operatorWaiver?: { sourceRunId: string, poolId: string, fenceProofDigest: string }
   /** Successful native research retained for correction in the same session. */
   nativeSearchEvidence?: import('./agent-execution-receipt.js').NativeSearchEvidence
   stageId: string
@@ -694,117 +798,18 @@ export interface RejectedAttempt {
   sessionId: string | null
   nativeTransport?: NativeTransportEvidence
   nativeTerminalCustody?: NativeTerminalCustodyEvidence
+  /** The provider or its transport failed: this attempt does not count against the limit and
+   * the next launch waits until `rejectedAt` + `delayMs` (P2-06). Absent on older records. */
+  providerBackoff?: import('./provider-backoff.js').ProviderBackoff
   usage: ProviderUsage
   rejectedAt: string
-  /**
-   * Run whose repair allowance produced this rejection. Absent on historical
-   * states; recovery children retain source usage under the source scope.
-   */
-  repairScopeRunId?: string
-}
-
-export interface FailedWaveRecoveryEvidence {
-  sourceRunId: string
-  sourceStateGeneration: number
-  sourceStateDigest: string
-  checkpointDigest: string
-  importedTaskIds: readonly string[]
-  inheritedRejectedAttemptCount: number
-  unknownUsageAttemptCount: number
-  /** Earlier recovery uncertainty included in unknownUsageAttemptCount. */
-  priorUnknownUsageAttemptCount?: number
-  sourceRuntimeRelease: RuntimeRelease
-  targetRuntimeRelease: RuntimeRelease
-  /** Exact durable execution reused without another provider call. */
-  promotedExecution?: PromotedExecutionEvidence
-  /** One failed native task continued in its original physical workspace. */
-  retainedNative?: RetainedNativeRecoveryEvidence
-  /** One terminally lost native execution, fenced before a fresh task attempt. */
-  unobservableNative?: UnobservableNativeRecoveryEvidence
-  /** Custody-verified rejected files seed a new repair session; never accepted by import. */
-  quarantinedRepair?: QuarantinedOutputRepairEvidence
-  /** Fenced sole-agent terminal wave with no output and an unchanged sealed frontier. */
-  sealedWaveRetry?: SealedWaveRetryEvidence
-}
-
-export interface SealedWaveRetryEvidence {
-  stageId: string
-  waveId: string
-  taskId: string
-  retirementProofDigest: string
-  /** Inherit an already verified image transition; never authorize another image change. */
-  imageAuthorization?: {
-    originalImageDigest: string
-    authorizedImageDigest: string
-    sourceRecoveryDigest: string
-  }
-}
-
-export interface QuarantinedOutputRepairEvidence {
-  /** Absent on historical synthesis repairs. */
-  kind?: 'negative-review'
-  stageId: string
-  waveId: string
-  taskId: string
-  sourceAttempt: number
-  requestDigest: string
-  promptDigest: string
-  outputDigest: string
-  quarantineUri: string
-  diagnostics: readonly string[]
-}
-
-export interface UnobservableNativeRecoveryEvidence {
-  stageId: string
-  waveId: string
-  taskId: string
-  attempt: number
-  promptDigest: string
-  requestDigest: string
-  fenceProofDigest: string
-}
-
-export interface RetainedNativeRecoveryEvidence {
-  stageId: string
-  waveId: string
-  taskId: string
-  workspaceKey: string
-  workspaceAllocationRunId: string
-  /** Original Cloudflare Sandbox Durable Object, verified before child admission. */
-  sandboxObjectId: string
-  nativeTransport: NativeTransportEvidence
-}
-
-export interface PromotedExecutionEvidence {
-  sourceRunId: string
-  stageId: string
-  waveId: string
-  taskId: string
-  sourceAttempt: number
-  requestDigest: string
-  promptDigest: string
-  outputDigest: string
-  /** Equal to outputDigest only for an explicitly quarantined, revalidated source response. */
-  quarantineOutputDigest?: string
-  inputDigest?: string
-  releaseDigest: string
-  usage: ProviderUsage
-}
-
-export interface TerminalCompletionRecoveryEvidence {
-  sourceRunId: string
-  sourceStateGeneration: number
-  sourceStateDigest: string
-  checkpointDigest: string
-  sourceRuntimeRelease: RuntimeRelease
-  targetRuntimeRelease: RuntimeRelease
-}
-
-export interface RuntimeTransitionEvidence extends TerminalCompletionRecoveryEvidence {
-  inheritedRecoveryDigest: string
 }
 
 export interface InFlightAgentAttempt {
+  /** Exact AgentRequest bytes authorized before native projection; not the native receipt digest. */
+  dispatchDigest?: string
+  /** Frozen dispatched configuration and read set; absent only on historical requests. */
+  execution?: ArtifactExecution
   stageId: string
   waveId: string
   taskId: string
@@ -818,53 +823,21 @@ export interface InFlightAgentAttempt {
   admittedAt: string
 }
 
-export interface RunState {
-  /** Set by the control-system startup integration, never inferred from a command. */
-  executionAuthority?: import('./execution-authority.js').ExecutionAuthority
-  controls?: import('./run-control-state.js').RunControlState
-  schemaVersion: 2
-  experimentId: string
-  runId: string
-  stateGeneration: number
-  rootRunId: string
-  rootCreatedAt: string
-  modelStartedAt: string | null
-  phase: RunPhase
-  recoveryEpoch: number
+export interface RunState extends ExecutionState {
+  schemaVersion: 3
   parentRunId: string | null
-  parentCheckpointDigest: string | null
-  /** Present only on a child reconstructed from an exact failed partial wave. */
-  failedWaveRecovery?: FailedWaveRecoveryEvidence
-  /** Immutable proofs for paid executions promoted by this run or an ancestor. */
-  promotedExecutionProofs?: readonly PromotedExecutionEvidence[]
-  /** Present only on a child replaying an all-deterministic terminal wave under a corrected runtime. */
-  terminalCompletionRecovery?: TerminalCompletionRecoveryEvidence
-  runtimeTransition?: RuntimeTransitionEvidence
-  releaseDigest: string
-  /** Absent only on runs created before runtime release isolation. */
-  runtimeRelease?: RuntimeRelease
-  definitionDigest: string
   status: RunStatus
-  cursor: RunCursor
   artifacts: readonly ArtifactRecord[]
-  rejectedAttempts: readonly RejectedAttempt[]
-  stageEndReceipts: readonly StageEndReceipt[]
-  waveReceipts: readonly WaveReceipt[]
-  /** Present while the discovery stage uses independently advancing pools. */
-  discoveryScheduler?: DiscoverySchedulerState
   /** Present only while an admitted wave has not reached its sealed barrier. */
   waveAdmission?: WaveAdmission | null
   /** Paid attempts admitted before dispatch and retained until their terminal evidence is recorded. */
   inFlightAgentAttempts?: readonly InFlightAgentAttempt[]
-  availabilityBoundaries: readonly AvailabilityBoundary[]
   checkpoints: readonly SealedCheckpoint[]
-  budget: BudgetUsage
   journal: readonly JournalEvent[]
   createdAt: string
   updatedAt: string
   terminalReason: string | null
 }
-
 export interface RunOutcome {
   state: RunState
   checkpoints: readonly SealedCheckpoint[]
@@ -872,12 +845,14 @@ export interface RunOutcome {
 
 export interface AgentProvider {
   run(request: AgentRequest): Promise<AgentResult>
-  disposeWorkspace?(input: { runId: string, workspaceKey: string, freshSuffix?: string }): Promise<
+  disposeWorkspace?(input: { runId: string, workspaceKey: string, freshSuffix?: string, mutationOwner?: import('./workspace-mutation-owner.js').WorkspaceMutationOwner }): Promise<
     import('./workspace-disposal.js').WorkspaceDisposalReceipt | void
   >
 }
 
 export interface ArtifactStore {
+  putExecutionInputs(inputs: readonly ArtifactReference[]): Promise<string>
+  readExecutionInputs(digest: string): Promise<readonly ArtifactReference[]>
   put(record: Omit<ArtifactRecord, 'uri'>, content: string): Promise<ArtifactRecord>
   putRejected(record: {
     id: string

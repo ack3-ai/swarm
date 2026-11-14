@@ -4,6 +4,10 @@ import { assertResearchLeadCustody, createNegativeReviewInput, negativeReviewRea
 import { configuredResearchTaskPoolId, researchTaskPoolId } from './research-scheduler.js'
 import { PermanentRunFailure } from './run-errors.js'
 import { SUBMISSION_PATH } from './submission.js'
+import {
+  acceptedScratchBundle, isScratchBundlePath, pocBundleDirectory, pocManifestTask, sameScratchLane, scratchRetained, scratchRetainedPath,
+} from './poc-handoff.js'
+import { isReconArtifact, RECON_FILES } from './recon.js'
 
 export type AcceptedMountMode =
   | 'none'
@@ -40,7 +44,7 @@ export function acceptedResearch(artifacts: readonly ArtifactRecord[]): readonly
 }
 
 export function researchEvidencePaths(artifact: ArtifactRecord): { documents: readonly string[], observations: string } {
-  const documents = artifact.files.filter(path => path !== SUBMISSION_PATH)
+  const documents = artifact.files.filter(path => path !== SUBMISSION_PATH && !isScratchBundlePath(path))
   if (documents.length === 0 || !artifact.files.includes(SUBMISSION_PATH)) {
     throw new PermanentRunFailure(`accepted research evidence is incomplete: ${artifact.taskId}`, 'integrity-failed')
   }
@@ -104,10 +108,19 @@ interface AcceptedArtifactReader {
   read(record: ArtifactRecord): Promise<Readonly<Record<string, string>>>
 }
 
+async function trustedExec(sandbox: AcceptedWorkspace, command: string, failure: string): Promise<void> {
+  const result = await sandbox.exec(command, { timeout: 60_000 }) as { success?: boolean, stderr?: string } | undefined
+  if (result?.success !== true) {
+    throw new PermanentRunFailure(`${failure}: ${String(result?.stderr ?? '').slice(-2_000)}`, 'integrity-failed')
+  }
+}
+
+/** `pocTests`: the release keeps discovery PoC tests (keepPocs), so the verifier receives them. */
 export async function writeAccepted(
   sandbox: AcceptedWorkspace,
   request: Pick<AgentRequest, 'task' | 'visibleArtifacts'>,
   store: AcceptedArtifactReader,
+  options: { pocTests?: boolean } = {},
 ): Promise<void> {
   await sandbox.exec('/usr/local/bin/ack3-reset-accepted', { timeout: 10_000 })
   const mode = acceptedMountMode(request.task)
@@ -129,7 +142,24 @@ export async function writeAccepted(
     }
     return
   }
+  // Recon notes keep fixed paths, /workspace/accepted/recon/<file>, so their links resolve.
+  for (const record of request.visibleArtifacts.filter(isReconArtifact)) {
+    const files = await store.read(record)
+    await sandbox.mkdir('/workspace/accepted/recon', { recursive: true })
+    for (const path of RECON_FILES) {
+      if (typeof files[path] !== 'string') throw new PermanentRunFailure(`accepted recon file is missing: ${path}`, 'integrity-failed')
+      await sandbox.writeFile(`/workspace/accepted/${path}`, files[path])
+    }
+  }
   const artifacts = mode === 'research-frontier' ? acceptedResearch(request.visibleArtifacts) : request.visibleArtifacts
+  // keepPocs: a research lane skips files its accepted bundles already keep; the
+  // verifier gets every bundle once, laid out by a trusted extractor.
+  const capture = request.task.research?.scratchCapture === undefined ? undefined : request.task.research
+  const pocTests = options.pocTests === true && request.task.promptKind === 'verification'
+  // Per path, the latest kept version: a file changed back to an older kept version is new again.
+  const retained = new Map<string, { wave: number, path: string, sha256: string }>()
+  const pocTasks: ReturnType<typeof pocManifestTask>[] = []
+  if (pocTests) await sandbox.mkdir(pocBundleDirectory, { recursive: true })
   // Keep only one hash-verified artifact's file bodies resident while mounting
   // the frontier. Verification and reporting can consume many large artifacts.
   for (const record of artifacts) {
@@ -140,7 +170,20 @@ export async function writeAccepted(
         throw new PermanentRunFailure(`accepted research file is missing: ${record.taskId}`, 'integrity-failed')
       }
     }
+    const scratch = acceptedScratchBundle(record, files)
+    if (scratch !== undefined && capture !== undefined && sameScratchLane(request.task, record, scratch.bundle)) {
+      const wave = pocManifestTask(record, scratch.path).wave
+      for (const file of scratch.bundle.files) {
+        if ((retained.get(file.path)?.wave ?? -1) < wave) retained.set(file.path, { wave, path: file.path, sha256: file.sha256 })
+      }
+    }
+    if (scratch !== undefined && pocTests) {
+      await sandbox.writeFile(`${pocBundleDirectory}/${record.taskId}.json`, files[scratch.path]!)
+      pocTasks.push(pocManifestTask(record, scratch.path))
+    }
     for (const [path, content] of Object.entries(files)) {
+      // Bundles are never mounted as documents or aliased into results.
+      if (path === scratch?.path) continue
       const destination = acceptedEvidencePath(record, path)
       await sandbox.mkdir(destination.slice(0, destination.lastIndexOf('/')), { recursive: true })
       await sandbox.writeFile(destination, content)
@@ -158,6 +201,15 @@ export async function writeAccepted(
     }
   }
   await sandbox.writeFile(researchIndexPath, researchIndex(artifacts))
+  if (capture !== undefined) {
+    await sandbox.writeFile(scratchRetainedPath, scratchRetained(capture.laneScratchPath, [...retained.values()]))
+    await trustedExec(sandbox, `chown 0:0 ${scratchRetainedPath} && chmod 0600 ${scratchRetainedPath}`,
+      'retained scratch list permissions failed')
+  }
+  if (pocTests) {
+    await sandbox.writeFile(`${pocBundleDirectory}/manifest.json`, canonicalJson({ schemaVersion: 1, tasks: pocTasks }))
+    await trustedExec(sandbox, 'node /usr/local/bin/ack3-mount-tests', 'discovery PoC test mount failed')
+  }
   if (mode === 'research-frontier') return
   await sandbox.writeFile('/workspace/accepted/accepted-artifacts.json', canonicalJson(request.visibleArtifacts))
   await sandbox.writeFile('/workspace/results/research-index.md', researchIndex(request.visibleArtifacts))

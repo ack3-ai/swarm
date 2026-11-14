@@ -26,7 +26,7 @@ describe('sealed release credential preflight', () => {
       CLAUDE_TEAM_OAUTH_TOKEN: { get: async () => 'sk-ant-oat-test-only' } }
     await expect(assertReleaseProviderCredentials(selected, bound)).resolves.toBeUndefined()
     await expect(assertReleaseProviderCredentials(selected, { ...bound, CLAUDE_TEAM_OAUTH_TOKEN: 'api-key' }))
-      .rejects.toThrow('Claude subscription token')
+      .rejects.toThrow('Claude subscription token CLAUDE_TEAM_OAUTH_TOKEN is missing or invalid')
   })
 
   it('selects a named Codex account without falling back to the default account', async () => {
@@ -97,4 +97,14 @@ it('requires optional header bindings before admission and supports Secrets Stor
   await expect(assertReleaseProviderCredentials(selected, bound)).resolves.toBeUndefined()
   await expect(assertReleaseProviderCredentials(selected, { ...bound, LOCAL_MODEL_HEADER_SECRET_API_KEY: '' }))
     .rejects.toThrow('LOCAL_MODEL_HEADER_SECRET_API_KEY is missing')
+})
+
+
+it('reads each shared runtime binding once per validation and refreshes it on the next validation', async () => {
+  let reads = 0
+  const bound = { ...env, PROVIDER_B_API_KEY: { get: async () => { reads++; return reads === 1 ? 'present' : '' } } }
+  await assertReleaseProviderCredentials(definition(), bound)
+  expect(reads).toBe(1)
+  await expect(assertReleaseProviderCredentials(definition(), bound)).rejects.toThrow('credential is missing')
+  expect(reads).toBe(2)
 })

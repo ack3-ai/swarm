@@ -54,6 +54,29 @@ function researchResult(request: AgentRequest): AgentResult {
   }
 }
 
+export const deterministicReconQueries = ['solidity vault withdrawal reentrancy advisories'] as const
+
+/** Background notes with one successful search, as the recon gate requires. */
+function reconResult(request: AgentRequest): AgentResult {
+  const researchQueries = [...deterministicReconQueries]
+  const source = request.task.backend === 'claude' ? 'claude-json' as const
+    : request.task.backend === 'dsh-chat-completions' ? 'dsh-json' as const : 'codex-exa' as const
+  return {
+    status: 'accepted', actorId: `stub-recon-${request.attempt}`, model: request.task.model, provider: providerIdentity(request.task),
+    files: {
+      'recon/index.md': '# Recon index\n\n- [project.md](project.md): public specifications.\n- [dependencies.md](dependencies.md): versions and advisories.\n- [attacks.md](attacks.md): similar incidents.\n\n## Key facts\n\n1. The target is a Solidity vault.\n',
+      'recon/project.md': '# Project\n\nPublic Solidity documentation.\n',
+      'recon/dependencies.md': '# Dependencies\n\nNo public advisories found. Queries tried: solidity vault withdrawal reentrancy advisories.\n',
+      'recon/attacks.md': '# Attacks\n\nReentrancy in withdrawal functions is a known bug class.\n',
+      [SUBMISSION_PATH]: JSON.stringify({ complete: true, researchQueries }),
+    },
+    assertions: [], protocol: { recon: { researchQueries } }, inputTokens: 100, outputTokens: 50, costUsd: 0,
+    sessionId: `session-${request.task.workspaceKey}`,
+    nativeSearchEvidence: { schemaVersion: 1, source, failed: 0, incomplete: 0,
+      completed: [{ callId: 'recon-search-1', queryDigest: '0'.repeat(64), resultDigest: '1'.repeat(64), queries: researchQueries }] },
+  }
+}
+
 export class DeterministicAuditProvider implements AgentProvider {
   constructor(private readonly failTasks: ReadonlySet<string> = new Set()) {}
 
@@ -62,6 +85,7 @@ export class DeterministicAuditProvider implements AgentProvider {
   async run(request: AgentRequest): Promise<AgentResult> {
     if (this.failTasks.has(request.task.id)) throw new Error(`sanitized provider failure for ${request.task.id}`)
     if (request.task.promptKind === 'research') return researchResult(request)
+    if (request.task.promptKind === 'recon') return reconResult(request)
     const base = {
       status: 'accepted' as const,
       actorId: `stub-${request.task.id}-${request.attempt}`,

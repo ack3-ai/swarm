@@ -167,6 +167,21 @@ describe('official Exa MCP evidence', () => {
     assert.equal(codexExaSearchEvidence(jsonl({ type: 'item.completed', item: exaResult }, { type: 'turn.completed' })).completed.length, 0)
     assert.equal(codexExaSearchEvidence(jsonl({ type: 'item.started', item: exaItem }, { type: 'item.completed', item: exaResult })).completed.length, 0)
   })
+  it('keeps searches that completed before a failed turn and counts only the open ones as incomplete (E6)', async () => {
+    const { codexExaSearchEvidence } = await import('../container/native-search-evidence.mjs')
+    const second = { ...exaItem, id: 'exa-2', arguments: { query: 'second guard semantics' } }
+    const open = { ...exaItem, id: 'exa-3', arguments: { query: 'still running' } }
+    const proof = codexExaSearchEvidence(jsonl(
+      { type: 'item.started', item: exaItem }, { type: 'item.completed', item: exaResult },
+      { type: 'item.started', item: second }, { type: 'item.completed', item: { ...exaResult, ...second } },
+      { type: 'item.started', item: { ...exaItem, id: 'exa-4' } },
+      { type: 'item.completed', item: { ...exaResult, id: 'exa-4', error: 'timeout' } },
+      { type: 'item.started', item: open },
+      { type: 'turn.failed', error: { message: 'stream disconnected' } }))
+    assert.deepEqual(proof.completed.map(c => c.queries), [['generic guard semantics'], ['second guard semantics']])
+    assert.equal(proof.failed, 1)
+    assert.equal(proof.incomplete, 1)
+  })
 })
 
 
@@ -178,4 +193,74 @@ test('direct search, another MCP server and fetch never satisfy a search citatio
     ))
     assert.equal(proof.completed.length, 0)
   }
+})
+
+test('Exa advanced search counts like basic search in every runner format', async () => {
+  const { codexExaSearchEvidence, exaSearchTools } = await import('../container/native-search-evidence.mjs')
+  const { exaMcpUrl } = await import('../container/reasoning-config.mjs')
+  assert.deepEqual(new URL(exaMcpUrl).searchParams.get('tools').split(','),
+    ['web_search_exa', 'web_search_advanced_exa', 'web_fetch_exa'])
+  assert.deepEqual(exaSearchTools, ['web_search_exa', 'web_search_advanced_exa'])
+  const advanced = { query: 'generic guard semantics', includeDomains: ['example.org'], subpages: 2 }
+  const dsh = dshNativeSearchEvidence(jsonl(
+    { type: 'tool_call', callId: 'advanced-1', tool: 'mcp__exa__web_search_advanced_exa', input: advanced },
+    { type: 'tool_result', callId: 'advanced-1', status: 'completed', result: '{"results":[{"url":"https://example.org/guard"}]}' },
+  ))
+  assert.deepEqual(dsh.completed.map(entry => entry.queries), [['generic guard semantics']])
+  assert.equal(dshNativeSearchAttempted(jsonl({ type: 'tool_call', tool: 'mcp__exa__web_search_advanced_exa', input: {} })), true)
+  const item = { ...exaItem, id: 'advanced-1', tool: 'web_search_advanced_exa', arguments: advanced }
+  const codex = codexExaSearchEvidence(jsonl({ type: 'item.started', item },
+    { type: 'item.completed', item: { ...exaResult, ...item } }, { type: 'turn.completed' }))
+  assert.deepEqual(codex.completed.map(entry => entry.queries), [['generic guard semantics']])
+  const other = { ...item, server: 'other' }
+  assert.equal(codexExaSearchEvidence(jsonl({ type: 'item.started', item: other },
+    { type: 'item.completed', item: { ...exaResult, ...other } }, { type: 'turn.completed' })).completed.length, 0)
+  for (const tool of ['mcp__other__web_search_advanced_exa', 'mcp__exa__web_search_advanced']) {
+    assert.equal(dshNativeSearchEvidence(jsonl(
+      { type: 'tool_call', callId: 'call-1', tool, input: advanced },
+      { type: 'tool_result', callId: 'call-1', status: 'completed', result: 'Public source text' },
+    )).completed.length, 0)
+  }
+})
+
+test('a long session emits at most 512 searches per list and count, keeping the most recent', async () => {
+  const { claudeNativeSearchEvidence, codexExaSearchEvidence } = await import('../container/native-search-evidence.mjs')
+  const range = count => Array.from({ length: count }, (_, index) => index)
+  const dsh = dshNativeSearchEvidence(jsonl(...range(600).flatMap(index => [
+    { type: 'tool_call', callId: `search-${index}`, tool: 'mcp__exa__web_search_exa', input: { query: `public topic ${index}` } },
+    { type: 'tool_result', callId: `search-${index}`, status: 'completed', result: 'Public source text' },
+  ])))
+  assert.equal(dsh.completed.length, 512)
+  assert.deepEqual(dsh.completed.at(0).queries, ['public topic 88'])
+  assert.deepEqual(dsh.completed.at(-1).queries, ['public topic 599'])
+  const failing = dshNativeSearchEvidence(jsonl(...range(600).flatMap(index => [
+    { type: 'tool_call', callId: `failed-${index}`, tool: 'mcp__exa__web_search_exa', input: { query: `public topic ${index}` } },
+    { type: 'tool_result', callId: `failed-${index}`, status: 'error', result: 'Error: no credit' },
+  ]), ...range(600).map(index =>
+    ({ type: 'tool_call', callId: `open-${index}`, tool: 'mcp__exa__web_search_exa', input: { query: `open ${index}` } }))))
+  assert.equal(failing.failed, 512)
+  assert.equal(failing.incomplete, 512)
+  const claude = claudeNativeSearchEvidence(jsonl(...range(600).flatMap(index => [
+    { type: 'assistant', message: { content: [{ type: 'tool_use', id: `toolu-${index}`, name: 'mcp__exa__web_search_exa',
+      input: { query: `public topic ${index}` } }] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: `toolu-${index}`, content: 'Public source text' }] } },
+  ])))
+  assert.equal(claude.completed.length, 512)
+  const codex = codexExaSearchEvidence(jsonl(...range(600).flatMap(index => {
+    const item = { ...exaItem, id: `exa-${index}`, arguments: { query: `public topic ${index}` } }
+    return [{ type: 'item.started', item }, { type: 'item.completed', item: { ...exaResult, ...item } }]
+  }), { type: 'turn.completed' }))
+  assert.equal(codex.completed.length, 512)
+  assert.deepEqual(codex.completed.at(-1).queries, ['public topic 599'])
+})
+
+test('a completed search with a query over 4,000 characters counts as failed, not as a malformed receipt', () => {
+  const proof = dshNativeSearchEvidence(jsonl(
+    { type: 'tool_call', callId: 'long-1', tool: 'mcp__exa__web_search_exa', input: { query: 'x'.repeat(4001) } },
+    { type: 'tool_result', callId: 'long-1', status: 'completed', result: 'Public source text' },
+    { type: 'tool_call', callId: 'short-1', tool: 'mcp__exa__web_search_exa', input: { query: 'public topic' } },
+    { type: 'tool_result', callId: 'short-1', status: 'completed', result: 'Public source text' },
+  ))
+  assert.deepEqual(proof.completed.map(entry => entry.callId), ['short-1'])
+  assert.equal(proof.failed, 1)
 })

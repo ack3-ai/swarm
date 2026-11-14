@@ -28,7 +28,8 @@ interface CommandIdentity {
 }
 
 export type RunCommand = CommandIdentity & (
-  | { action: 'pause' | 'continue' | 'cancel'; scope: RunCommandScope }
+  | { action: 'pause' | 'continue'; scope: RunCommandScope }
+  | { action: 'cancel'; scope: { kind: 'audit' } }
   | ({ action: 'fork'; source: SavedStateReference; releaseDigest: string; runtimeRelease: RuntimeRelease } & ForkBoundary)
 )
 
@@ -104,7 +105,12 @@ export function parseRunCommand(value: unknown): RunCommand {
   }
   switch (value.action) {
     case 'pause': case 'continue': case 'cancel':
-      keys(value, [...common, 'scope']); scope(value.scope); break
+      keys(value, [...common, 'scope']); scope(value.scope)
+      if (value.action === 'cancel' && (value.scope as RunCommandScope).kind !== 'audit') {
+        throw new RunCommandRejected('immutable-continuation-required',
+          'adjustments require a quiescent fork with the ordinary manifest')
+      }
+      break
     case 'fork':
       keys(value, [...common, 'source', 'releaseDigest', 'runtimeRelease'], ['stageId', 'checkpointDigest', 'sourceFrontier'])
       if (['stageId', 'checkpointDigest', 'sourceFrontier'].filter(key => Object.hasOwn(value, key)).length !== 1) throw new TypeError('fork requires exactly one saved boundary')
@@ -117,9 +123,4 @@ export function parseRunCommand(value: unknown): RunCommand {
     default: throw new TypeError('command action is invalid')
   }
   return deepClone(value) as unknown as RunCommand
-}
-
-/** The only currently installed terminal-state execution decision. */
-export function isWholeAuditCancellation(command: RunCommand): boolean {
-  return command.action === 'cancel' && command.scope.kind === 'audit'
 }

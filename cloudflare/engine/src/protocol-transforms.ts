@@ -82,16 +82,16 @@ export async function createNegativeReviewInput(artifacts: readonly ArtifactReco
       const leadCheck = artifact.protocol.research?.leadChecks?.find(check => check.observationId === observation.id)
       pending.push({
         observationId: observation.id, sourceKind: 'research', sourceLabel: `${artifact.stageId}/${artifact.waveId}/${artifact.taskId}`,
-        observation, observationSha256: await sha256(JSON.stringify(observation)),
-        primaryDisposition, primaryDispositionSha256: await sha256(JSON.stringify(primaryDisposition)),
+        observation, observationSha256: await sha256(canonicalJson(observation)),
+        primaryDisposition, primaryDispositionSha256: await sha256(canonicalJson(primaryDisposition)),
         ...(leadCheck === undefined ? {} : { leadCheck }),
       })
     }
     for (const observation of artifact.protocol.challengeObservations ?? []) {
       pending.push({
         observationId: observation.id, sourceKind: 'challenge', sourceLabel: observation.perspective,
-        observation, observationSha256: await sha256(JSON.stringify(observation)),
-        primaryDisposition: observation, primaryDispositionSha256: await sha256(JSON.stringify(observation)),
+        observation, observationSha256: await sha256(canonicalJson(observation)),
+        primaryDisposition: observation, primaryDispositionSha256: await sha256(canonicalJson(observation)),
       })
     }
   }
@@ -107,7 +107,7 @@ export async function createNegativeReviewInput(artifacts: readonly ArtifactReco
     || (referenceCounts.get(primaryDisposition.reference.toLowerCase()) ?? 0) > 1).map(item => item.observationId))
   const eligible = await Promise.all(pending.filter(item => !mandatory.has(item.observationId)).map(async item => ({
     id: item.observationId,
-    digest: await sha256(`${item.observationId}\0${JSON.stringify(item.observation)}`),
+    digest: await sha256(`${item.observationId}\0${canonicalJson(item.observation)}`),
   })))
   eligible.sort((left, right) => compare(left.digest, right.digest))
   const controlCount = eligible.length === 0 ? 0 : Math.min(4, Math.max(1, Math.ceil(pending.length * 0.1)))
@@ -121,7 +121,7 @@ export async function createNegativeReviewInput(artifacts: readonly ArtifactReco
     ],
   }))
   const payload = { version: 2 as const, entries }
-  return { ...payload, inputSha256: await sha256(JSON.stringify(payload)) }
+  return { ...payload, inputSha256: await sha256(canonicalJson(payload)) }
 }
 
 export function createCoverageUnion(artifacts: readonly ArtifactRecord[]): readonly CoverageUnionEntry[] {
@@ -276,9 +276,12 @@ export async function createFinalObservationCustody(artifacts: readonly Artifact
   }
 }
 
+/** Reserved for the sealed custody register; the reporter's draft may not contain it. */
+export const FINAL_CUSTODY_MARKER = '<!-- ACK3_FINAL_OBSERVATION_CUSTODY_V1 -->'
+
 export function sealFinalFinding(draft: string, custody: FinalObservationCustody): string {
   if (draft.trim() === '') throw new Error('finding draft is empty')
-  const marker = '<!-- ACK3_FINAL_OBSERVATION_CUSTODY_V1 -->'
+  const marker = FINAL_CUSTODY_MARKER
   if (draft.includes(marker)) throw new Error('finding draft contains a reserved custody marker')
   return `${draft.trimEnd()}\n\n${marker}\n${canonicalJson(custody)}\n<!-- /ACK3_FINAL_OBSERVATION_CUSTODY_V1 -->\n`
 }

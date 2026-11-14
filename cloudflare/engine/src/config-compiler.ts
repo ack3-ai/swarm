@@ -14,6 +14,9 @@ const manifestKeys = [
   'method',
   'stages',
   'promptFile',
+  'scopeFile',
+  'keepPocs',
+  'submitCheck',
   'forceSearch',
   'forceSearchStages',
   'nativeSearch',
@@ -33,7 +36,8 @@ function rejectUnknownKeys(value: Record<string, unknown>, allowed: readonly str
   if (unknown.length > 0) throw new TypeError(`${path} has unknown keys: ${unknown.join(', ')}`)
 }
 
-export function compileExperimentConfig(value: unknown, promptContents: unknown): ReleasePackageBody {
+/** `scopeContents` is the text of the manifest's `scopeFile`, read by the caller like the prompt file. */
+export function compileExperimentConfig(value: unknown, promptContents: unknown, scopeContents?: unknown): ReleasePackageBody {
   object(value)
   rejectUnknownKeys(value, manifestKeys, 'audit manifest')
   if (value.kind !== 'ack3-audit' || value.configVersion !== 2) {
@@ -45,7 +49,7 @@ export function compileExperimentConfig(value: unknown, promptContents: unknown)
   if (value.environment !== undefined) {
     object(value.environment)
     rejectUnknownKeys(value.environment, [
-      'image', 'environmentBindings', 'preflightCommands', 'workspacePreparation',
+      'image', 'environmentBindings', 'preflightCommands', 'workspacePreparation', 'buildRequired', 'commandTimeoutMinutes',
     ], 'audit manifest environment')
     if (value.target.environment !== undefined || value.target.runtime !== undefined) {
       throw new TypeError('audit manifest environment must not be combined with legacy target environment/runtime')
@@ -57,7 +61,7 @@ export function compileExperimentConfig(value: unknown, promptContents: unknown)
   object(runtime)
   rejectUnknownKeys(runtime, [
     'environmentBindings', 'preflightCommands', 'workspacePreparation',
-    ...(value.environment === undefined ? [] : ['image']),
+    ...(value.environment === undefined ? [] : ['image', 'buildRequired', 'commandTimeoutMinutes']),
   ], value.environment === undefined ? 'audit manifest target.runtime' : 'audit manifest environment')
   object(value.limits)
   rejectUnknownKeys(value.limits, [
@@ -76,7 +80,8 @@ export function compileExperimentConfig(value: unknown, promptContents: unknown)
   for (const [index, pool] of value.modelPools.entries()) {
     object(pool)
     rejectUnknownKeys(pool, [
-      'id', 'backend', 'provider', 'connection', 'model', 'cyberAccessProgram', 'reasoningEffort', 'thinking', 'subagents', 'credentialSource', 'agents', 'required',
+      'id', 'backend', 'provider', 'connection', 'model', 'cyberAccessProgram', 'reasoningEffort', 'thinking', 'subagents', 'credentialSource',
+      'fallbackCredentialSources', 'agents', 'required',
     ], `audit manifest modelPools[${index}]`)
     if (pool.connection !== undefined) {
       object(pool.connection)
@@ -96,14 +101,14 @@ export function compileExperimentConfig(value: unknown, promptContents: unknown)
     if (pool.subagents.stages !== undefined) {
       object(pool.subagents.stages)
       rejectUnknownKeys(pool.subagents.stages, [
-        'discovery', 'synthesis', 'coverage', 'negative-review', 'verification', 'reporting',
+        'recon', 'discovery', 'synthesis', 'coverage', 'negative-review', 'verification', 'reporting',
       ], `audit manifest modelPools[${index}].subagents.stages`)
     }
   }
   const stageModelPools = value.stageModelPools ?? {}
   object(stageModelPools)
   rejectUnknownKeys(stageModelPools, [
-    'synthesis', 'coverage', 'negative-review', 'verification', 'reporting',
+    'recon', 'synthesis', 'coverage', 'negative-review', 'verification', 'reporting',
   ], 'audit manifest stageModelPools')
-  return compileSecurityAuditV1({ ...value, stageModelPools }, promptContents)
+  return compileSecurityAuditV1({ ...value, stageModelPools }, promptContents, scopeContents)
 }

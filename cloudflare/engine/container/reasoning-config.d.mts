@@ -19,4 +19,5 @@ export function renderDshReasoningPatch(input: ReasoningInput & {
 }): string
 
 export function validCodexAccessProgram(backend: string | undefined, program: unknown): boolean
+export function validClaudeAccounts(names: unknown): names is readonly string[]
 export function modelHeaderCredentialNames(connection?: ModelConnection): string[]

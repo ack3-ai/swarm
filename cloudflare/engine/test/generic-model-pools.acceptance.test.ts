@@ -1,3 +1,4 @@
+import { createControlledMachine } from './support/controlled-machine.js'
 import { compileExperimentConfig } from './support/compile-config.js'
 import document from './fixtures/audit0-hello-vault.json' with { type: 'json' }
 import { describe, expect, it } from 'vitest'
@@ -38,7 +39,7 @@ describe('generic model-pool acceptance flow', () => {
     const body = compileExperimentConfig(manifest)
     const release = await sealReleasePackage(body)
     const startedAt = '2026-09-22T00:00:00.000Z'
-    const machine = await RunMachine.create(body.definition, release.digest, 'generic-pool-acceptance', startedAt)
+    const machine = await createControlledMachine(body.definition, release.digest, 'generic-pool-acceptance', startedAt)
     const base = new DeterministicAuditProvider()
     const provider: AgentProvider = {
       async run(request) {

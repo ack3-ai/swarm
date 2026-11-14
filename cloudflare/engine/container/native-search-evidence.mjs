@@ -4,6 +4,25 @@ import { join } from 'node:path'
 
 const digest = value => createHash('sha256').update(value).digest('hex')
 
+/** The Worker accepts at most this many entries per list and count; see agent-execution-receipt.ts. */
+export const SEARCH_EVIDENCE_MAX = 512
+
+/**
+ * Never send evidence the Worker would reject as a malformed receipt (E1): keep the most
+ * recent searches, cap the counts, and count a completed search whose query text exceeds the
+ * Worker's limits as failed, since it cannot be cited.
+ */
+function bounded(evidence) {
+  const citable = evidence.completed.filter(entry => entry.queries === undefined
+    || (entry.queries.length <= 16 && entry.queries.every(query => query.length <= 4000)))
+  return { ...evidence, completed: citable.slice(-SEARCH_EVIDENCE_MAX),
+    failed: Math.min(evidence.failed + evidence.completed.length - citable.length, SEARCH_EVIDENCE_MAX),
+    incomplete: Math.min(evidence.incomplete, SEARCH_EVIDENCE_MAX) }
+}
+
+/** Exa tools whose `query` counts as a native search; both take the same search text. */
+export const exaSearchTools = ['web_search_exa', 'web_search_advanced_exa']
+
 /** Claude's official SDK forwards the native assistant/user tool blocks. */
 export function claudeNativeSearchEvidence(stdout) {
   const events = []
@@ -49,7 +68,7 @@ export function dshNativeSearchEvidence(stdout) {
     if (!line.trim()) continue
     let event
     try { event = JSON.parse(line) } catch { continue }
-    if (event?.type === 'tool_call' && event.tool === 'mcp__exa__web_search_exa'
+    if (event?.type === 'tool_call' && exaSearchTools.some(tool => event.tool === `mcp__exa__${tool}`)
       && typeof event.callId === 'string' && event.callId.length > 0
       && typeof event.input?.query === 'string' && event.input.query.trim().length > 0) {
       if (!pending.has(event.callId)) pending.set(event.callId, { queryDigest: digest(JSON.stringify([event.input.query])), queries: [event.input.query] })
@@ -65,7 +84,7 @@ export function dshNativeSearchEvidence(stdout) {
     }
     completed.push({ callId: event.callId, queryDigest, queries, resultDigest: digest(event.result) })
   }
-  return { schemaVersion: 1, source: 'dsh-json', completed, failed, incomplete: pending.size }
+  return bounded({ schemaVersion: 1, source: 'dsh-json', completed, failed, incomplete: pending.size })
 }
 
 /** An Exa search or fetch may incur a separate charge even when its result fails validation. */
@@ -74,7 +93,7 @@ export function dshNativeSearchAttempted(stdout) {
     if (!line.trim()) continue
     try {
       const event = JSON.parse(line)
-      if (event?.type === 'tool_call' && ['mcp__exa__web_search_exa', 'mcp__exa__web_fetch_exa'].includes(event.tool)) return true
+      if (event?.type === 'tool_call' && [...exaSearchTools, 'web_fetch_exa'].some(tool => event.tool === `mcp__exa__${tool}`)) return true
     } catch {}
   }
   return false
@@ -139,6 +158,10 @@ export async function readCodexNativeJournal(root, sessionId) {
 
 /** Require the exact native journal response status for this prompt and turn. */
 export function codexNativeSearchEvidence(stdout, journalText, prompt, sessionId) {
+  return bounded(codexJournalSearchEvidence(stdout, journalText, prompt, sessionId))
+}
+
+function codexJournalSearchEvidence(stdout, journalText, prompt, sessionId) {
   const cli = codexCliSearchCandidates(stdout)
   if (typeof journalText !== 'string' || typeof prompt !== 'string'
     || !/^[a-zA-Z0-9-]{8,100}$/.test(sessionId ?? '')) {
@@ -209,7 +232,7 @@ export function codexExaSearchEvidence(stdout) {
     if (e.type === 'turn.completed') turnCompleted = true
     if (e.type === 'turn.failed') turnFailed = true
     const i = e.item
-    if (i?.type !== 'mcp_tool_call' || i.server !== 'exa' || i.tool !== 'web_search_exa') continue
+    if (i?.type !== 'mcp_tool_call' || i.server !== 'exa' || !exaSearchTools.includes(i.tool)) continue
     if (e.type === 'item.started' && typeof i.arguments?.query === 'string' && i.arguments.query.trim()) {
       pending.set(i.id, i.arguments.query)
     }
@@ -222,6 +245,7 @@ export function codexExaSearchEvidence(stdout) {
     completed.push({ callId: i.id, queries: [query], queryDigest: digest(JSON.stringify([query])),
       resultDigest: digest(JSON.stringify(i.result)) })
   }
-  return { schemaVersion: 1, source: 'codex-exa', completed: turnCompleted && !turnFailed ? completed : [],
-    failed: failed + (turnFailed ? completed.length : 0), incomplete: pending.size }
+  // A failed turn keeps the searches that completed before it: each is a paired call with its result (E6).
+  return bounded({ schemaVersion: 1, source: 'codex-exa', completed: turnCompleted || turnFailed ? completed : [],
+    failed, incomplete: pending.size })
 }

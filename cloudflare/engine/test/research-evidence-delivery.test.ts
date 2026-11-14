@@ -1,3 +1,4 @@
+import { createControlledMachine } from './support/controlled-machine.js'
 import document from './fixtures/audit0-hello-vault.json' with { type: 'json' }
 import { describe, expect, it } from 'vitest'
 import type { AgentProvider, ArtifactRecord, TaskDefinition } from '../src/contracts.js'
@@ -226,7 +227,7 @@ describe('frozen research evidence delivery without model calls', () => {
     const discovery = body.definition.stages.find(stage => stage.kind === 'discovery')!
     const configured = discovery.waves[1]!.tasks.find(task => task.providerClass === 'additive')!
     configured.research = { ...configured.research!, role: 'satellite', buildsOn: 'wave-0/research-3' }
-    const machine = await RunMachine.create(body.definition, 'a'.repeat(64), 'frozen-peer-delivery')
+    const machine = await createControlledMachine(body.definition, 'a'.repeat(64), 'frozen-peer-delivery')
     const store = new MemoryArtifactStore()
     const base = new DeterministicAuditProvider()
     const selected: string[] = []

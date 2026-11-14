@@ -1,4 +1,5 @@
-import { canonicalJsonDigest } from './canonical-bytes.js'
+import { plainCanonicalJson, plainCanonicalJsonDigest } from './canonical-bytes.js'
+import { compareText } from './text-order.js'
 
 const encoder = new TextEncoder()
 
@@ -8,7 +9,7 @@ function normalized(value: unknown): unknown {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>)
         .filter(([, entry]) => entry !== undefined)
-        .sort(([left], [right]) => left.localeCompare(right))
+        .sort(([left], [right]) => compareText(left, right))
         .map(([key, entry]) => [key, normalized(entry)]),
     )
   }
@@ -18,29 +19,17 @@ function normalized(value: unknown): unknown {
   return value
 }
 
+// Plain data objects take the one-pass writer. Custom objects, toJSON functions,
+// functions, symbols and cycles keep the historical normalize-and-stringify
+// path. Both produce the same text for plain data, accessors included.
 export function canonicalJson(value: unknown): string {
-  return JSON.stringify(normalized(value))
-}
-
-// Only take the bounded path for data objects. Preserve the historical
-// canonicalJson behavior for custom objects, getters and toJSON functions.
-function plainData(value: unknown, seen = new Set<object>()): boolean {
-  if (value === null || ['undefined', 'string', 'number', 'boolean'].includes(typeof value)) return true
-  if (typeof value !== 'object') return false
-  if (seen.has(value) || 'toJSON' in value) return false
-  const prototype = Object.getPrototypeOf(value)
-  if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) return false
-  seen.add(value)
-  for (const entry of Object.values(Object.getOwnPropertyDescriptors(value))) {
-    if (!entry.enumerable) continue
-    if (!('value' in entry) || !plainData(entry.value, seen)) return false
-  }
-  seen.delete(value)
-  return true
+  const plain = value !== null && typeof value === 'object' ? plainCanonicalJson(value) : null
+  return plain ?? JSON.stringify(normalized(value))
 }
 
 export async function sha256(value: unknown): Promise<string> {
-  if (value !== undefined && typeof value !== 'string' && plainData(value)) return canonicalJsonDigest(value)
+  const plain = value !== undefined && typeof value !== 'string' ? plainCanonicalJsonDigest(value) : null
+  if (plain !== null) return plain
   const bytes = encoder.encode(typeof value === 'string' ? value : canonicalJson(value))
   const digest = await crypto.subtle.digest('SHA-256', bytes)
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('')

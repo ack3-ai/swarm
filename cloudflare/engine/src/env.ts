@@ -1,34 +1,12 @@
-import type { DiscoveryPoolWaiver } from './discovery-pool-waiver.js'
 import type { AgentSandbox } from './agent-sandbox.js'
-import type { ModelClockAmendment } from './recovery-clock.js'
-import type {
-  FailedWaveRecoveryEvidence, ProviderUsage, RuntimeRelease, RuntimeTransitionEvidence, TerminalCompletionRecoveryEvidence,
-} from './contracts.js'
-
-export interface QuarantinedRevalidation {
-  sourceRunId: string
-  stageId: string
-  waveId: string
-  taskId: string
-  promptDigest: string
-  outputDigest: string
-  quarantineUri: string
-  usage: ProviderUsage
-}
+import type { RuntimeRelease } from './contracts.js'
 
 export interface AuditWorkflowPayload {
-  mode: 'start' | 'resume' | 'recover-failed-wave' | 'recover-terminal-completion' | 'recover-discovery-waiver'
+  mode: 'start'
   experimentId: string
   runId: string
   releaseDigest?: string
-  checkpointDigest?: string
   runtimeRelease?: RuntimeRelease
-  timeAmendment?: ModelClockAmendment
-  revalidation?: QuarantinedRevalidation
-  failedWaveRecovery?: FailedWaveRecoveryEvidence
-  terminalCompletionRecovery?: TerminalCompletionRecoveryEvidence
-  runtimeTransition?: RuntimeTransitionEvidence
-  discoveryPoolWaiver?: DiscoveryPoolWaiver
 }
 
 export interface RuntimeIsolationWorkflowPayload {
@@ -38,43 +16,6 @@ export interface RuntimeIsolationWorkflowPayload {
   parentCheckpointDigest?: string
   /** Zero-model proof that keep-alive survives a period longer than the inactivity timeout without observer traffic. */
   idleSurvival?: true
-}
-
-export interface RuntimeResumeRequest {
-  experimentId: string
-  childRunId: string
-  checkpointDigest: string
-  runtimeRelease: RuntimeRelease
-  runtimeTransition?: RuntimeTransitionEvidence
-  revalidate?: {
-    sourceRunId: string
-    outputDigest: string
-  }
-}
-
-export interface RuntimeFailedWaveRecoveryRequest {
-  experimentId: string
-  childRunId: string
-  sourceRunId: string
-  sourceStateGeneration: number
-  sourceStateDigest: string
-  checkpointDigest: string
-  runtimeRelease: RuntimeRelease
-  promoteExecution?: {
-    taskId: string
-    sourceAttempt: number
-    requestDigest: string
-    quarantineOutputDigest?: string
-  }
-  retainNative?: { taskId: string, requestDigest: string, snapshotDigest: string, sandboxObjectId: string }
-  repairQuarantined?: { taskId: string, requestDigest: string, outputDigest: string }
-}
-
-export interface RuntimeTerminalCompletionRecoveryRequest extends RuntimeFailedWaveRecoveryRequest {}
-
-export interface RuntimeDiscoveryWaiverRequest extends RuntimeFailedWaveRecoveryRequest {
-  poolId: string
-  requestDigest: string
 }
 
 export interface Env {
@@ -99,4 +40,11 @@ export interface Env {
   ACK3_CODEX_WORKSPACE_ID: string
   CONTROL_API_TOKEN: string
   [binding: string]: unknown
+}
+
+export function engineRole(env: Pick<Env, 'ENGINE_ROLE'>): 'front-door' | 'runtime' {
+  if (env.ENGINE_ROLE !== 'front-door' && env.ENGINE_ROLE !== 'runtime') {
+    throw new TypeError('ENGINE_ROLE must be front-door or runtime')
+  }
+  return env.ENGINE_ROLE
 }

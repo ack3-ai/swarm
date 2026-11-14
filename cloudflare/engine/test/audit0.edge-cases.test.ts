@@ -1,3 +1,5 @@
+import { createControlledMachine } from './support/controlled-machine.js'
+import { restoreSelected } from './support/selected-snapshots.js'
 import { describe, expect, it } from 'vitest'
 import type { AgentProvider, AgentRequest, AgentResult } from '../src/contracts.js'
 import {
@@ -40,13 +42,13 @@ it.each(['codex', 'claude'] as const)('does not send exhausted %s quota back to 
 
 async function run(runId: string, provider: AgentProvider) {
   const release = await sealReleasePackage(audit0PackageBody)
-  const machine = await RunMachine.create(audit0Definition, release.digest, runId, startedAt)
+  const machine = await createControlledMachine(audit0Definition, release.digest, runId, startedAt)
   const store = new MemoryArtifactStore()
   const outcome = await runExperiment({
     definition: audit0Definition, machine, provider, artifactStore: store,
     policy: createAudit0RunPolicy(() => Date.parse(startedAt) + 60_000),
   })
-  return { outcome, store }
+  return { outcome, store, machine }
 }
 
 function wrapped(mutate: (request: AgentRequest, result: AgentResult) => AgentResult | Promise<AgentResult>): AgentProvider {
@@ -117,7 +119,7 @@ describe('audit0 sanitized edge contracts', () => {
         outputTokens: usage.outputTokens }
     })
     const release = await sealReleasePackage(audit0PackageBody)
-    const machine = await RunMachine.create(audit0Definition, release.digest, 'partial-dsh-cache')
+    const machine = await createControlledMachine(audit0Definition, release.digest, 'partial-dsh-cache')
     const input = { definition: audit0Definition, machine, provider, artifactStore: new MemoryArtifactStore() }
     await runNextWave(input)
     expect(await runNextWave(input)).not.toBeNull()
@@ -138,7 +140,7 @@ describe('audit0 sanitized edge contracts', () => {
       return agentResultFromExecutionReceipt(request, receipt, receipt.requestDigest, false)
     })
 
-    const { outcome } = await run('late-504-valid-handoff', provider)
+    const { outcome, machine } = await run('late-504-valid-handoff', provider)
     expect(outcome.state.status).toBe('completed')
     expect(attempts).toEqual([1])
     expect(outcome.state.rejectedAttempts.filter(value => value.taskId === 'additive-wave-0-research-1'))
@@ -155,11 +157,7 @@ describe('audit0 sanitized edge contracts', () => {
       })
     expect(outcome.state.budget.modelCalls).toBe(outcome.state.artifacts
       .reduce((total, artifact) => total + artifact.usage.modelCalls, 0))
-    await expect(RunMachine.resume(
-      audit0Definition,
-      outcome.checkpoints.at(-1)!,
-      'late-504-valid-handoff-child',
-    )).resolves.toBeDefined()
+    await expect(restoreSelected(machine)).resolves.toBeDefined()
   })
 
   it('quarantines a malformed late-504 handoff and preserves the normal repair policy', async () => {
@@ -254,7 +252,7 @@ describe('audit0 sanitized edge contracts', () => {
     definition.limits.maxInputTokens = discovery.waves.slice(0, 4).flatMap(wave => wave.tasks)
       .filter(task => task.providerClass !== 'deterministic').length * 100
     const release = await sealReleasePackage({ ...audit0PackageBody, definition })
-    const machine = await RunMachine.create(definition, release.digest, 'downstream-completion-after-cap', startedAt)
+    const machine = await createControlledMachine(definition, release.digest, 'downstream-completion-after-cap', startedAt)
     const outcome = await runExperiment({
       definition,
       machine,
@@ -265,16 +263,14 @@ describe('audit0 sanitized edge contracts', () => {
 
     expect(outcome.state.status).toBe('completed')
     expect(outcome.state.budget.inputTokens).toBeGreaterThan(definition.limits.maxInputTokens)
-    await expect(RunMachine.resume(
-      definition, outcome.state.checkpoints.at(-1)!, 'downstream-completion-child',
-    )).resolves.toBeDefined()
+    await expect(restoreSelected(machine)).resolves.toBeDefined()
   })
 
   it('accounts and seals every result from a wave admitted before its measured token overrun', async () => {
     const definition = structuredClone(audit0Definition)
     definition.limits.maxInputTokens = 1
     const release = await sealReleasePackage({ ...audit0PackageBody, definition })
-    const machine = await RunMachine.create(definition, release.digest, 'paid-overrun-accounting')
+    const machine = await createControlledMachine(definition, release.digest, 'paid-overrun-accounting')
     const store = new MemoryArtifactStore()
     const provider = new DeterministicAuditProvider()
     await advanceExperimentOneWave({ definition, machine, provider, artifactStore: store })
@@ -291,7 +287,7 @@ describe('audit0 sanitized edge contracts', () => {
     const laterCheckpoint = machine.snapshot().checkpoints.at(-1)!
     expect(laterCheckpoint.body.cursor).toEqual({ stageIndex: 2, waveIndex: 0 })
     expect(machine.snapshot().stageEndReceipts.at(-1)?.reason).toBe('measured-budget-inability')
-    await expect(RunMachine.resume(definition, laterCheckpoint, 'paid-overrun-stage-child'))
+    await expect(restoreSelected(machine))
       .resolves.toBeDefined()
   })
 
@@ -302,7 +298,7 @@ describe('audit0 sanitized edge contracts', () => {
     definition.limits.maxModelCalls = paidTaskCount
     definition.limits.maxInputTokens = paidTaskCount * 100
     const release = await sealReleasePackage({ ...audit0PackageBody, definition })
-    const machine = await RunMachine.create(definition, release.digest, 'legacy-budget-receipt')
+    const machine = await createControlledMachine(definition, release.digest, 'legacy-budget-receipt')
     const input = {
       definition,
       machine,
@@ -317,7 +313,7 @@ describe('audit0 sanitized edge contracts', () => {
     const evidence = { ...(receipt.evidence as Record<string, unknown>) }
     expect((evidence.budget as { inputTokens: number }).inputTokens).toBe(definition.limits.maxInputTokens)
     expect(checkpoint.body.budget.inputTokens).toBe(definition.limits.maxInputTokens)
-    await expect(RunMachine.resume(definition, checkpoint, 'pool-budget-child'))
+    await expect(restoreSelected(machine))
       .resolves.toBeDefined()
   })
 
@@ -325,7 +321,7 @@ describe('audit0 sanitized edge contracts', () => {
     const definition = structuredClone(audit0Definition)
     definition.limits.maxModelCalls = 1
     const release = await sealReleasePackage({ ...audit0PackageBody, definition })
-    const machine = await RunMachine.create(definition, release.digest, 'budget-admission')
+    const machine = await createControlledMachine(definition, release.digest, 'budget-admission')
     const provider = new DeterministicAuditProvider()
     let calls = 0
     const counted: AgentProvider = { run: async request => {
@@ -402,7 +398,7 @@ describe('audit0 sanitized edge contracts', () => {
       }
     })
 
-    const { outcome } = await run('additive-research-fresh-repair', provider)
+    const { outcome, machine } = await run('additive-research-fresh-repair', provider)
     expect(outcome.state.status).toBe('completed')
     expect(attempts).toEqual([
       { attempt: 1, mode: 'new', freshContext: false, diagnostics: [] },
@@ -418,11 +414,7 @@ describe('audit0 sanitized edge contracts', () => {
     expect(rejected[0]?.diagnostics).toEqual([
       'submission.observations[0].id must be a local identifier such as A1',
     ])
-    await expect(RunMachine.resume(
-      audit0Definition,
-      outcome.checkpoints.at(-1)!,
-      'additive-research-fresh-repair-child',
-    )).resolves.toBeDefined()
+    await expect(restoreSelected(machine)).resolves.toBeDefined()
   })
 
   it('repairs a verifier enum defect in the same session without weakening the gate', async () => {
@@ -490,7 +482,7 @@ describe('audit0 sanitized edge contracts', () => {
       }
     })
 
-    const { outcome } = await run('additive-review-fresh-repair', provider)
+    const { outcome, machine } = await run('additive-review-fresh-repair', provider)
     expect(outcome.state.status).toBe('completed')
     expect(attempts).toHaveLength(2)
     expect(attempts[0]).toEqual({ attempt: 1, mode: 'new', freshContext: false, diagnostics: [] })
@@ -500,11 +492,7 @@ describe('audit0 sanitized edge contracts', () => {
     ]))
     expect(outcome.state.rejectedAttempts.filter(value => value.taskId === 'negative-review-replica'))
       .toHaveLength(1)
-    await expect(RunMachine.resume(
-      audit0Definition,
-      outcome.checkpoints.at(-1)!,
-      'additive-review-fresh-repair-child',
-    )).resolves.toBeDefined()
+    await expect(restoreSelected(machine)).resolves.toBeDefined()
   })
 
   it('uses the configured fresh repair after an additive process failure and preserves its usage', async () => {
@@ -538,7 +526,7 @@ describe('audit0 sanitized edge contracts', () => {
       return result
     })
 
-    const { outcome } = await run('additive-process-fresh-repair', provider)
+    const { outcome, machine } = await run('additive-process-fresh-repair', provider)
     expect(outcome.state.status).toBe('completed')
     expect(attempts).toEqual([
       { attempt: 1, mode: 'new', freshContext: false, diagnostics: [] },
@@ -564,11 +552,7 @@ describe('audit0 sanitized edge contracts', () => {
           cacheAccountingComplete: false,
         },
       })])
-    await expect(RunMachine.resume(
-      audit0Definition,
-      outcome.checkpoints.at(-1)!,
-      'additive-process-fresh-repair-child',
-    )).resolves.toBeDefined()
+    await expect(restoreSelected(machine)).resolves.toBeDefined()
   })
 
   it('preserves paid receipt usage through a permanent resource classification', async () => {
@@ -590,7 +574,7 @@ describe('audit0 sanitized edge contracts', () => {
     })
 
     const release = await sealReleasePackage(audit0PackageBody)
-    const machine = await RunMachine.create(audit0Definition, release.digest, 'resource-usage-custody')
+    const machine = await createControlledMachine(audit0Definition, release.digest, 'resource-usage-custody')
     const input = {
       definition: audit0Definition,
       machine,
@@ -646,7 +630,7 @@ describe('audit0 sanitized edge contracts', () => {
         protocol: { ...result.protocol, dispositionReferences: references, reviewDecisions: submission.decisions.map(({ observationId, action, finalDisposition, finalReference, rationale }) => ({ observationId, action, finalDisposition, finalReference, rationale })) },
       }
     })
-    const { outcome } = await run('review-dissent-union', provider)
+    const { outcome, machine } = await run('review-dissent-union', provider)
     const union = outcome.state.artifacts.find(value => value.taskId === 'negative-review-union')
     expect(union?.protocol.decisionDissentObservationIds).toHaveLength(1)
     expect(union?.protocol.dispositionReferences).toEqual(expect.arrayContaining(['C-1', 'U-9']))

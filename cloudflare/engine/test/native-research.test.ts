@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { validateDismissalResearch } from '../src/native-research.js'
+import { searchCitationIssues, validateDismissalResearch } from '../src/native-research.js'
 import type { AgentResult, ProtocolMetadata } from '../src/contracts.js'
 import type { NativeSearchEvidence } from '../src/agent-execution-receipt.js'
 
@@ -114,4 +114,54 @@ it.each(['codex-exa', 'dsh-json', 'claude-json'] as const)('classifies %s repair
     const foreign = validateDismissalResearch(output, [{ sessionId: 'foreign', nativeSearchEvidence: proof }])
     expect(foreign[0]).toContain('no successful native search queries recorded in this session')
   }
+})
+
+describe('citation matching after normalization (E5)', () => {
+  const sent = '"ERC4626 inflation attack"  first depositor'
+  const proof = (queries: string[]): NativeSearchEvidence => ({ ...evidence, completed: [{ ...evidence.completed[0]!, queries }] })
+  const cite = (citation: string, recorded = [sent]) => validateDismissalResearch(result(queried(protocols[1], [citation]), proof(recorded)))
+  it.each([
+    sent,
+    '"ERC4626 inflation attack" first depositor',
+    'ERC4626 inflation attack first depositor',
+    '“ERC4626 inflation attack” first depositor',
+    '"erc4626 inflation attack"  first depositor',
+    '"ERC4626 inflation attack"  first depositor.',
+    '`ERC4626 inflation attack first depositor?`',
+    'ＥＲＣ４６２６ inflation attack first depositor!',
+  ])('accepts %j for the query that was sent', citation => {
+    expect(cite(citation)).toEqual([])
+  })
+  it('normalizes the recorded query the same way', () => {
+    expect(cite('how can a vault share price be inflated', ['How can a vault share price be inflated?'])).toEqual([])
+  })
+  it('still rejects a different query and lists the recorded queries exactly as sent', () => {
+    const issues = cite('ERC4626 donation attack first depositor')
+    expect(issues).toHaveLength(2)
+    expect(issues[0]).toContain('native search citation mismatch')
+    expect(issues[1]).toContain(JSON.stringify([sent]))
+    expect(cite('ERC4626 inflation attack first depositors')).toHaveLength(2)
+    expect(cite('ERC4626 inflation attack first depositor..')).toHaveLength(2)
+  })
+})
+
+describe('the citation check shared with ack3-submit (S26)', () => {
+  it('gives exactly the Worker\'s issues from the session\'s recorded queries and failure count', () => {
+    const failure = { ...evidence, completed: [], failed: 1 }
+    const second = { ...evidence, completed: [...evidence.completed, { ...evidence.completed[0]!, callId: 'call-2', queries: [' Second  query '] }] }
+    const leads = [{ research: { leadChecks: [{ observationId: 'A1', conclusion: 'unresolved' }] } },
+      { challengeObservations: [{ id: 'A2', disposition: 'unresolved' }] }]
+    for (const requirement of ['leads', 'narrowing', 'dismissals', 'recon'] as const) {
+      for (const protocol of [...protocols, ...leads, 'recon']) {
+        for (const citations of [undefined, [query], ['unexecuted query'], ['second query.']]) {
+          for (const proof of [undefined, evidence, failure, second]) {
+            const output = result(protocol === 'recon' ? { recon: citations === undefined ? {} : { researchQueries: citations } }
+              : citations === undefined ? protocol : queried(protocol, citations), proof)
+            expect(searchCitationIssues(output.protocol, proof?.completed.flatMap(entry => entry.queries ?? []) ?? [],
+              (proof?.failed ?? 0) > 0, requirement)).toEqual(validateDismissalResearch(output, [], requirement))
+          }
+        }
+      }
+    }
+  })
 })

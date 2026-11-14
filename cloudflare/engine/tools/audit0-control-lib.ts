@@ -1,11 +1,11 @@
+import { parseRunCommand } from '../src/run-commands.js'
 const runIdPattern = /^[a-z0-9][a-z0-9._-]{0,99}$/
-const digestPattern = /^[0-9a-f]{64}$/
 
 export interface Audit0Request {
   method: 'GET' | 'POST'
   path: string
   body?: unknown
-  timingField?: 'dispatchMs' | 'resumeDispatchMs'
+  timingField?: 'dispatchMs'
 }
 
 function runId(value: string | undefined, label: string): string {
@@ -30,40 +30,19 @@ export function audit0Request(
     if (args.length !== 1) throw new Error('usage: audit0 status RUN_ID')
     return { method: 'GET', path: `/v1/runs/${id}` }
   }
-  if (command === 'stop') {
-    const id = runId(args[0], 'run ID')
-    if (args.length !== 1) throw new Error('usage: audit0 stop RUN_ID')
-    return { method: 'POST', path: `/v1/runs/${id}/stop` }
+  if (command === 'control') {
+    const id = runId(args[0], 'audit ID')
+    if (args.length !== 2) throw new Error('usage: audit0 control AUDIT_ID COMMAND_JSON')
+    return { method: 'POST', path: `/v1/experiments/${experimentPath}/audits/${id}/commands`,
+      body: parseRunCommand(JSON.parse(args[1]!)) }
   }
-  if (command === 'resume') {
-    const childRunId = runId(args[0], 'child run ID')
-    const checkpointDigest = args[1] ?? ''
-    if (args.length !== 2 || !digestPattern.test(checkpointDigest)) {
-      throw new Error('usage: audit0 resume FRESH_CHILD_RUN_ID CHECKPOINT_SHA256')
-    }
-    return {
-      method: 'POST',
-      path: `/v1/experiments/${experimentPath}/resumes`,
-      body: { childRunId, checkpointDigest },
-      timingField: 'resumeDispatchMs',
-    }
+  if (command === 'controls') {
+    const id = runId(args[0], 'audit ID')
+    if (args.length < 1 || args.length > 2) throw new Error('usage: audit0 controls AUDIT_ID [COMMAND_ID]')
+    const suffix = args[1] === undefined ? '' : `/${runId(args[1], 'command ID')}`
+    return { method: 'GET', path: `/v1/experiments/${experimentPath}/audits/${id}/commands${suffix}` }
   }
-  if (command === 'resume-revalidate') {
-    const childRunId = runId(args[0], 'child run ID')
-    const checkpointDigest = args[1] ?? ''
-    const sourceRunId = runId(args[2], 'source run ID')
-    const outputDigest = args[3] ?? ''
-    if (args.length !== 4 || !digestPattern.test(checkpointDigest) || !digestPattern.test(outputDigest)) {
-      throw new Error('usage: audit0 resume-revalidate FRESH_CHILD_RUN_ID CHECKPOINT_SHA256 FAILED_SOURCE_RUN_ID OUTPUT_SHA256')
-    }
-    return {
-      method: 'POST',
-      path: `/v1/experiments/${experimentPath}/resumes`,
-      body: { childRunId, checkpointDigest, revalidate: { sourceRunId, outputDigest } },
-      timingField: 'resumeDispatchMs',
-    }
-  }
-  throw new Error('usage: audit0 start|status|stop|resume|resume-revalidate ...')
+  throw new Error('usage: audit0 start|status|control|controls ...')
 }
 
 export function operationLatency(field: string, providerMs: unknown, endToEndMs: number): {
@@ -75,6 +54,12 @@ export function operationLatency(field: string, providerMs: unknown, endToEndMs:
   if (!Number.isFinite(endToEndMs) || endToEndMs < 0) throw new Error('end-to-end timing is invalid')
   const latencyTargetMs = 1_000
   return { endToEndMs, latencyTargetMs, latencyTargetMet: providerMs < latencyTargetMs && endToEndMs < latencyTargetMs }
+}
+
+/** A pending dispatch is accepted; the coordinator delivers it later, so it has no dispatch timing yet. */
+export function withOperationLatency(field: string, result: Record<string, unknown>, endToEndMs: number): Record<string, unknown> {
+  if (result.dispatchPending === true) return { ...result, endToEndMs }
+  return { ...result, ...operationLatency(field, result[field], endToEndMs) }
 }
 
 export function summarizeStatus(payload: unknown): unknown {
@@ -89,13 +74,10 @@ export function summarizeStatus(payload: unknown): unknown {
     runId: state.runId,
     status: state.status,
     cursor: state.cursor,
-    recoveryEpoch: state.recoveryEpoch,
-    parentRunId: state.parentRunId,
-    parentCheckpointDigest: state.parentCheckpointDigest,
+    stateGeneration: state.stateGeneration,
+    controls: state.controls,
+    forkOrigin: state.forkOrigin,
     modelStartedAt: state.modelStartedAt,
-    timeAmendments: Array.isArray(state.journal) ? state.journal
-      .filter(event => (event as { type?: unknown }).type === 'run.time-amended')
-      .map(event => (event as { payload?: unknown }).payload) : [],
     checkpoints: checkpoints.map(checkpoint => {
       const item = checkpoint as { digest?: unknown, body?: Record<string, unknown> }
       return { digest: item.digest, cursor: item.body?.cursor, sealedAt: item.body?.sealedAt }
@@ -107,7 +89,9 @@ export function summarizeStatus(payload: unknown): unknown {
     recentRejections: rejected.slice(-5).map(attempt => {
       const item = attempt as Record<string, unknown>
       return { taskId: item.taskId, attempt: item.attempt, formatRepairOrdinal: item.formatRepairOrdinal,
-        rejectedAt: item.rejectedAt, diagnostics: item.diagnostics }
+        rejectedAt: item.rejectedAt, diagnostics: item.diagnostics,
+        // A provider outage: the next launch waits until rejectedAt + delayMs (P2-06).
+        ...(item.providerBackoff === undefined ? {} : { providerBackoff: item.providerBackoff }) }
     }),
     terminalReason: state.terminalReason,
     updatedAt: state.updatedAt,

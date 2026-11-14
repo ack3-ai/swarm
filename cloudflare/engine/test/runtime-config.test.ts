@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -67,13 +67,19 @@ describe('runtime release deployment config', () => {
       preview_urls: false,
       vars: { ENGINE_ROLE: 'runtime', ACK3_CLOUDFLARE_ACCOUNT_ID: 'e'.repeat(32) },
       version_metadata: { binding: 'VERSION_METADATA' },
-      durable_objects: { bindings: [{ name: 'AGENT_SANDBOX', class_name: 'AgentSandbox' }] },
+      durable_objects: { bindings: [
+        { name: 'AGENT_SANDBOX', class_name: 'AgentSandbox' },
+        { name: 'COORDINATORS', class_name: 'ExperimentCoordinator' },
+      ] },
     })
     expect(config.migrations).toEqual([
       { tag: 'v1', new_sqlite_classes: ['Sandbox'] },
       { tag: 'v2', new_sqlite_classes: ['AgentSandbox'] },
+      { tag: 'v3', new_sqlite_classes: ['ExperimentCoordinator'] },
     ])
-    expect(config.durable_objects.bindings).toHaveLength(1)
+    expect(config.durable_objects.bindings).toHaveLength(2)
+    expect(config.durable_objects.bindings.every((binding: { script_name?: string }) => binding.script_name === undefined)).toBe(true)
+    expect(config.services).toBeUndefined()
     expect(config.secrets.required).toEqual([])
     expect(config.r2_buckets).toEqual([
       { binding: 'PACKAGES', bucket_name: 'swarm-experiment-packages' },
@@ -154,6 +160,40 @@ describe('runtime release deployment config', () => {
         cwd: engine, env: environment(workersPath, invalid), stdio: 'pipe',
       })).toThrow()
     }
+  })
+
+  it('refuses a runtime config that would give the Worker a public address', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ack3-runtime-public-'))
+    roots.push(root)
+    mkdirSync(join(root, 'tools'))
+    for (const tool of ['render-runtime-config.mjs', 'deployment-options.mjs']) {
+      copyFileSync(join(engine, 'tools', tool), join(root, 'tools', tool))
+    }
+    const base = JSON.parse(readFileSync(join(engine, 'wrangler.jsonc'), 'utf8'))
+    const declarationPath = join(root, 'runtime.json')
+    const workersPath = join(root, 'workers.json')
+    writeFileSync(declarationPath, JSON.stringify({
+      schemaVersion: 1, id: 'runtime-a', frameworkCommit: 'a'.repeat(40),
+      workerService: 'swarm-runtime-a', workflowName: 'ack3-audit-workflow-a',
+      containerImageDigest: `sha256:${'b'.repeat(64)}`,
+    }))
+    writeFileSync(workersPath, JSON.stringify({ 'runtime-a': 'swarm-runtime-a' }))
+    const render = (overrides: Record<string, unknown>) => {
+      const config = { ...base, ...overrides }
+      for (const [key, value] of Object.entries(overrides)) if (value === undefined) delete config[key]
+      writeFileSync(join(root, 'wrangler.jsonc'), JSON.stringify(config))
+      return () => execFileSync('node', ['tools/render-runtime-config.mjs', declarationPath], {
+        cwd: root, env: environment(workersPath), stdio: 'pipe',
+      })
+    }
+    for (const overrides of [{ workers_dev: true }, { preview_urls: true },
+      { workers_dev: undefined }, { preview_urls: undefined }]) {
+      expect(render(overrides)).toThrow(/workers_dev and preview_urls must be false/)
+      expect(existsSync(join(root, 'wrangler.runtime.runtime-a.jsonc'))).toBe(false)
+    }
+    render({})()
+    expect(JSON.parse(readFileSync(join(root, 'wrangler.runtime.runtime-a.jsonc'), 'utf8')))
+      .toMatchObject({ workers_dev: false, preview_urls: false })
   })
 
   it('requires official Secrets Store credentials without a local runtime secrets file', () => {
@@ -247,6 +287,9 @@ describe('runtime release deployment config', () => {
     const config = JSON.parse(readFileSync(deployOutput, 'utf8'))
     expect(config.workers_dev).toBe(true)
     expect(config.preview_urls).toBe(false)
+    expect(config.secrets_store_secrets).toEqual([{ binding: 'CLOUDFLARE_OBSERVABILITY_TOKEN',
+      store_id: 'c'.repeat(32), secret_name: 'swarm-cloudflare-observability-token' }])
+    expect(config.vars.ACK3_CLOUDFLARE_ACCOUNT_ID).toBe('e'.repeat(32))
     expect(config.vars).toMatchObject({
       ENGINE_ROLE: 'front-door',
       DASHBOARD_ACCESS_ISSUER: 'https://example-team.cloudflareaccess.com',

@@ -42,6 +42,14 @@ export function validCodexAccessProgram(backend, program) {
     || (backend === 'codex' && typeof program === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(program))
 }
 
+// Claude subscription accounts in use order: the pool's credentialSource, then its fallbacks.
+// The runner passes the active token as CLAUDE_CODE_OAUTH_TOKEN, so no fallback may use that name.
+export function validClaudeAccounts(names) {
+  return Array.isArray(names) && names.length >= 2 && names.length <= 8
+    && names.every(name => typeof name === 'string' && /^CLAUDE_[A-Z0-9_]*OAUTH_TOKEN$/.test(name))
+    && new Set(names).size === names.length && !names.slice(1).includes('CLAUDE_CODE_OAUTH_TOKEN')
+}
+
 export function modelHeaderCredentialNames(connection) {
   const headers = connection?.headersEnv
   if (headers === undefined) return []
@@ -188,7 +196,8 @@ export function renderDshReasoningPatch(input) {
   ].join('\n')
 }
 
-export const exaMcpUrl = 'https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa'
+// Advanced search adds domain and date filters and subpage crawling; it counts as a search.
+export const exaMcpUrl = 'https://mcp.exa.ai/mcp?tools=web_search_exa,web_search_advanced_exa,web_fetch_exa'
 
 /** Operational attribution only: never include target details, prompts or run identifiers. */
 export function exaSourceLabel(attribution) {

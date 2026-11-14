@@ -55,9 +55,8 @@ async function setup(captured = false, chunks = 1, scope = { stage, wave, task }
     }),
     get: vi.fn(async (key: string) => objects.get(key) ?? null),
   } as any
-  const store = { getState: vi.fn(async () => state('root')) }
-  const input = { state: state('child', 'root'), definition: { stages: definition.stages, historical: definition },
-    stage, wave, task, bucket, store, attempt: null, offset: 0 }
+  const input = { state: state('root'), definition: { stages: definition.stages, historical: definition },
+    stage, wave, task, bucket, attempt: null, offset: 0 }
   return { input, objects, prefix, put, prompt, promptDigest }
 }
 
@@ -117,11 +116,11 @@ describe('private agent prompt and log reader', () => {
     expect(page2.logs.events.map(event => event.text)).toEqual(['completion'])
   })
 
-  it('recovers original prompt from the real parent only when its recorded digest matches; labels historical gaps', async () => {
+  it('reconstructs the current prompt only when its recorded digest matches', async () => {
     const { input, prompt } = await setup()
     const result = await readDashboardAgent(input)
     expect(result.sourceRunId).toBe('root')
-    expect(result.filesystem).toMatchObject({ sourceRunId: 'root', allocationId: `root/${task.workspaceKey}`, usage: 'unknown' })
+    expect(result.filesystem).toMatchObject({ sourceRunId: 'root', allocationId: null, usage: 'unknown' })
     expect(result.prompt).toMatchObject({ status: 'verified-reconstruction', text: prompt })
     expect(result.logs).toMatchObject({ mode: 'stderr-tail-only', complete: true, truncated: true,
       events: [{ at: null, stream: 'stderr', text: 'legacy stderr tail' }] })
@@ -129,6 +128,46 @@ describe('private agent prompt and log reader', () => {
     changed.policy.outcome += ' A later edit.'
     expect((await readDashboardAgent({ ...input, definition: { stages: definition.stages, historical: changed } })).prompt)
       .toMatchObject({ text: null, status: 'unavailable' })
+  })
+
+  it('keeps a pinned fork source separate from this runtime’s agent transcript', async () => {
+    const { input, put } = await setup(true)
+    const otherDigest = 'b'.repeat(64)
+    const otherPrompt = 'Recorded prompt from the earlier model'
+    await put(`monitor/agent-executions/root/${task.id}/${otherDigest}/request.json`, {
+      schemaVersion: 1, runId: 'root', requestDigest: otherDigest, stageId: stage.id, waveId: wave.id,
+      taskId: task.id, prompt: otherPrompt, promptDigest: await sha256(otherPrompt),
+      model: 'earlier-model', provider: providerIdentity(task), attempt: 2,
+      startedAt: '2026-09-26T01:00:00Z', startedAtBasis: 'execution-admission',
+    }, { requestDigest: otherDigest })
+    const source = { ...state('root'), stateGeneration: 7 }
+    const pointer = { generation: 7, digest: await sha256(source) }
+    const forked = { ...state('child', null), forkOrigin: { source: { runId: 'root', state: pointer } } } as RunState
+    const result = await readDashboardAgent({ ...input, state: forked })
+    expect(result).toMatchObject({ sourceReference: { runId: 'root', state: pointer },
+      sourceRunId: null, selectedModel: null, prompt: { status: 'unavailable', text: null } })
+    expect(result.attempts).toEqual([])
+  })
+
+  it('shows the exact source reference without traversing the historical audit', async () => {
+    const { input } = await setup()
+    const sourceChild = { ...state('source-child', 'source-root'), rootRunId: 'source-root', stateGeneration: 4 }
+    const pointer = { generation: 4, digest: await sha256(sourceChild) }
+    const fork = { ...state('new-audit', null), rootRunId: 'new-audit',
+      forkOrigin: { source: { runId: 'source-child', state: pointer } } } as RunState
+    const history = await dashboardHistory(fork, input.bucket)
+    expect(history.incomplete).toBe(false)
+    expect(history.runs.map(item => item.state.runId)).toEqual(['new-audit'])
+    expect(history.sourceReference).toEqual({ runId: 'source-child', state: pointer })
+  })
+
+  it('leaves historical replacement sessions to their owning app version', async () => {
+    const { input } = await setup()
+    const historical = { ...state('restart-execution', 'fork-root'), journal: [
+      { sequence: 1, type: 'run.executor-replaced', at: startedAt, previousDigest: null,
+        digest: 'a'.repeat(64), payload: {} },
+    ] } as unknown as RunState
+    await expect(dashboardHistory(historical, input.bucket)).rejects.toThrow('historical app version')
   })
 
   it('pages immutable captured chunks and accepts passive-capture cursor metadata without inventing output', async () => {
@@ -152,11 +191,10 @@ describe('private agent prompt and log reader', () => {
     await expect(readDashboardAgent(input)).rejects.toThrow('integrity mismatch')
   })
 
-  it('does not cross unrelated recovery roots and stops cyclic ancestry', async () => {
+  it('marks an unexpected parent as incomplete without reading another execution', async () => {
     const { input } = await setup()
-    input.store.getState.mockResolvedValueOnce({ ...state('root'), rootRunId: 'other' })
-    expect(await dashboardHistory(input.state, input.store, input.bucket)).toMatchObject({ incomplete: true, runs: [{ state: input.state }] })
-    input.store.getState.mockResolvedValue(state('root', 'root'))
-    expect((await dashboardHistory(input.state, input.store, input.bucket)).runs).toHaveLength(2)
+    const unexpected = state('child', 'root')
+    expect(await dashboardHistory(unexpected, input.bucket)).toMatchObject({ incomplete: true,
+      sourceReference: null, runs: [{ state: unexpected }] })
   })
 })

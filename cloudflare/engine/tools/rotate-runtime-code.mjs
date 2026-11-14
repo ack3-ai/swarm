@@ -26,6 +26,9 @@ export async function runtimeCodeUploadForm(bytes, settings, containers) {
     ['AUDIT_WORKFLOW', 'workflow'],
     ['RUNTIME_ISOLATION_WORKFLOW', 'workflow'],
   ]) assert.equal(named(name)?.type, type, `${name} binding is missing or changed`)
+  const coordinators = named('COORDINATORS')
+  assert.ok(coordinators?.type === 'durable_object_namespace' && coordinators.class_name === 'ExperimentCoordinator',
+    'COORDINATORS binding is missing or changed; publish the full runtime (binding and v3 migration) before code rotation')
   assert.match(named('ACK3_CLOUDFLARE_ACCOUNT_ID')?.text ?? '', /^[0-9a-f]{32}$/i,
     'ACK3_CLOUDFLARE_ACCOUNT_ID binding is missing; configure the reserved idle slot before code rotation')
   assert.ok(Array.isArray(containers) && containers.filter(item => item?.class_name === 'AgentSandbox').length === 1,
@@ -114,43 +117,16 @@ export async function rotateRuntimeCode({ intentFile, expectedCommit, expectedIm
   const deadlineMs = deadline === undefined ? undefined : Number(deadline)
   assert.ok(deadlineMs === undefined || (Number.isSafeInteger(deadlineMs) && deadlineMs > 0),
     'ACK3_DEPLOY_DEADLINE_MS must be a positive integer when set')
-  const fileRecord = { at: new Date().toISOString(), intent, expectedCommit, expectedImage,
-    phase: 'lock-request', outcome: 'unknown',
-    note: 'Never reupload on an uncertain result; reconcile this exact intent.' }
-  saveIntent(intentFile, fileRecord, true)
-  const locked = await requestJson(`${base}/v1/runtime-slots/rotations`, control, {
-    method: 'POST', body: JSON.stringify({ intent }),
-  })
-  assert.equal(locked.slotId, locked.runtimeRelease?.id)
-  fileRecord.locked = locked
-  fileRecord.phase = 'before-upload'
-  saveIntent(intentFile, fileRecord)
-  assert.equal(locked.runtimeRelease.containerImageDigest, expectedImage,
-    'oldest idle slot needs one-time image normalization; lock must be reconciled')
-  const service = locked.runtimeRelease.workerService
-  const script = `https://api.cloudflare.com/client/v4/accounts/${account}/workers/scripts/${service}`
-  const settingsResponse = await requestJson(`${script}/settings`, cloudflareToken)
-  assert(settingsResponse.success && settingsResponse.result)
-  const settings = settingsResponse.result
-  const declared = JSON.parse(settings.bindings.find(item => item.name === 'RUNTIME_RELEASE_JSON')?.text)
-  for (const field of ['id', 'workerService', 'workflowName', 'containerImageDigest']) {
-    assert.equal(declared[field], locked.runtimeRelease[field], `slot binding changed: ${field}`)
-  }
-  const priorObserved = await requestJson(`${base}/v1/runtime-slots/${locked.slotId}/identity`, control)
-  assert.deepEqual(priorObserved, locked.runtimeRelease,
-    'native slot identity changed before publication')
-  const priorVersion = await requestJson(`${script}/versions/${priorObserved.workerVersionId}`, cloudflareToken)
-  assert.ok(priorVersion.success && priorVersion.result)
-  assert.equal(normalizedVersion(priorVersion.result.id), priorObserved.workerVersionId)
-  const containers = priorVersion.result.resources?.script_runtime?.containers
   const dir = mkdtempSync(join(tmpdir(), 'ack3-runtime-rotation-'))
   let uploadAttempted = false
   try {
+    // Build and check before taking the slot lock, so a failure leaves nothing to reconcile.
+    // The build name is a placeholder: the upload keeps only the modules and the slot's own settings.
     const baseConfig = JSON.parse(readFileSync(join(engine, 'wrangler.jsonc'), 'utf8'))
     const buildConfig = join(dir, 'wrangler.json')
     const outfile = join(dir, 'worker.multipart')
     writeFileSync(buildConfig, JSON.stringify({
-      name: service, main: join(engine, 'src/worker.ts'), rules: baseConfig.rules,
+      name: 'swarm-runtime-code-build', main: join(engine, 'src/worker.ts'), rules: baseConfig.rules,
       compatibility_date: baseConfig.compatibility_date,
       compatibility_flags: baseConfig.compatibility_flags,
       define: { __ACK3_RUNTIME_BUILD_COMMIT_SHA__: JSON.stringify(expectedCommit) },
@@ -164,8 +140,37 @@ export async function rotateRuntimeCode({ intentFile, expectedCommit, expectedIm
       cwd: engine, encoding: 'utf8', maxBuffer: 2 * 1024 * 1024,
     }))
     for (const item of checks) if (item.error || item.status !== 0) {
-      throw new Error('bundle build or focused check failed; rotation lock remains until reconciled')
+      throw new Error('bundle build or focused check failed; no slot was locked')
     }
+    const fileRecord = { at: new Date().toISOString(), intent, expectedCommit, expectedImage,
+      phase: 'lock-request', outcome: 'unknown',
+      note: 'Never reupload on an uncertain result; reconcile this exact intent.' }
+    saveIntent(intentFile, fileRecord, true)
+    const locked = await requestJson(`${base}/v1/runtime-slots/rotations`, control, {
+      method: 'POST', body: JSON.stringify({ intent }),
+    })
+    assert.equal(locked.slotId, locked.runtimeRelease?.id)
+    fileRecord.locked = locked
+    fileRecord.phase = 'before-upload'
+    saveIntent(intentFile, fileRecord)
+    assert.equal(locked.runtimeRelease.containerImageDigest, expectedImage,
+      'oldest idle slot needs one-time image normalization; lock must be reconciled')
+    const service = locked.runtimeRelease.workerService
+    const script = `https://api.cloudflare.com/client/v4/accounts/${account}/workers/scripts/${service}`
+    const settingsResponse = await requestJson(`${script}/settings`, cloudflareToken)
+    assert(settingsResponse.success && settingsResponse.result)
+    const settings = settingsResponse.result
+    const declared = JSON.parse(settings.bindings.find(item => item.name === 'RUNTIME_RELEASE_JSON')?.text)
+    for (const field of ['id', 'workerService', 'workflowName', 'containerImageDigest']) {
+      assert.equal(declared[field], locked.runtimeRelease[field], `slot binding changed: ${field}`)
+    }
+    const priorObserved = await requestJson(`${base}/v1/runtime-slots/${locked.slotId}/identity`, control)
+    assert.deepEqual(priorObserved, locked.runtimeRelease,
+      'native slot identity changed before publication')
+    const priorVersion = await requestJson(`${script}/versions/${priorObserved.workerVersionId}`, cloudflareToken)
+    assert.ok(priorVersion.success && priorVersion.result)
+    assert.equal(normalizedVersion(priorVersion.result.id), priorObserved.workerVersionId)
+    const containers = priorVersion.result.resources?.script_runtime?.containers
     const form = await runtimeCodeUploadForm(readFileSync(outfile), settings, containers)
     // Persist the uncertain phase before the only PUT. A crash after this
     // write must never permit an automatic second upload or cancellation.

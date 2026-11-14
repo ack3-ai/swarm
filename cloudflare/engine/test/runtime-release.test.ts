@@ -1,3 +1,5 @@
+import { createControlledMachine } from './support/controlled-machine.js'
+import { restoreSelected } from './support/selected-snapshots.js'
 import { describe, expect, it, vi } from 'vitest'
 import type { RuntimeRelease } from '../src/contracts.js'
 import { RunMachine, runNextWave, sealReleasePackage } from '../src/index.js'
@@ -162,9 +164,9 @@ describe('immutable runtime release routing', () => {
     })).toThrow('latest release must exist')
   })
 
-  it('seals the exact runtime into checkpoints and preserves it on resume', async () => {
+  it('seals the exact runtime into checkpoints and preserves it on state restoration', async () => {
     const sealed = await sealReleasePackage(audit0PackageBody)
-    const machine = await RunMachine.create(
+    const machine = await createControlledMachine(
       audit0Definition, sealed.digest, 'runtime-bound-root', new Date().toISOString(), release,
     )
     const checkpoint = await runNextWave({
@@ -174,38 +176,12 @@ describe('immutable runtime release routing', () => {
       artifactStore: new MemoryArtifactStore(),
     })
     expect(checkpoint?.body.runtimeRelease).toEqual(release)
-    const child = await RunMachine.resume(
-      audit0Definition, checkpoint!, 'runtime-bound-child', new Set(), new Date().toISOString(), undefined, release,
-    )
+    const child = await restoreSelected(machine)
     expect(child.snapshot().runtimeRelease).toEqual(release)
-    await expect(RunMachine.resume(
-      audit0Definition,
-      checkpoint!,
-      'runtime-mismatch-child',
-      new Set(),
-      new Date().toISOString(),
-      undefined,
-      { ...release, workerVersionId: '22222222-2222-4222-8222-222222222222' },
-    )).rejects.toThrow('resume runtime release mismatch')
+
   })
 
-  it('binds a legacy checkpoint to the explicit migration runtime on first resume', async () => {
-    const sealed = await sealReleasePackage(audit0PackageBody)
-    const machine = await RunMachine.create(audit0Definition, sealed.digest, 'legacy-runtime-root')
-    const checkpoint = await runNextWave({
-      definition: audit0Definition,
-      machine,
-      provider: new DeterministicAuditProvider(),
-      artifactStore: new MemoryArtifactStore(),
-    })
-    expect(checkpoint?.body.runtimeRelease).toBeUndefined()
-    const child = await RunMachine.resume(
-      audit0Definition, checkpoint!, 'legacy-runtime-child', new Set(), new Date().toISOString(), undefined, release,
-    )
-    expect(child.snapshot().runtimeRelease).toEqual(release)
-  })
-
-  it('keeps A routable after latest advances to B and binds a child back to A', async () => {
+  it('keeps A routable after latest advances to B and restores its pinned runtime', async () => {
     const declarationB = {
       ...declaration,
       id: 'runtime-b',
@@ -256,7 +232,7 @@ describe('immutable runtime release routing', () => {
     ]))
 
     const sealed = await sealReleasePackage(audit0PackageBody)
-    const root = await RunMachine.create(
+    const root = await createControlledMachine(
       audit0Definition, sealed.digest, 'a-root', new Date().toISOString(), release,
     )
     const checkpoint = await runNextWave({
@@ -265,10 +241,8 @@ describe('immutable runtime release routing', () => {
       provider: new DeterministicAuditProvider(),
       artifactStore: new MemoryArtifactStore(),
     })
-    const child = await RunMachine.resume(
-      audit0Definition, checkpoint!, 'a-child', new Set(), new Date().toISOString(), undefined,
-      await router.resolve(checkpoint!.body.runtimeRelease!.id),
-    )
+    expect(await router.resolve(checkpoint!.body.runtimeRelease!.id)).toEqual(release)
+    const child = await restoreSelected(root)
     expect(child.snapshot().runtimeRelease).toEqual(release)
   })
 })

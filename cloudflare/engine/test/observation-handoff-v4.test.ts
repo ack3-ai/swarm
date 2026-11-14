@@ -1,3 +1,4 @@
+import { createControlledMachine } from './support/controlled-machine.js'
 import { describe, expect, it } from 'vitest'
 import manifest from './fixtures/audit0-hello-vault.json' with { type: 'json' }
 import { compileExperimentConfig } from './support/compile-config.js'
@@ -86,7 +87,7 @@ describe('observation-level verification and report handoff', () => {
 })
 
 it('completes the ordinary v4 runner handoff and seal without model or network calls', async () => {
-  const machine = await RunMachine.create(definition, 'a'.repeat(64), 'observation-handoff-v4')
+  const machine = await createControlledMachine(definition, 'a'.repeat(64), 'observation-handoff-v4')
   const result = await runExperiment({ definition, machine, provider: new DeterministicAuditProvider(), artifactStore: new MemoryArtifactStore() })
   expect(result.state.status).toBe('completed')
   const verifier = result.state.artifacts.find(item => item.taskId === 'verifier')!

@@ -1,9 +1,9 @@
-import { modelHeaderCredentialNames } from '../container/reasoning-config.mjs'
-import type { ExperimentDefinition } from './contracts.js'
+import { modelHeaderCredentialNames, validClaudeAccounts } from '../container/reasoning-config.mjs'
+import type { ExperimentDefinition, TaskDefinition } from './contracts.js'
 import type { Env } from './env.js'
 import { taskBackend } from './provider-identity.js'
 import { PermanentRunFailure, TransientRunFailure } from './run-errors.js'
-import { subscriptionCredentialSource, codexWorkspaceId } from './subscription-credentials.js'
+import { claudeAccountBindings, subscriptionCredentialSource, codexWorkspaceId } from './subscription-credentials.js'
 
 /** Runtime secrets may be direct Worker secrets or official Secrets Store bindings. */
 export async function resolveCredentialBinding(env: Record<string, unknown>, name: string): Promise<string | null> {
@@ -18,17 +18,23 @@ export async function resolveCredentialBinding(env: Record<string, unknown>, nam
   return typeof value === 'string' && value.trim() !== '' ? value : null
 }
 
-/** Check every sealed lane before a Workflow can admit paid model work. */
+/** Check the selected sealed tasks before a Workflow can admit paid model work. */
 export async function assertReleaseProviderCredentials(
   definition: ExperimentDefinition,
   env: Pick<Env, 'ACK3_CODEX_AUTH_JSON' | 'ACK3_CODEX_WORKSPACE_ID'> & Record<string, unknown>,
+  tasks: readonly TaskDefinition[] = definition.stages.flatMap(stage => stage.waves.flatMap(wave => wave.tasks)),
 ): Promise<void> {
-  const present = async (name: string): Promise<boolean> => (await resolveCredentialBinding(env, name)) !== null
-  const tasks = definition.stages.flatMap(stage => stage.waves.flatMap(wave => wave.tasks))
+  const reads = new Map<string, Promise<string | null>>()
+  const read = (name: string) => {
+    let pending = reads.get(name)
+    if (pending === undefined) { pending = resolveCredentialBinding(env, name); reads.set(name, pending) }
+    return pending
+  }
+  const present = async (name: string): Promise<boolean> => (await read(name)) !== null
   for (const task of tasks) {
     if (taskBackend(task) === 'codex') {
       const source = subscriptionCredentialSource(task)!
-      const auth = await resolveCredentialBinding(env, source)
+      const auth = await read(source)
       if (!auth || (task.credentialSource === undefined && !(await present('ACK3_CODEX_WORKSPACE_ID')))) {
         throw new PermanentRunFailure('core provider credentials are missing', 'missing-credentials')
       }
@@ -37,11 +43,15 @@ export async function assertReleaseProviderCredentials(
       continue
     }
     if (taskBackend(task) === 'claude') {
-      if (!/^CLAUDE_[A-Z0-9_]*OAUTH_TOKEN$/.test(task.credentialSource ?? '')) {
+      if (!/^CLAUDE_[A-Z0-9_]*OAUTH_TOKEN$/.test(task.credentialSource ?? '')
+        || (task.fallbackCredentialSources !== undefined && !validClaudeAccounts(claudeAccountBindings(task)))) {
         throw new PermanentRunFailure('Claude subscription binding is invalid', 'invalid-configuration')
       }
-      if (!(await resolveCredentialBinding(env, task.credentialSource!))?.startsWith('sk-ant-oat')) {
-        throw new PermanentRunFailure('Claude subscription token is missing or invalid', 'missing-credentials')
+      // Every fallback account is checked like the primary, so a switch never finds a missing token.
+      for (const name of claudeAccountBindings(task)) {
+        if (!(await read(name))?.startsWith('sk-ant-oat')) {
+          throw new PermanentRunFailure(`Claude subscription token ${name} is missing or invalid`, 'missing-credentials')
+        }
       }
       continue
     }
@@ -58,7 +68,8 @@ export async function assertReleaseProviderCredentials(
       if (!(await present(name))) throw new PermanentRunFailure(`model header credential ${name} is missing`, 'missing-credentials')
     }
   }
-  if (definition.forceSearch?.enabled === true || definition.nativeSearch?.enabled === true) {
+  if (tasks.some(task => taskBackend(task) !== 'deterministic')
+    && (definition.forceSearch?.enabled === true || definition.nativeSearch?.enabled === true)) {
     const connection = definition.nativeSearch?.searchConnection
     if (definition.nativeSearch?.enabled !== true || connection?.provider !== 'exa'
       || !/^[A-Z][A-Z0-9_]{0,119}_API_KEY$/.test(connection.apiKeyEnv)) {

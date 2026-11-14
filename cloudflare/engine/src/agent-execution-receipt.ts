@@ -1,7 +1,10 @@
 import { canonicalJson, sha256 } from './canonical.js'
 import type { AgentRequest } from './contracts.js'
 import { receiptMonitoringMetadata } from './dashboard-receipts.js'
-import { validSubscriptionLimits, validSubscriptionWaits, type SubscriptionLimits, type SubscriptionWait } from '../container/subscription-limits.mjs'
+import {
+  validSubscriptionLimits, validSubscriptionSwitches, validSubscriptionWaits,
+  type SubscriptionLimits, type SubscriptionSwitch, type SubscriptionWait,
+} from '../container/subscription-limits.mjs'
 
 export interface AgentExecutionReceipt {
   requestDigest: string
@@ -23,7 +26,15 @@ export interface AgentExecutionReceipt {
   nativeSearchEvidence?: NativeSearchEvidence
   subscriptionLimits?: SubscriptionLimits
   subscriptionWaits?: readonly SubscriptionWait[]
+  /** Written by a runner with Claude account rotation; checked against the task by the Worker's output validation. */
+  subscriptionSwitches?: readonly SubscriptionSwitch[]
+  /** Checked by the Worker's output validation, not here: a malformed report is an integrity issue. */
+  submitCheck?: import('./submission-check.js').SubmitCheckReport
+  /** Output files in which the runner replaced a credential value, by binding name; absent when none. Checked like submitCheck. */
+  outputCredentials?: readonly OutputCredential[]
 }
+
+export interface OutputCredential { path: string, name: string }
 
 export interface NativeSearchEvidence {
   schemaVersion: 1
@@ -35,6 +46,9 @@ export interface NativeSearchEvidence {
   incomplete: number
 }
 
+/** Most entries per list and count. The runner keeps the most recent searches within it (E1). */
+export const NATIVE_SEARCH_EVIDENCE_MAX = 512
+
 export function validNativeSearchEvidence(value: NativeSearchEvidence | undefined): boolean {
   if (value === undefined) return true
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
@@ -42,15 +56,15 @@ export function validNativeSearchEvidence(value: NativeSearchEvidence | undefine
     && (value.source === 'codex-json'
       ? ['verified', 'missing', 'mismatch'].includes(value.journalStatus ?? '')
       : value.journalStatus === undefined)
-    && Array.isArray(value.completed) && value.completed.length <= 64
+    && Array.isArray(value.completed) && value.completed.length <= NATIVE_SEARCH_EVIDENCE_MAX
     && value.completed.every(item => item !== null && typeof item === 'object' && !Array.isArray(item)
       && typeof item.callId === 'string' && /^[a-zA-Z0-9._:-]{1,200}$/.test(item.callId)
       && (item.queries === undefined || (Array.isArray(item.queries) && item.queries.length > 0
         && item.queries.length <= 16 && item.queries.every((q: unknown) => typeof q === 'string' && q.trim().length > 0 && q.length <= 4000)))
       && /^[a-f0-9]{64}$/.test(item.queryDigest) && /^[a-f0-9]{64}$/.test(item.resultDigest))
     && new Set(value.completed.map(item => item.callId)).size === value.completed.length
-    && Number.isSafeInteger(value.failed) && value.failed >= 0 && value.failed <= 64
-    && Number.isSafeInteger(value.incomplete) && value.incomplete >= 0 && value.incomplete <= 64
+    && Number.isSafeInteger(value.failed) && value.failed >= 0 && value.failed <= NATIVE_SEARCH_EVIDENCE_MAX
+    && Number.isSafeInteger(value.incomplete) && value.incomplete >= 0 && value.incomplete <= NATIVE_SEARCH_EVIDENCE_MAX
 }
 
 export class AgentExecutionReceiptIntegrityError extends Error {
@@ -279,6 +293,7 @@ export function classifyAgentExecutionReceipt(
       || !validNativeSearchEvidence(value.nativeSearchEvidence)
       || !validSubscriptionLimits(value.subscriptionLimits)
       || !validSubscriptionWaits(value.subscriptionWaits)
+      || !validSubscriptionSwitches(value.subscriptionSwitches)
       || (value.providerRequests !== undefined
         && (!Array.isArray(value.providerRequests)
           || value.providerRequests.length > 2_000

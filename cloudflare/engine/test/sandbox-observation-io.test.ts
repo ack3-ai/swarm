@@ -1,9 +1,10 @@
-import { expect, it, vi } from 'vitest'
+import { admittedProviderRequest } from './support/admitted-provider-request.js'
+import { afterEach, expect, it, vi } from 'vitest'
 import { getAgentSandbox } from '../src/agent-sandbox-client.js'
 import { waitForAgentProcess } from '../src/agent-process.js'
 import { SandboxAgentProvider, agentProcessEnvironment, agentObservationIncidentMaxMs,
   terminalLogDrainMs } from '../src/sandbox-provider.js'
-import { expiredObservationCooldownMs } from '../src/agent-observation-cooldown.js'
+import { observationFailureSpacingMs } from '../src/agent-observation-health.js'
 import { AgentExecutionPending } from '../src/run-errors.js'
 
 vi.mock('../src/agent-sandbox-client.js', () => ({ getAgentSandbox: vi.fn() }))
@@ -16,6 +17,10 @@ vi.mock('../src/agent-process.js', () => ({
   }),
 }))
 
+const ownerReceipt = { initializeMutationOwner: async (owner: unknown) => ({ owner, objectId: 'a'.repeat(64) }) }
+const closeDatabases: (() => void)[] = []
+afterEach(() => closeDatabases.splice(0).forEach(close => close()))
+
 const request = {
   runId: 'receipt-run', experimentId: 'receipt-run', releaseDigest: 'release',
   prompt: 'synthetic', promptDigest: 'prompt', attempt: 1, freshContext: false,
@@ -27,6 +32,7 @@ const request = {
 
 it('bounds a sustained core observation outage without touching its admitted process', async () => {
   const provider = new SandboxAgentProvider({ ACK3_CODEX_WORKSPACE_ID: 'synthetic' } as any) as any
+  const request = await admittedProviderRequest(provider, close => closeDatabases.push(close))
   provider.assertProviderCredentials = () => {}
   let digest = ''
   provider.executionReceipts = { get: vi.fn(async (_run: string, requestDigest: string) => {
@@ -46,6 +52,7 @@ it('bounds a sustained core observation outage without touching its admitted pro
 
 it('prefers a late exact receipt over the core observation-outage boundary', async () => {
   const provider = new SandboxAgentProvider({ ACK3_CODEX_WORKSPACE_ID: 'synthetic' } as any) as any
+  const request = await admittedProviderRequest(provider, close => closeDatabases.push(close))
   provider.assertProviderCredentials = () => {}
   let digest = ''
   let reads = 0
@@ -65,6 +72,7 @@ it('prefers a late exact receipt over the core observation-outage boundary', asy
 
 it('does not turn an unreadable late receipt into an absent receipt', async () => {
   const provider = new SandboxAgentProvider({ ACK3_CODEX_WORKSPACE_ID: 'synthetic' } as any) as any
+  const request = await admittedProviderRequest(provider, close => closeDatabases.push(close))
   provider.assertProviderCredentials = () => {}
   let digest = ''
   let reads = 0
@@ -83,11 +91,12 @@ it('does not turn an unreadable late receipt into an absent receipt', async () =
 
 it('yields an admitted attempt when result-file observation hangs, with no late launch', async () => {
   const provider = new SandboxAgentProvider({ ACK3_CODEX_WORKSPACE_ID: 'synthetic' } as any) as any
+  const request = await admittedProviderRequest(provider, close => closeDatabases.push(close))
   provider.sandboxObservationMs = 20
   provider.executionReceipts = { get: async () => null }
   let resolveExists!: (value: { exists: boolean }) => void
   const exists = vi.fn(() => new Promise<{ exists: boolean }>(resolve => { resolveExists = resolve }))
-  const sandbox = { exists, getProcess: vi.fn(), mkdir: vi.fn(), startProcess: vi.fn() }
+  const sandbox = { ...ownerReceipt, exists, getProcess: vi.fn(), mkdir: vi.fn(), startProcess: vi.fn() }
   await expect(provider.runInSandbox(sandbox as any, request as any))
     .rejects.toBeInstanceOf(AgentExecutionPending)
   resolveExists({ exists: false })
@@ -100,11 +109,12 @@ it('yields an admitted attempt when result-file observation hangs, with no late 
 
 it('yields an admitted attempt when getProcess hangs, without interpreting it as missing', async () => {
   const provider = new SandboxAgentProvider({ ACK3_CODEX_WORKSPACE_ID: 'synthetic' } as any) as any
+  const request = await admittedProviderRequest(provider, close => closeDatabases.push(close))
   provider.sandboxObservationMs = 20
   provider.executionReceipts = { get: async () => null }
   let resolveProcess!: (value: null) => void
   const getProcess = vi.fn(() => new Promise<null>(resolve => { resolveProcess = resolve }))
-  const sandbox = {
+  const sandbox = { ...ownerReceipt,
     exists: vi.fn(async () => ({ exists: false })), getProcess,
     mkdir: vi.fn(), startProcess: vi.fn(),
   }
@@ -121,13 +131,13 @@ it('yields an admitted attempt when the initial lifetime RPC hangs, with no late
   const provider = new SandboxAgentProvider({
     ACK3_CODEX_AUTH_JSON: 'synthetic', ACK3_CODEX_WORKSPACE_ID: 'synthetic',
   } as any) as any
+  const request = await admittedProviderRequest(provider, close => closeDatabases.push(close))
   provider.sandboxLaunchPrerequisiteMs = 20
   provider.executionReceipts = { get: async () => null }
-  provider.observationCooldowns = { get: async () => null, put: vi.fn() }
   provider.observationHealth = { get: async () => null, recordFailure: vi.fn() }
   const launch = vi.spyOn(provider, 'runInSandbox')
   let resolveLifetime!: () => void
-  const sandbox = { setKeepAlive: vi.fn(() => new Promise<void>(resolve => { resolveLifetime = resolve })) }
+  const sandbox = { ...ownerReceipt, setKeepAlive: vi.fn(() => new Promise<void>(resolve => { resolveLifetime = resolve })) }
   vi.mocked(getAgentSandbox).mockReturnValue(sandbox as any)
   await expect(provider.run(request as any)).rejects.toBeInstanceOf(AgentExecutionPending)
   resolveLifetime()
@@ -135,17 +145,18 @@ it('yields an admitted attempt when the initial lifetime RPC hangs, with no late
   await Promise.resolve()
   expect(launch).not.toHaveBeenCalled()
   expect(provider.observationHealth.recordProcessSuccess).toBeUndefined()
-  expect(provider.observationCooldowns.put).toHaveBeenCalledOnce()
+  expect(provider.observationHealth.recordFailure).toHaveBeenCalledOnce()
 })
 
 it('checks an exact durable receipt before an active observation cooldown', async () => {
   const provider = new SandboxAgentProvider({
     ACK3_CODEX_AUTH_JSON: 'synthetic', ACK3_CODEX_WORKSPACE_ID: 'synthetic',
   } as any) as any
+  const request = await admittedProviderRequest(provider, close => closeDatabases.push(close))
   let receipt: any = null
-  provider.executionReceipts = { get: async () => receipt }
-  provider.observationCooldowns = { get: async () => Date.now() + 60_000 }
-  provider.observationHealth = { get: async () => null, recordProcessSuccess: vi.fn() }
+  let digest = ''
+  provider.executionReceipts = { get: async (_run: string, requestDigest: string) => { digest = requestDigest; return receipt } }
+  provider.observationHealth = { get: async () => ({ requestDigest: digest, nextObservationAfter: new Date(Date.now() + 60_000).toISOString() }), recordProcessSuccess: vi.fn() }
   vi.mocked(getAgentSandbox).mockClear()
   await expect(provider.run(request as any)).rejects.toBeInstanceOf(AgentExecutionPending)
   expect(getAgentSandbox).not.toHaveBeenCalled()
@@ -164,18 +175,18 @@ it('picks up an exact local receipt after the bounded cooldown without starting 
     const provider = new SandboxAgentProvider({
       ACK3_CODEX_AUTH_JSON: 'synthetic', ACK3_CODEX_WORKSPACE_ID: 'synthetic',
     } as any) as any
-    const retryAfter = Date.now() + expiredObservationCooldownMs
+    const request = await admittedProviderRequest(provider, close => closeDatabases.push(close))
+    const retryAfter = Date.now() + observationFailureSpacingMs
     let digest = ''
     const put = vi.fn()
     provider.executionReceipts = {
       get: async (_runId: string, requestDigest: string) => { digest = requestDigest; return null }, put,
     }
-    provider.observationCooldowns = { get: async () => retryAfter }
-    provider.observationHealth = { get: async () => null, recordProcessSuccess: vi.fn() }
+    provider.observationHealth = { get: async () => ({ requestDigest: digest, nextObservationAfter: new Date(retryAfter).toISOString() }), recordProcessSuccess: vi.fn() }
     provider.ensureAgentLogRequest = async () => {}
     provider.drainAgentLogs = async () => {}
     provider.agentResult = async () => ({ actorId: 'local-receipt' })
-    const sandbox = {
+    const sandbox = { ...ownerReceipt,
       setKeepAlive: vi.fn(async () => {}),
       exists: vi.fn(async () => ({ exists: true })),
       readFile: vi.fn(async () => ({ content: JSON.stringify({
@@ -187,7 +198,7 @@ it('picks up an exact local receipt after the bounded cooldown without starting 
     vi.mocked(getAgentSandbox).mockClear().mockReturnValue(sandbox as any)
     await expect(provider.run(request as any)).rejects.toBeInstanceOf(AgentExecutionPending)
     expect(getAgentSandbox).not.toHaveBeenCalled()
-    await vi.advanceTimersByTimeAsync(expiredObservationCooldownMs + 1)
+    await vi.advanceTimersByTimeAsync(observationFailureSpacingMs + 1)
     const result = await provider.run(request as any)
     expect(result.actorId).toBe('local-receipt')
     expect(put).toHaveBeenCalledOnce()
@@ -200,9 +211,10 @@ it('picks up an exact local receipt after the bounded cooldown without starting 
 
 it('keeps an observation-incident reattachment read-only if process lookup returns null', async () => {
   const provider = new SandboxAgentProvider({ ACK3_CODEX_WORKSPACE_ID: 'synthetic' } as any) as any
+  const request = await admittedProviderRequest(provider, close => closeDatabases.push(close))
   provider.executionReceipts = { get: async () => null }
   provider.observationHealth = { recordFailure: vi.fn() }
-  const sandbox = {
+  const sandbox = { ...ownerReceipt,
     exists: vi.fn(async () => ({ exists: false })), getProcess: vi.fn(async () => null),
     mkdir: vi.fn(), startProcess: vi.fn(), exec: vi.fn(),
   }
@@ -223,6 +235,7 @@ it('accepts a late exact receipt during an unresolved incident before any Sandbo
   const provider = new SandboxAgentProvider({
     ACK3_CODEX_AUTH_JSON: 'synthetic', ACK3_CODEX_WORKSPACE_ID: 'synthetic',
   } as any) as any
+  const request = await admittedProviderRequest(provider, close => closeDatabases.push(close))
   provider.executionReceipts = { get: async () => ({
     requestDigest: 'a'.repeat(64), exitCode: 0, actorId: 'original-session',
     files: {}, inputTokens: 1, outputTokens: 1, costUsd: 0, stderr: '',
@@ -239,14 +252,14 @@ it('allows the first launch after a pre-claim observation outage', async () => {
   const provider = new SandboxAgentProvider({
     ACK3_CODEX_AUTH_JSON: 'synthetic', ACK3_CODEX_WORKSPACE_ID: 'synthetic',
   } as any) as any
+  const request = await admittedProviderRequest(provider, close => closeDatabases.push(close))
   let digest = ''
   provider.executionReceipts = { get: async (_run: string, value: string) => { digest = value; return null },
     getStart: vi.fn(async () => null) }
   provider.observationHealth = { get: async () => ({ requestDigest: digest, consecutiveFailures: 1,
     incidentSince: null, nextObservationAfter: null }) }
-  provider.observationCooldowns = { get: async () => null }
   const setKeepAlive = vi.fn(async () => {})
-  vi.mocked(getAgentSandbox).mockReturnValue({ setKeepAlive } as any)
+  vi.mocked(getAgentSandbox).mockReturnValue({ ...ownerReceipt, setKeepAlive } as any)
   const reattach = vi.spyOn(provider, 'runInSandbox').mockResolvedValue({ actorId: 'first-launch' })
   expect((await provider.run(request as any)).actorId).toBe('first-launch')
   expect(provider.executionReceipts.getStart).toHaveBeenCalledOnce()
@@ -258,14 +271,14 @@ it('retains an existing launch claim and skips lifetime mutation during unresolv
   const provider = new SandboxAgentProvider({
     ACK3_CODEX_AUTH_JSON: 'synthetic', ACK3_CODEX_WORKSPACE_ID: 'synthetic',
   } as any) as any
+  const request = await admittedProviderRequest(provider, close => closeDatabases.push(close))
   let digest = ''
   provider.executionReceipts = { get: async (_run: string, value: string) => { digest = value; return null },
     getStart: vi.fn(async () => ({ claimedAt: '2026-10-07T00:00:00Z' })) }
   provider.observationHealth = { get: async () => ({ requestDigest: digest, consecutiveFailures: 3,
     incidentSince: new Date(Date.now() - 11 * 60_000).toISOString(), nextObservationAfter: null }) }
-  provider.observationCooldowns = { get: async () => null }
   const setKeepAlive = vi.fn(async () => {})
-  vi.mocked(getAgentSandbox).mockReturnValue({ setKeepAlive } as any)
+  vi.mocked(getAgentSandbox).mockReturnValue({ ...ownerReceipt, setKeepAlive } as any)
   const reattach = vi.spyOn(provider, 'runInSandbox').mockRejectedValue(new AgentExecutionPending('same-process', 'unavailable'))
   await expect(provider.run(request as any)).rejects.toBeInstanceOf(AgentExecutionPending)
   expect(provider.executionReceipts.getStart).toHaveBeenCalledOnce()
@@ -277,30 +290,31 @@ it('records all-unavailable status probes as a failed observation without a new 
   const provider = new SandboxAgentProvider({
     ACK3_CODEX_AUTH_JSON: 'synthetic', ACK3_CODEX_WORKSPACE_ID: 'synthetic',
   } as any) as any
+  const request = await admittedProviderRequest(provider, close => closeDatabases.push(close))
   provider.executionReceipts = { get: async () => null }
   provider.observationHealth = { get: async () => null, recordFailure: vi.fn() }
-  provider.observationCooldowns = { get: async () => null, put: vi.fn() }
   provider.ensureAgentLogRequest = async () => {}
   vi.mocked(waitForAgentProcess).mockResolvedValueOnce('unavailable')
-  const sandbox = { setKeepAlive: vi.fn(async () => {}),
+  const sandbox = { ...ownerReceipt, setKeepAlive: vi.fn(async () => {}),
     exists: vi.fn(async () => ({ exists: false })),
     getProcess: vi.fn(async () => ({ id: 'original-process' })),
     startProcess: vi.fn(), mkdir: vi.fn() }
   vi.mocked(getAgentSandbox).mockReturnValue(sandbox as any)
   await expect(provider.run(request as any)).rejects.toBeInstanceOf(AgentExecutionPending)
   expect(provider.observationHealth.recordFailure).toHaveBeenCalledWith(
-    expect.any(Object), expect.any(String), 'process-status-unavailable', expect.any(Date))
-  expect(provider.observationCooldowns.put).toHaveBeenCalledOnce()
+    expect.any(Object), expect.any(String), 'process-status-unavailable', expect.any(Date), expect.any(Date))
+  expect(provider.observationHealth.recordFailure).toHaveBeenCalledOnce()
   expect(sandbox.startProcess).not.toHaveBeenCalled()
 })
 
 it('keeps a terminal result-read expiry pending even after failed process status', async () => {
   const provider = new SandboxAgentProvider({ ACK3_CODEX_WORKSPACE_ID: 'synthetic' } as any) as any
+  const request = await admittedProviderRequest(provider, close => closeDatabases.push(close))
   provider.sandboxTerminalReceiptMs = 20
   provider.executionReceipts = { get: async () => null, put: vi.fn() }
   provider.observationHealth = { recordProcessSuccess: vi.fn() }
   provider.ensureAgentLogRequest = async () => {}
-  const sandbox = {
+  const sandbox = { ...ownerReceipt,
     exists: vi.fn(async () => ({ exists: false })),
     getProcess: vi.fn(async () => ({ id: 'existing-process' })),
     readFile: vi.fn(() => new Promise(() => {})),
@@ -315,24 +329,53 @@ it('keeps a terminal result-read expiry pending even after failed process status
   expect(provider.observationHealth.recordProcessSuccess).not.toHaveBeenCalled()
 })
 
-it('returns an exact completed receipt even when terminal log existence never resolves', async () => {
+it.each([false, true])('uses no-start log observation and marks EOF complete only with terminal work (%s)', async terminal => {
+  const provider = new SandboxAgentProvider({} as any) as any
+  const sync = vi.fn(async (input: { complete: boolean }) => ({ complete: input.complete })), finish = vi.fn()
+  provider.executionLogs = { cursor: async () => ({ ready: true, index: { sourceBytes: 2 } }), sync, finish }
+  const observeAgentLog = vi.fn(async () => ({ status: 'available', offset: 2, size: 5, bytes: 3, data: 'YWJj' }))
+  const sandbox = { ...ownerReceipt, observeAgentLog, exec: vi.fn(), exists: vi.fn(), startProcess: vi.fn(), setKeepAlive: vi.fn() }
+  expect(await provider.captureAgentLogs(sandbox, request, 'a'.repeat(64), terminal)).toBe(terminal)
+  expect(observeAgentLog).toHaveBeenCalledExactlyOnceWith('a'.repeat(64), 2, 256 * 1024)
+  expect(sync).toHaveBeenCalledExactlyOnceWith({ runId: request.runId, taskId: request.task.id,
+    requestDigest: 'a'.repeat(64), source: 'abc', sourceOffset: 2, complete: terminal })
+  expect(finish).not.toHaveBeenCalled()
+  for (const forbidden of [sandbox.exec, sandbox.exists, sandbox.startProcess, sandbox.setKeepAlive]) expect(forbidden).not.toHaveBeenCalled()
+})
+
+it.each(['missing', 'transport', 'invalid'])('keeps %s log evidence distinct during terminal capture', async status => {
+  const provider = new SandboxAgentProvider({} as any) as any
+  const sync = vi.fn(), finish = vi.fn()
+  provider.executionLogs = { cursor: async () => ({ ready: true, index: { sourceBytes: 0 } }), sync, finish }
+  const sandbox = { ...ownerReceipt, observeAgentLog: vi.fn(async () => {
+    if (status === 'transport') throw new Error('native output lost')
+    return status === 'missing' ? { status: 'missing' } : { status: 'available', offset: 0, bytes: 1, size: 1, data: 'YR==' }
+  }) }
+  expect(await provider.captureAgentLogs(sandbox, request, 'a'.repeat(64), true)).toBe(status === 'missing')
+  if (status === 'missing') expect(finish).toHaveBeenCalledExactlyOnceWith({ runId: request.runId,
+    taskId: request.task.id, requestDigest: 'a'.repeat(64), truncated: true })
+  else expect(finish).not.toHaveBeenCalled()
+  expect(sync).not.toHaveBeenCalled()
+})
+
+it('bounds terminal drain when the no-start log observation never resolves', async () => {
   vi.useFakeTimers()
   try {
     const provider = new SandboxAgentProvider({} as any) as any
-    let resolveExists!: (value: { exists: boolean }) => void
-    const exists = vi.fn(() => new Promise<{ exists: boolean }>(resolve => { resolveExists = resolve }))
+    let resolveObservation!: (value: { status: 'missing' }) => void
+    const observeAgentLog = vi.fn(() => new Promise<{ status: 'missing' }>(resolve => { resolveObservation = resolve }))
     const finish = vi.fn()
     const sync = vi.fn()
     provider.executionLogs = {
       cursor: async () => ({ ready: true, index: { sourceBytes: 0 } }), finish, sync,
     }
     const request = { runId: 'receipt-run', task: { id: 'research-1' } }
-    const drain = provider.drainAgentLogs({ exists } as any, request as any, 'a'.repeat(64))
+    const drain = provider.drainAgentLogs({ observeAgentLog } as any, request as any, 'a'.repeat(64))
     await vi.advanceTimersByTimeAsync(0)
-    expect(exists).toHaveBeenCalledOnce()
+    expect(observeAgentLog).toHaveBeenCalledOnce()
     await vi.advanceTimersByTimeAsync(terminalLogDrainMs + 1)
     await expect(drain).resolves.toBeUndefined()
-    resolveExists({ exists: false })
+    resolveObservation({ status: 'missing' })
     await Promise.resolve()
     await Promise.resolve()
     expect(finish).not.toHaveBeenCalled()
@@ -350,9 +393,9 @@ it('does not start a terminal log write after a late cursor response', async () 
     const cursor = vi.fn(() => new Promise(resolve => { resolveCursor = resolve }))
     const finish = vi.fn()
     const sync = vi.fn()
-    const exists = vi.fn()
+    const observeAgentLog = vi.fn()
     provider.executionLogs = { cursor, finish, sync }
-    const drain = provider.drainAgentLogs({ exists } as any,
+    const drain = provider.drainAgentLogs({ observeAgentLog } as any,
       { runId: 'receipt-run', task: { id: 'research-1' } } as any, 'a'.repeat(64))
     await vi.advanceTimersByTimeAsync(0)
     await vi.advanceTimersByTimeAsync(terminalLogDrainMs + 1)
@@ -360,7 +403,7 @@ it('does not start a terminal log write after a late cursor response', async () 
     resolveCursor({ ready: true, index: { sourceBytes: 0 } })
     await Promise.resolve()
     await Promise.resolve()
-    expect(exists).not.toHaveBeenCalled()
+    expect(observeAgentLog).not.toHaveBeenCalled()
     expect(finish).not.toHaveBeenCalled()
     expect(sync).not.toHaveBeenCalled()
   } finally {
@@ -372,21 +415,21 @@ it('does not start a terminal log sync after a late Sandbox read response', asyn
   vi.useFakeTimers()
   try {
     const provider = new SandboxAgentProvider({} as any) as any
-    let resolveRead!: (value: { success: boolean, stdout: string }) => void
-    const exec = vi.fn(() => new Promise(resolve => { resolveRead = resolve }))
+    let resolveRead!: (value: unknown) => void
+    const observeAgentLog = vi.fn(() => new Promise(resolve => { resolveRead = resolve }))
     const sync = vi.fn()
     const finish = vi.fn()
     provider.executionLogs = {
       cursor: async () => ({ ready: true, index: { sourceBytes: 0 } }), sync, finish,
     }
     const drain = provider.drainAgentLogs({
-      exists: async () => ({ exists: true }), exec,
+      observeAgentLog,
     } as any, { runId: 'receipt-run', task: { id: 'research-1' } } as any, 'a'.repeat(64))
     await vi.advanceTimersByTimeAsync(0)
-    expect(exec).toHaveBeenCalledOnce()
+    expect(observeAgentLog).toHaveBeenCalledOnce()
     await vi.advanceTimersByTimeAsync(terminalLogDrainMs + 1)
     await expect(drain).resolves.toBeUndefined()
-    resolveRead({ success: true, stdout: JSON.stringify({ size: 0, bytes: 0, data: '' }) })
+    resolveRead({ status: 'available', offset: 0, size: 0, bytes: 0, data: '' })
     await Promise.resolve()
     await Promise.resolve()
     expect(sync).not.toHaveBeenCalled()
@@ -411,6 +454,7 @@ it('diagnoses the terminal observation-loss route with native metrics without to
       CLOUDFLARE_OBSERVABILITY_TOKEN: { get: async () => 'monitor-private-token' },
       VERSION_METADATA: { id: 'runtime-version' }, AGENT_SANDBOX: { idFromName: vi.fn(() => ({ toString: () => actorId })) } }
     const provider = new SandboxAgentProvider(env as any) as any
+    const request = await admittedProviderRequest(provider, close => closeDatabases.push(close))
     provider.assertProviderCredentials = () => {}
     let digest = ''
     provider.executionReceipts = { get: async (_run: string, requestDigest: string) => { digest = requestDigest; return null } }

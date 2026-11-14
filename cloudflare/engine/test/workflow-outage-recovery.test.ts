@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { stripTypeScriptTypes } from 'node:module'
 import { expect, it, vi } from 'vitest'
-import { waveStepConfig, workflowBootstrapProgress } from '../src/workflow-step-config.js'
+import { waveStepConfig } from '../src/workflow-step-config.js'
 import { failureForWorkflowProgress, workflowFailureDisposition } from '../src/workflow-outcome.js'
 
 it('keeps an admitted run nonterminal when recovery observation also exhausts retries', async () => {
@@ -19,7 +19,6 @@ it('keeps an admitted run nonterminal when recovery observation also exhausts re
     'WorkflowEntrypoint',
     'CloudflareRunStore',
     'waveStepConfig',
-    'workflowBootstrapProgress',
     'failureForWorkflowProgress',
     'workflowFailureDisposition',
     'NonRetryableError',
@@ -29,7 +28,6 @@ it('keeps an admitted run nonterminal when recovery observation also exhausts re
     class { env = {} },
     class {},
     waveStepConfig,
-    workflowBootstrapProgress,
     failureForWorkflowProgress,
     workflowFailureDisposition,
     NonRetryableError,
@@ -50,7 +48,7 @@ it('keeps an admitted run nonterminal when recovery observation also exhausts re
       if (name === 'bootstrap-run') return running
       observedSteps.push({ name, limit: config.retries.limit })
       if (name === 'advance-or-poll-1') return completed
-      if (name === 'dispose-completed-workspaces') return { ready: true }
+      if (name === 'dispose-completed-workspaces') return completed
       throw new Error('temporary storage outage; execution state is unknown')
     },
     sleep: vi.fn(async () => {}),
@@ -89,7 +87,6 @@ it.each([
     'WorkflowEntrypoint',
     'CloudflareRunStore',
     'waveStepConfig',
-    'workflowBootstrapProgress',
     'failureForWorkflowProgress',
     'workflowFailureDisposition',
     'NonRetryableError',
@@ -99,7 +96,6 @@ it.each([
     class { env = {} },
     class {},
     waveStepConfig,
-    workflowBootstrapProgress,
     failureForWorkflowProgress,
     workflowFailureDisposition,
     NonRetryableError,
@@ -131,7 +127,7 @@ it.each([
         return running
       }
       if (name.startsWith('recover-wave-state-')) throw platformFailure
-      if (name === 'dispose-completed-workspaces') return { ready: true }
+      if (name === 'dispose-completed-workspaces') return completed
       throw new Error(`unexpected step ${name}`)
     }),
     sleep: vi.fn(async (name: string) => {
@@ -157,4 +153,31 @@ it.each([
   ])
   expect(instance.recordTerminalFailure).not.toHaveBeenCalled()
   expect(running.status).toBe('running')
+})
+
+it('sleeps 5 minutes after a step that was idle under a pause, and 15 seconds otherwise', async () => {
+  const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8')
+  const code = stripTypeScriptTypes(source.slice(
+    source.indexOf('export class AuditWorkflow'),
+    source.indexOf('async function forwardCoordinator'),
+  ).replace('export class', 'class'))
+  const sameCursor = (left: { stageIndex: number, waveIndex: number }, right: { stageIndex: number, waveIndex: number }) =>
+    left.stageIndex === right.stageIndex && left.waveIndex === right.waveIndex
+  const Workflow = new Function('WorkflowEntrypoint', 'CloudflareRunStore', 'waveStepConfig', 'failureForWorkflowProgress',
+    'workflowFailureDisposition', 'NonRetryableError', 'sameCursor', `${code}\nreturn AuditWorkflow;`,
+  )(class { env = {} }, class {}, waveStepConfig, failureForWorkflowProgress, workflowFailureDisposition, class extends Error {}, sameCursor)
+  const running = { status: 'running', cursor: { stageIndex: 1, waveIndex: 0 }, checkpointDigest: null, terminalReason: null }
+  const completed = { ...running, status: 'completed', terminalReason: 'completed' }
+  const polls = [{ ...running, pausedIdle: true }, running, completed]
+  const instance = new Workflow()
+  instance.workflowStepError = (error: unknown) => error
+  const step = {
+    do: async (name: string) => name === 'initialize-index' ? { ready: true }
+      : name === 'bootstrap-run' ? running
+        : name.startsWith('advance-or-poll-') ? polls.shift()
+          : name === 'dispose-completed-workspaces' ? completed : Promise.reject(new Error(`unexpected step ${name}`)),
+    sleep: vi.fn(async () => {}),
+  }
+  await expect(instance.run({ payload: { runId: 'paused-audit' } }, step)).resolves.toEqual(completed)
+  expect(step.sleep.mock.calls).toEqual([['agent-poll-backoff-0', '5 minutes'], ['agent-poll-backoff-1', '15 seconds']])
 })

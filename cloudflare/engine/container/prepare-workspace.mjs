@@ -158,12 +158,17 @@ const marker = { schemaVersion: 1, status: 'prepared', commit, tree, profileDige
 const facts = [
   '# Workspace environment',
   '',
+  ...(process.env.ACK3_BUILD_REQUIRED === 'false' ? ['The baseline build is optional for this audit and may fail here. Check whether the project builds before relying on tests; if it does not, work from the source.', ''] : []),
   'The verified source is an archive without Git history; `git status` is unavailable.',
   `Working directory: ${workspaceDirectory}`,
   `Preparation: completed (${profile.commands.length} sealed commands; ${marker.durationMs} ms).`,
   `Verified commands: ${profile.commands.map(value => `\`${value}\``).join('; ')}`,
   `Installed tools: ${Object.entries(versions).map(([name, value]) => `${name} ${value}`).join('; ')}.`,
   'Optional OS tools: `sudo -n /usr/local/bin/ack3-install-os-packages PACKAGE` installs literal packages from configured repositories in this workspace. Use project-local package managers for project dependencies.',
+  'GitHub CLI: `gh` works when the audit provides a read-only `GH_TOKEN`; without one, use `git clone` or `curl` for public GitHub data. Keep GitHub searches generic so they reveal nothing about the target.',
+  // Same text as workspaceLimitNotes in src/container-resource-diagnostics.ts (pinned by a test).
+  'Resources: 1 CPU and 8 GB of memory. Disk: 6 GB in total, including dependencies and build output. Run builds and tests one job at a time (for example `-j1`). If memory runs out, your commands are stopped first.',
+  ...(/^\d+$/.test(process.env.ACK3_COMMAND_TIMEOUT_MINUTES ?? '') ? [`Command time limit: every command you start, background jobs included, is stopped after ${process.env.ACK3_COMMAND_TIMEOUT_MINUTES} minutes. Split longer work, for example fewer fuzz runs or one test file at a time.`] : []),
   'A successful build is environment readiness, not a security reproduction.',
   '',
 ].join('\n')

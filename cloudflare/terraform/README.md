@@ -10,6 +10,7 @@ file for your account, hostname and dashboard users, for example
 Prerequisites:
 
 - Terraform 1.15.x ([versions.tf](versions.tf) pins `~> 1.15.0`; newer releases are refused).
+  Download the newest 1.15 release from <https://releases.hashicorp.com/terraform/>.
 - Node and pnpm from [package.json](../../package.json), with `pnpm install --frozen-lockfile`
   run at the repository root (the commands below use the repository's Wrangler).
 - A dedicated Cloudflare account with Workers Paid, R2 and Containers.
@@ -21,8 +22,12 @@ Prerequisites:
   Scripts, Workers Containers, Workers R2 Storage, D1, Secrets Store, Account API Tokens,
   Zero Trust Access (applications, policies and identity providers) and, if you manage
   members, Account Memberships. Wrangler uses the same token; also export
-  `CLOUDFLARE_ACCOUNT_ID`.
-- `jq`. For Codex pools, the Codex CLI (`npm install -g @openai/codex@0.152.1`, the
+  `CLOUDFLARE_ACCOUNT_ID`. To check an account-owned token, use
+  `/accounts/<account-id>/tokens/verify`; `/user/tokens/verify` rejects it.
+  This is the only token you create by hand (dashboard: Manage Account → Account API
+  Tokens → Create Token → Create Custom Token). The state token is created from it with
+  a command ([below](#state-and-credentials)), and Terraform creates the rest.
+- `jq`. For Codex pools, the Codex CLI (`npm install -g @openai/codex@0.165.0`, the
   version in the image) signed in with a dedicated ChatGPT account whose plan includes
   Codex; for a Claude token, the Claude Code CLI.
 - The service credentials listed [below](#state-and-credentials).
@@ -37,20 +42,42 @@ Keep remote state in a private R2 bucket separate from audit data. The module
 names it `swarm-terraform-state`, in `data_jurisdiction` (`default` when unset).
 Create both first, matching the module so the import shows no changes:
 
-- the bucket: `pnpm --dir cloudflare/engine exec wrangler r2 bucket create swarm-terraform-state`
+- the bucket: `pnpm --dir cloudflare/engine exec wrangler r2 bucket create swarm-terraform-state --no-update-config`
   (add `--jurisdiction <data_jurisdiction>` when you set one);
-- an account-owned API token (Manage Account → Account API Tokens) named
-  `Swarm Terraform state` with only Workers R2 Storage Bucket Item Write, limited to
-  that bucket. Its ID is `result.id` from
+- an account-owned API token named `Swarm Terraform state` with only Workers R2
+  Storage Bucket Item Write, limited to that bucket. Create it with the management
+  token (the same policy as [credentials.tf](credentials.tf); use your
+  `data_jurisdiction` in place of `default` when you set one):
+
+  ```sh
+  (
+    set -eu
+    umask 077
+    body=$(printf '{"name":"Swarm Terraform state","policies":[{"effect":"allow","permission_groups":[{"id":"2efd5506f9c8494dacb1fa10a3e7d5b6"}],"resources":{"com.cloudflare.edge.r2.bucket.%s_default_swarm-terraform-state":"*"}}]}' "$CLOUDFLARE_ACCOUNT_ID")
+    printf 'Authorization: Bearer %s\n' "$CLOUDFLARE_API_TOKEN" | curl -fsS -H @- \
+      -H 'Content-Type: application/json' --data "$body" \
+      "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/tokens" \
+      > /path/to/secrets/state-token.json
+  )
+  ```
+
+  Cloudflare returns the token value only once, so keep this file: `result.id` is the
+  token ID and `result.value` its value (`STATE_TOKEN="$(jq -er .result.value /path/to/secrets/state-token.json)"`).
+  A token created in the dashboard (Manage Account → Account API Tokens) also works;
+  its ID is `result.id` from
   `printf 'Authorization: Bearer %s\n' "$STATE_TOKEN" | curl -fsS -H @- https://api.cloudflare.com/client/v4/accounts/<account-id>/tokens/verify`.
 
 Import both after `init` (below). Import other existing resources instead of recreating
-them. Cloudflare allows one Secrets Store per account: if the account already has one,
-set `secrets_store_name` to its name and import it (below). If `apply` reports an
+them. Cloudflare allows one Secrets Store per account, and new accounts often already
+have one named `default_secrets_store`. Check with
+`printf 'Authorization: Bearer %s\n' "$CLOUDFLARE_API_TOKEN" | curl -fsS -H @- https://api.cloudflare.com/client/v4/accounts/<account-id>/secrets_store/stores`;
+if it lists one, set `secrets_store_name` to its name and import it (below). If `apply` reports an
 existing One-time PIN login method, import that too. The token's S3 credentials are its ID
 (access key ID) and the SHA-256 of its value (secret access key:
-`printf %s "$STATE_TOKEN" | sha256sum | cut -d' ' -f1`). Use them through `AWS_ACCESS_KEY_ID` and
-`AWS_SECRET_ACCESS_KEY`, and a Swarm management token through
+`printf %s "$STATE_TOKEN" | sha256sum | cut -d' ' -f1`; on macOS without `sha256sum`,
+use `shasum -a 256`). Use them through `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY`: Terraform's S3 backend reads these names, but the values are
+R2 credentials and no Amazon account is needed. Set the Swarm management token as
 `CLOUDFLARE_API_TOKEN`. Supply existing service credentials in memory through
 `TF_VAR_service_credentials`; never put values in Git, command arguments or
 `.tfvars` files. The map needs one string value per Secrets Store name:
@@ -63,10 +90,10 @@ existing One-time PIN login method, import that too. The token's S3 credentials 
 | `swarm-cloudflare-tfstate-access-key-id`, `swarm-cloudflare-tfstate-secret-access-key` | The state token's S3 credentials (above). |
 | Each secret name in `runtime_secret_bindings` | That provider key or subscription token. |
 
-For example, read it from a private file:
+For example, read it from an owner-only file outside the repository:
 
 ```sh
-export TF_VAR_service_credentials="$(cat /path/to/private/service-credentials.json)"
+export TF_VAR_service_credentials="$(cat /path/to/secrets/service-credentials.json)"
 # {"swarm-control-token":"…","swarm-exa-api-key":"…", …}
 ```
 
@@ -77,23 +104,26 @@ credential needs permissions for the declared resources, including Access,
 account tokens and membership; Wrangler OAuth alone does not provide these.
 
 ```sh
-# Work around empty POST bodies observed with the Cloudflare provider over HTTP/2.
+# Use HTTP/1.1 for Cloudflare provider requests.
 export GODEBUG=http2client=0
 # With data_jurisdiction set, use https://<account-id>.<jurisdiction>.r2.cloudflarestorage.com.
 terraform -chdir=cloudflare/terraform init \
   -backend-config='endpoints={s3="https://<account-id>.r2.cloudflarestorage.com"}'
 # First run only: import the state bucket and its token.
 terraform -chdir=cloudflare/terraform import -var-file=/path/to/private/swarm.tfvars \
-  cloudflare_r2_bucket.terraform_state '<account-id>/swarm-terraform-state/<jurisdiction>'
+  cloudflare_r2_bucket.terraform_state '<account-id>/swarm-terraform-state/default'
+# (use your data_jurisdiction in place of default when you set one)
 terraform -chdir=cloudflare/terraform import -var-file=/path/to/private/swarm.tfvars \
   cloudflare_account_token.terraform_state '<account-id>/<token-id>'
 # Only if the account already has a Secrets Store (with secrets_store_name set to its name).
 terraform -chdir=cloudflare/terraform import -var-file=/path/to/private/swarm.tfvars \
   cloudflare_secrets_store.swarm '<account-id>/<store-id>'
 terraform -chdir=cloudflare/terraform plan -var-file=/path/to/private/swarm.tfvars \
-  -out=/path/to/private/swarm.tfplan
-# Inspect the complete plan before applying it.
-terraform -chdir=cloudflare/terraform apply /path/to/private/swarm.tfplan
+  -out=/path/to/secrets/swarm.tfplan
+# Inspect the complete plan before applying it. If it would create the state bucket,
+# the state token or an existing Secrets Store, an import is missing: delete the plan
+# and fix the import.
+terraform -chdir=cloudflare/terraform apply /path/to/secrets/swarm.tfplan
 terraform -chdir=cloudflare/terraform output -json experiment_runtime_worker_names
 ```
 

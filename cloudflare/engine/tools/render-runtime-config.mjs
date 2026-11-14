@@ -68,12 +68,17 @@ config.secrets_store_secrets = [...engineBindings, ...Object.entries(runtimeBind
 config.secrets.required = []
 config.version_metadata = { binding: 'VERSION_METADATA' }
 config.durable_objects = {
-  bindings: [{ name: 'AGENT_SANDBOX', class_name: 'AgentSandbox' }],
+  bindings: [
+    { name: 'AGENT_SANDBOX', class_name: 'AgentSandbox' },
+    { name: 'COORDINATORS', class_name: 'ExperimentCoordinator' },
+  ],
 }
 // v1 declared Sandbox SDK 0.12's class, which stays exported as an empty class.
 config.migrations = [
   { tag: 'v1', new_sqlite_classes: ['Sandbox'] },
   { tag: 'v2', new_sqlite_classes: ['AgentSandbox'] },
+  // Runtime-local terminal delivery observes only this runtime's Workflows.
+  { tag: 'v3', new_sqlite_classes: ['ExperimentCoordinator'] },
 ]
 if (!Array.isArray(config.containers) || config.containers.length !== 1
   || config.containers[0]?.class_name !== 'AgentSandbox'
@@ -97,6 +102,10 @@ config.workflows = [
 ]
 delete config.services
 applyDeploymentOptions(config, process.env, { containers: true })
+// Runtime routes have no token check of their own; only the missing public address keeps them private.
+if (config.workers_dev !== false || config.preview_urls !== false) {
+  throw new Error('runtime Worker must have no public address: workers_dev and preview_urls must be false')
+}
 
 const output = new URL(`../wrangler.runtime.${declaration.id}.jsonc`, import.meta.url)
 const rendered = `${JSON.stringify(config, null, 2)}\n`

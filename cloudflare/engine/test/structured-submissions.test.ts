@@ -618,6 +618,9 @@ describe('structured model submissions', () => {
       inputTokens: 0, outputTokens: 0, costUsd: 0, unavailableReason: 'provider-credit',
     }
     await expect(validateAgentResult(definition, unavailable, [])).resolves.toEqual([])
+    await expect(validateAgentResult(definition, { ...unavailable, modelCalls: 0,
+      assertions: ['promoted-execution:retired-source:' + 'a'.repeat(64)] }, []))
+      .resolves.toContain('an unavailable task cannot publish evidence metadata')
     await expect(validateAgentResult(definition, { ...unavailable, files: { [SUBMISSION_PATH]: '{}' } }, []))
       .resolves.toContain('an unavailable task cannot publish output files')
   })

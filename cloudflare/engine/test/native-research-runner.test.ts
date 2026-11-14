@@ -1,3 +1,5 @@
+import { createControlledMachine } from './support/controlled-machine.js'
+import { restoreSelected } from './support/selected-snapshots.js'
 import { expect, it } from 'vitest'
 import { RunMachine } from '../src/machine.js'
 import { advanceExperimentOneWave, runNextWave } from '../src/runner.js'
@@ -12,7 +14,7 @@ it.each(['required', 'optional', 'unavailable', 'unresolved', 'failed-search', '
   const enabled = mode !== 'optional' && mode !== 'outside-stage'
   const definition = compileExperimentConfig({ ...document, forceSearch: mode !== 'optional',
     ...(mode === 'outside-stage' ? { forceSearchStages: ['negative-review'] } : {}), nativeSearch: {} }).definition
-  const machine = await RunMachine.create(definition, 'a'.repeat(64), 'native-research-runner')
+  const machine = await createControlledMachine(definition, 'a'.repeat(64), 'native-research-runner')
   const artifactStore = new MemoryArtifactStore()
   const base = new DeterministicAuditProvider()
   await advanceExperimentOneWave({ definition, machine, provider: base, artifactStore })
@@ -76,6 +78,6 @@ it.each(['required', 'optional', 'unavailable', 'unresolved', 'failed-search', '
     }
     expect(record.protocol.research?.leadChecks?.[0]?.researchQueries).toEqual([query])
     expect(state.rejectedAttempts.find(r => r.taskId === parent.id)?.nativeSearchEvidence?.completed).toHaveLength(1)
-    await expect(RunMachine.fromState(definition, state)).resolves.toBeDefined()
+    await expect(restoreSelected(machine, state)).resolves.toBeDefined()
   }
 })

@@ -1,3 +1,7 @@
+import { nativeWorkspaceKey } from '../src/native-workspace.js'
+import { createControlledMachine } from './support/controlled-machine.js'
+import { restoreSelected } from './support/selected-snapshots.js'
+import { validNativeTransport, validNativeSessionCustody } from '../src/native-session-custody.js'
 import { expect, it } from 'vitest'
 import type { AgentRequest, NativeTerminalCustodyEvidence, NativeTransportEvidence } from '../src/contracts.js'
 import { compileExperimentConfig } from './support/compile-config.js'
@@ -22,7 +26,7 @@ function evidence(request: AgentRequest, workState: NativeTransportEvidence['wor
 }
 
 it.each(['present', 'unknown', 'none'] as const)('keeps execution, persisted admission, checkpoint, and resume consistent for %s custody', async workState => {
-  const definition = setup(), machine = await RunMachine.create(definition, 'a'.repeat(64), `custody-${workState}`)
+  const definition = setup(), machine = await createControlledMachine(definition, 'a'.repeat(64), `custody-${workState}`)
   const store = new MemoryArtifactStore(), base = new DeterministicAuditProvider()
   await advanceExperimentOneWave({ definition, machine, provider: base, artifactStore: store })
   const nativeCalls: AgentRequest[] = []
@@ -49,7 +53,7 @@ it.each(['present', 'unknown', 'none'] as const)('keeps execution, persisted adm
     await advanceExperimentOneWave({ definition, machine, provider, artifactStore: store,
       onWaveAdmission: async state => {
         if (state.inFlightAgentAttempts?.some(a => a.attempt === 2)) {
-          await RunMachine.fromState(definition, state)
+          await restoreSelected(machine, state)
           nativeAdmissionVerified = true
         }
       },
@@ -63,16 +67,16 @@ it.each(['present', 'unknown', 'none'] as const)('keeps execution, persisted adm
   expect(state.rejectedAttempts[0]).toMatchObject({ sessionId, nativeTransport: { workState }, usage })
   expect(sideEffects).toBe(workState === 'present' ? 1 : 0)
   expect(state.budget.modelCalls).toBe(state.artifacts.reduce((n, a) => n + a.usage.modelCalls, 0) + 1)
-  const checkpoint = state.checkpoints.at(-1)!
-  await expect(RunMachine.resume(definition, checkpoint, `custody-${workState}-resumed`)).resolves.toBeDefined()
+  await expect(restoreSelected(machine, state)).resolves.toBeDefined()
   expect(nativeCalls).toHaveLength(2) // Neither state validation nor checkpoint loading invokes a model.
   const changed = structuredClone(state)
   changed.rejectedAttempts[0]!.nativeTransport!.snapshotDigest = 'invalid'
-  await expect(RunMachine.fromState(definition, changed)).rejects.toThrow('digest mismatch')
+  expect(validNativeTransport(changed.rejectedAttempts[0]!.nativeTransport)).toBe(false)
+  await expect(restoreSelected(machine, changed)).rejects.toThrow('snapshot has no matching state selection receipt')
 })
 
 it('leaves ordinary native output repairs on their original fresh-context policy', async () => {
-  const definition = setup(), machine = await RunMachine.create(definition, 'a'.repeat(64), 'ordinary-native-repair')
+  const definition = setup(), machine = await createControlledMachine(definition, 'a'.repeat(64), 'ordinary-native-repair')
   const store = new MemoryArtifactStore(), base = new DeterministicAuditProvider()
   await advanceExperimentOneWave({ definition, machine, provider: base, artifactStore: store })
   const calls: AgentRequest[] = []
@@ -88,11 +92,11 @@ it('leaves ordinary native output repairs on their original fresh-context policy
     await advanceExperimentOneWave({ definition, machine, provider, artifactStore: store })
   }
   expect(calls.map(r => r.attempt)).toEqual([1, 2])
-  await expect(RunMachine.resume(definition, machine.snapshot().checkpoints.at(-1)!, 'ordinary-repair-resume')).resolves.toBeDefined()
+  await expect(restoreSelected(machine)).resolves.toBeDefined()
 })
 
 it('does not charge or consume an allowance while the closed execution custody upload retries', async () => {
-  const definition = setup(), machine = await RunMachine.create(definition, 'a'.repeat(64), 'native-custody-upload-retry')
+  const definition = setup(), machine = await createControlledMachine(definition, 'a'.repeat(64), 'native-custody-upload-retry')
   const store = new MemoryArtifactStore(), base = new DeterministicAuditProvider()
   await advanceExperimentOneWave({ definition, machine, provider: base, artifactStore: store })
   const calls: number[] = []
@@ -113,11 +117,11 @@ it('does not charge or consume an allowance while the closed execution custody u
   expect(machine.snapshot().rejectedAttempts).toHaveLength(1)
   expect(machine.snapshot().rejectedAttempts[0]?.usage).toEqual(usage)
   expect(machine.snapshot().budget.modelCalls).toBe(machine.snapshot().artifacts.reduce((n, a) => n + a.usage.modelCalls, 0) + 1)
-  await expect(RunMachine.resume(definition, machine.snapshot().checkpoints.at(-1)!, 'custody-upload-resume')).resolves.toBeDefined()
+  await expect(restoreSelected(machine)).resolves.toBeDefined()
 })
 
 it('does not reopen exhausted native repair allowances on supervisor retries', async () => {
-  const definition = setup(), machine = await RunMachine.create(definition, 'a'.repeat(64), 'native-repair-exhausted')
+  const definition = setup(), machine = await createControlledMachine(definition, 'a'.repeat(64), 'native-repair-exhausted')
   const store = new MemoryArtifactStore(), base = new DeterministicAuditProvider()
   await advanceExperimentOneWave({ definition, machine, provider: base, artifactStore: store })
   const calls: number[] = []
@@ -137,8 +141,8 @@ it('does not reopen exhausted native repair allowances on supervisor retries', a
   expect(calls).toEqual([1, 2])
 })
 
-it.each(['present', 'unknown', 'none'] as const)('stops after terminal AUTH and preserves only potentially worked native lanes (%s)', async workState => {
-  const definition = setup(), machine = await RunMachine.create(definition, 'a'.repeat(64), `terminal-auth-${workState}`)
+it.each(['present', 'unknown', 'none'] as const)('stops after terminal AUTH and preserves native lanes for controlled cleanup (%s)', async workState => {
+  const definition = setup(), machine = await createControlledMachine(definition, 'a'.repeat(64), `terminal-auth-${workState}`)
   const store = new MemoryArtifactStore(), base = new DeterministicAuditProvider()
   await advanceExperimentOneWave({ definition, machine, provider: base, artifactStore: store })
   const calls: number[] = [], disposed: string[] = []
@@ -162,20 +166,22 @@ it.each(['present', 'unknown', 'none'] as const)('stops after terminal AUTH and 
   expect(state.status).toBe('failed')
   expect(state.rejectedAttempts.filter(r => r.nativeTerminalCustody !== undefined)).toHaveLength(1)
   expect(state.rejectedAttempts.find(r => r.nativeTerminalCustody)?.usage).toEqual(usage)
-  await RunMachine.fromState(definition, state)
+  await restoreSelected(machine, state)
   const tampered = structuredClone(state)
   tampered.rejectedAttempts[0]!.nativeTerminalCustody!.snapshotDigest = 'invalid'
-  await expect(RunMachine.fromState(definition, tampered)).rejects.toThrow('digest mismatch')
-  const nativeKey = definition.stages.flatMap(stage => stage.waves.flatMap(wave => wave.tasks))
-    .find(task => task.providerClass === 'additive' && task.research?.wave === 0)!.workspaceKey
-  await disposeTerminalWorkspaces(provider, definition, state)
-  expect(disposed.includes(nativeKey)).toBe(workState === 'none')
+  expect(validNativeSessionCustody(tampered.rejectedAttempts[0]!.nativeTerminalCustody)).toBe(false)
+  await expect(restoreSelected(machine, tampered)).rejects.toThrow('snapshot has no matching state selection receipt')
+  const nativeTask = definition.stages.flatMap(stage => stage.waves.flatMap(wave => wave.tasks))
+    .find(task => task.providerClass === 'additive' && task.research?.wave === 0)!
+  const nativeKey = await nativeWorkspaceKey(nativeTask)
+  await expect(disposeTerminalWorkspaces(provider, definition, machine.view())).rejects.toThrow('cancel control')
+  expect(disposed).not.toContain(nativeKey)
 })
 
 it('does not re-admit terminal AUTH while a required review peer drains across checkpoints', async () => {
   const definition = compileExperimentConfig({ ...structuredClone(document), maxDiscoveryWaves: 4,
      }).definition
-  let machine = await RunMachine.create(definition, 'a'.repeat(64), 'terminal-auth-pending-peer')
+  let machine = await createControlledMachine(definition, 'a'.repeat(64), 'terminal-auth-pending-peer')
   const artifactStore = new MemoryArtifactStore(), base = new DeterministicAuditProvider()
   const replicaAttempts: number[] = []
   let primaryPolls = 0, pendingWithFailure = false, failure: unknown
@@ -195,7 +201,7 @@ it('does not re-admit terminal AUTH while a required review peer drains across c
         if (machine.snapshot().journal.some(event => event.type === 'task.failed'
           && (event.payload as { taskId?: string }).taskId === 'negative-review-replica')) {
           pendingWithFailure = true
-          machine = await RunMachine.fromState(definition, machine.snapshot())
+          machine = await restoreSelected(machine)
         }
         continue
       }

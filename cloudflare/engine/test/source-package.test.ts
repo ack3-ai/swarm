@@ -58,4 +58,39 @@ describe('source package v2', () => {
     expect(readFileSync(join(workspace, 'source/lib/example/dependency.sol'), 'utf8')).toBe('dependency\n')
     expect(readFileSync(join(privateDirectory, 'source-package.json'), 'utf8')).toContain(submoduleCommit)
   })
+
+  it('still accepts a stored package written with Git attributes applied, and refuses a changed file', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ack3-source-package-'))
+    roots.push(root)
+    const repository = join(root, 'repository')
+    run('git', ['init', '--quiet', repository])
+    const git = (...args: string[]) => run('git', ['-C', repository, '-c', 'user.name=ACK3 Test', '-c', 'user.email=test@invalid',
+      '-c', 'core.autocrlf=false', ...args])
+    writeFileSync(join(repository, '.gitattributes'), '* text eol=crlf\n')
+    writeFileSync(join(repository, 'lf.txt'), 'a\nb\n')
+    git('add', '--all')
+    git('commit', '--quiet', '-m', 'fixture')
+    const commit = git('rev-parse', 'HEAD'), tree = git('rev-parse', 'HEAD^{tree}')
+    // An older publisher exported with `git archive` in the source repository: LF blobs became CRLF files.
+    const prepare = (change?: string) => {
+      const staging = mkdtempSync(join(root, 'staging-')), workspace = mkdtempSync(join(root, 'workspace-'))
+      mkdirSync(join(workspace, 'private'))
+      const archive = spawnSync('git', ['-C', repository, 'archive', '--format=tar', 'HEAD'], { encoding: null })
+      run('tar', ['-xf', '-', '-C', staging], { input: archive.stdout })
+      expect(readFileSync(join(staging, 'lf.txt'), 'utf8')).toBe('a\r\nb\r\n')
+      if (change !== undefined) writeFileSync(join(staging, 'lf.txt'), change)
+      writeFileSync(join(staging, '.ack3-source-package.json'), `${JSON.stringify({ schemaVersion: 2, commit, tree, gitlinks: [] })}\n`)
+      const tar = spawnSync('tar', ['-cf', '-', '-C', staging, '.'], { encoding: null })
+      run('zstd', ['-q', '-o', join(workspace, 'private', 'source.tar.zst')], { input: tar.stdout })
+      return spawnSync('/bin/sh', [script], { encoding: 'utf8', env: {
+        ...process.env, ACK3_EXPECTED_COMMIT: commit, ACK3_EXPECTED_TREE: tree, ACK3_WORKSPACE_ROOT: workspace,
+        ACK3_SOURCE_OWNER: `${process.getuid?.() ?? 0}:${process.getgid?.() ?? 0}`,
+      } })
+    }
+    const legacy = prepare()
+    expect(legacy.status, `${legacy.stderr}\n${legacy.stdout}`).toBe(0)
+    const changed = prepare('a\r\nchanged\r\n')
+    expect(changed.status).toBe(3)
+    expect(changed.stderr).toContain(`source tree mismatch: expected ${tree}`)
+  })
 })

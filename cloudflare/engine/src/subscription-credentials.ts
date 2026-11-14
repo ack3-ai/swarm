@@ -9,6 +9,11 @@ export function subscriptionCredentialSource(task: Pick<TaskDefinition, 'backend
     ? task.credentialSource : 'ACK3_CODEX_AUTH_JSON'
 }
 
+/** A Claude task's account bindings in use order: credentialSource, then any fallbacks. */
+export function claudeAccountBindings(task: Pick<TaskDefinition, 'credentialSource' | 'fallbackCredentialSources'>): string[] {
+  return [task.credentialSource!, ...(task.fallbackCredentialSources ?? [])]
+}
+
 export function codexWorkspaceId(auth: string, fallback: string, explicitAccount: boolean): string {
   if (!explicitAccount) return fallback
   try {
